@@ -35,7 +35,7 @@ The LLM proxy sees intent (a `tool_call` in the model's response); the MCP proxy
 **No bypassing the gateway.** Upstreams accept traffic only from the gateway. Containers on a shared Docker bridge can reach each other, so "internal network, no published ports" alone is not enough. The topology is:
 
 - `edge` network (`internal: true`): the agent and the gateway's agent listener (`:8080`, serving `/v1` and `/mcp`). The gateway is the only service the agent can resolve or reach, and the agent has no internet access.
-- `ops` network: the gateway's operator listener (`:9090`, serving `/auth/demo-token`, `/admin/*`, `/metrics`), Prometheus, Loki and Grafana. Only this listener and Grafana are published, on `127.0.0.1`.
+- `ops` network: the gateway's operator listener (`:9090`, serving `/auth/demo-token`, `/admin/*`, `/metrics`), Prometheus, Loki, Grafana Alloy and Grafana. Only this listener and Grafana are published, on `127.0.0.1`.
 - `llm_backend` network (`internal: true`): the gateway and Ollama (and LiteLLM if used).
 - `mcp_backend` network (`internal: true`): the gateway and the internal MCP servers (`mcp-postgres`) plus Postgres.
 - `mcp_untrusted` network (`internal: true`): the gateway and `mcp-fetch`. A compromised fetch server cannot reach Postgres or Ollama.
@@ -91,7 +91,7 @@ resource_pattern := "*" | namespace ":" identifier_pattern   # split at the next
 
 `generate:model:qwen3:8b` → action `generate`, namespace `model`, identifier `qwen3:8b`. `*` matches any run of characters (it crosses `.` and `:`), there are no other wildcards, matching is case-sensitive and anchored on the whole string, `*` as the whole resource pattern matches every resource, so `*:*` is every action on every resource and `egress:*` is egress anywhere. A concrete resource (on an `Interaction`) always has the `namespace:identifier` form.
 
-**Risk score and taint.** A session starts at `risk = 0`. Risk is bounded to `[0, 1]`. Each control verdict adds its `risk_delta` (clamped), including verdicts on calls that end up blocked. Risk decays exponentially with a configurable half-life (`risk.half_life_s`, default 600 s, wall clock on the gateway). Thresholds are strict (`risk_gt: 0.5` means `> 0.5`). Each detection control has a configurable `risk_delta` (defaults: `prompt_injection` 0.6, `secrets` 0.3, `signatures` 0.4, `pii` 0.1, `authz` deny 0.1); an allow verdict adds nothing. Taint is set when untrusted content reaches the agent's context: a tool result from a server with `trust: untrusted` (web, email, external document) or a prompt-injection detector hit. A tool result that is blocked or replaced still taints the session, because the attempt reached the gateway on the agent's behalf. **Taint lasts until the session ends, and decay never clears it.** Taint from a tool result is persisted before that result is released to the agent. Calls within one session are serialized, so a call never races past a restriction set by the previous one. A session ends on `DELETE /v1/session`, after `sessions.idle_ttl_s` (default 3600) without calls, or after `sessions.max_lifetime_s` (default 86400); a token naming an ended session is rejected and a new `session_id` must be issued. `/v1/models` lists only the models the session may `generate`.
+**Risk score and taint.** A session starts at `risk = 0`. Risk is bounded to `[0, 1]`. Each control verdict adds its `risk_delta` (clamped), including verdicts on calls that end up blocked. Risk decays exponentially with a configurable half-life (`risk.half_life_s`, default 600 s, wall clock on the gateway). Thresholds are strict (`risk_gt: 0.5` means `> 0.5`). Each detection control has a configurable `risk_delta` (defaults: `prompt_injection` 0.6, `secrets` 0.3, `signatures` 0.4, `pii` 0.1, `egress` 0.3, `authz` deny 0.1); an allow verdict adds nothing. Taint is set when untrusted content reaches the agent's context: a tool result from a server with `trust: untrusted` (web, email, external document) or a prompt-injection detector hit. A tool result that is blocked or replaced still taints the session, because the attempt reached the gateway on the agent's behalf. **Taint lasts until the session ends, and decay never clears it.** Taint from a tool result is persisted before that result is released to the agent. Calls within one session are serialized, so a call never races past a restriction set by the previous one. A session ends on `DELETE /v1/session`, after `sessions.idle_ttl_s` (default 3600) without calls, or after `sessions.max_lifetime_s` (default 86400); a token naming an ended session is rejected and a new `session_id` must be issued. `/v1/models` lists only the models the session may `generate`.
 
 **The reaction depends on session mode.** The mode is the token's `mode` claim, validated against the agent's registered `type`.
 
@@ -349,7 +349,7 @@ Each control declares its supported modes ordered from most to least enforcing (
 
 Every decision leaves one audit entry with the full "why", and metrics feed dashboards for both security and management.
 
-**Audit entry** (JSON to stdout → Loki, plus JSONL to an export file):
+**Audit entry** (JSON to stdout, plus a size-rotated JSONL file that Alloy ships to Loki and that doubles as the export):
 
 ```json
 {"ts":"2026-10-04T10:12:03Z","session_id":"s-81f","principal":"intern@demo","actor":"databot",
@@ -397,7 +397,7 @@ The competition rules weight the test suite at 20%, so every control has at leas
 - `tests/bypass/`: run from inside the agent container, a direct request to Ollama, the router, MCP servers or Postgres does not get through; the fetch tool cannot reach internal addresses (SSRF).
 - `tests/identity/`: forged, expired, wrong-audience and wrong-algorithm tokens; an unregistered agent; `mode` not matching registration; session reuse with a different principal.
 - `tests/e2e/`: real requests through the gateway to Ollama and MCP servers in docker compose.
-- `tests/attacks/`: a corpus of attack prompts and payloads (direct and indirect injection, secret leakage, tool poisoning, pickle in a model file) with the expected block.
+- `tests/attacks/`: a corpus of attack prompts and payloads (direct and indirect injection, secret leakage, PII exfiltration, tool poisoning, SQL attacks, path traversal, SSRF, approval and identity abuse; pickle scanning is out of scope) with the expected block.
 - `tests/budget/`: token and call budget exhaustion, loop detection, throttling with backoff.
 - `tests/reload/`: changing `policy.yaml` mid-test changes the verdict without restart; a broken file does not break the working policy.
 - `tests/perf/`: p50/p95 overhead with a mocked upstream, written into the report.

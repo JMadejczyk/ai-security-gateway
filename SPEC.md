@@ -38,7 +38,8 @@ The LLM proxy sees intent (a `tool_call` in the model's response); the MCP proxy
 - `ops` network: the gateway's operator listener (`:9090`, serving `/auth/demo-token`, `/admin/*`, `/metrics`), Prometheus, Loki and Grafana. Only this listener and Grafana are published, on `127.0.0.1`.
 - `llm_backend` network (`internal: true`): the gateway and Ollama (and LiteLLM if used).
 - `mcp_backend` network (`internal: true`): the gateway and the internal MCP servers (`mcp-postgres`) plus Postgres.
-- `mcp_untrusted` network: the gateway and `mcp-fetch`. Only this network has outbound internet access, so a compromised fetch server cannot reach Postgres or Ollama.
+- `mcp_untrusted` network (`internal: true`): the gateway and `mcp-fetch`. A compromised fetch server cannot reach Postgres or Ollama.
+- `fetch_egress` network: `mcp-fetch` only, the one runtime network with outbound internet. (Kept separate from `mcp_untrusted` because Docker routes a container's published ports via its default-route network; a non-internal network shared with the gateway would capture the gateway's host port mapping.)
 - No upstream publishes a port to the host. No container gets the Docker socket, `privileged` or host networking.
 
 The router key (e.g. the LiteLLM master key) is known only to the gateway; gateway bearer tokens are never forwarded upstream. Ollama models are pulled before the network is locked down (an init step on a separate, temporary network). In production this maps to network policies or mTLS between the gateway and upstreams. The threat boundary excludes a hostile host or Docker administrator. The bypass tests run **from inside the agent container** against Ollama, MCP servers and Postgres. An employee connecting straight to a public provider API is a matter of company egress policy, outside this project's scope.

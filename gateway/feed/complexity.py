@@ -10,8 +10,16 @@ timeout could apply. Every feed pattern therefore passes a conservative scan fir
   the compiler expands) is bounded per pattern and, in `FeedBudget`, per feed;
 - an unbounded quantifier directly over a group that itself contains one (``(a+)+``, star
   height 2, the classic catastrophic-backtracking shape) is refused;
-- backreferences, lookbehind, conditionals, recursion and inline flags beyond ``aimsux`` are
-  refused: none is needed for a signature, and each makes matching cost hard to bound.
+- backreferences, lookbehind, conditionals, recursion and inline flags beyond ``aimsu`` are
+  refused: none is needed for a signature, and each makes matching cost hard to bound;
+- verbose mode (``x``, inline, scoped or combined with other flags) is refused because it
+  changes the tokens themselves: whitespace and ``#`` comments stop being atoms, so
+  ``(?x)(a{100}) {300}`` repeats the group while this scan would read a literal space. Parsing
+  verbose syntax too would mean a second tokenizer that must agree with ``regex`` on every
+  edge case; refusing it costs signature authors nothing (write ``\\s`` or a literal space).
+  The flags that remain only change what an atom *matches* (``i`` case, ``m``/``s`` anchors and
+  ``.``, ``a``/``u`` character classes), never where one starts or ends, so the scan stays in
+  step with the compiler.
 
 The scan is deliberately stricter than ``regex``'s grammar: a pattern it cannot classify is
 refused, never waved through.
@@ -26,7 +34,7 @@ MAX_PATTERN_WEIGHT: Final = 20_000
 MAX_FEED_WEIGHT: Final = 200_000  # ~275 B peak per unit while compiling (measured)
 MAX_NESTING: Final = 32
 
-_ALLOWED_FLAGS: Final = frozenset("aimsux-")
+_ALLOWED_FLAGS: Final = frozenset("aimsu-")  # never x: see the module docstring
 _BRACED_ESCAPES: Final = frozenset("pPNxuU")  # \p{L}, \N{name}, \x{41}: skip to the brace
 
 
@@ -43,6 +51,7 @@ class Refusal(StrEnum):
     LOOKBEHIND = "lookbehind"
     BACKREFERENCE = "backreference"
     GROUP_SYNTAX = "backreference, conditional, recursion or unsupported group syntax"
+    VERBOSE_MODE = "verbose mode (the x flag)"
     UNSUPPORTED_ESCAPE = "\\g, \\k, \\Q or \\E escape"
     UNTERMINATED = "unterminated escape, group name or character class"
     NESTED_CLASS = "nested character class"
@@ -122,6 +131,8 @@ def _group_open(pattern: str, i: int) -> int:
         if ch in {")", ":"}:
             break
         flags += ch
+    if "x" in flags:
+        raise PatternTooComplexError(Refusal.VERBOSE_MODE)
     if not flags or not set(flags) <= _ALLOWED_FLAGS:
         raise PatternTooComplexError(Refusal.GROUP_SYNTAX)
     return i + 2 + len(flags)  # the ")" or ":" is handled by the caller's loop

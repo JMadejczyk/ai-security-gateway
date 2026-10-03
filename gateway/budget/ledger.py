@@ -16,9 +16,11 @@ store, and only budget-limited calls fail closed when it is down.
 **GPU allowance.** An LLM call holds GPU time up front: the upstream timeout, lowered to what
 every GPU-limited scope has left and to what every cost-limited scope can still pay for at
 the model's GPU price (after the token cost). A budget-bound allowance below
-``MIN_GPU_ALLOWANCE_S`` refuses the call; otherwise the pipeline enforces it as the upstream
-call's deadline. The settlement charges the measured wall time (never more than the
-allowance) and refunds the rest. The allowance is sized from a read, then reserved
+``MIN_GPU_ALLOWANCE_S`` refuses the call. Every LLM call carries an allowance, the plain
+upstream timeout when no budget lowers it (or none applies), and the pipeline enforces it as
+a total deadline on the upstream call: httpx's own timeouts bound each read, so a trickling
+response could otherwise outlast them. The settlement charges the measured wall time (never
+more than the allowance) and refunds the rest. The allowance is sized from a read, then reserved
 atomically: a concurrent call can make the reservation refuse, never overspend, and the
 ledger re-sizes and retries a couple of times.
 
@@ -180,6 +182,8 @@ class BudgetLedger:
             pricing=policy.pricing,
             policy_revision=snapshot.revision,
             soft_limit_pct=policy.budgets.soft_limit_pct,
+            # No budget limits the call: its deadline is still the upstream timeout, in total.
+            gpu_allowance_s=policy.limits.upstream_timeout_s if Meter.GPU in plan.meters else None,
         )
         if not scopes:
             return reservation
@@ -263,7 +267,7 @@ class BudgetLedger:
         costs: CostModel,
         policy: Policy,
     ) -> tuple[Spend, float | None]:
-        """What to hold, GPU allowance included; the allowance itself when a budget bounds it."""
+        """What to hold, GPU allowance included, and the allowance (LLM calls only)."""
         if Meter.GPU not in plan.meters:
             return plan.estimate, None
         allowance_ms = math.ceil(policy.limits.upstream_timeout_s * MS_PER_SECOND)
@@ -289,7 +293,7 @@ class BudgetLedger:
             + costs.gpu_cost(call.model, gpu_ms=allowance_ms),
             gpu_ms=allowance_ms,
         )
-        return amount, (allowance_ms / MS_PER_SECOND if binding is not None else None)
+        return amount, allowance_ms / MS_PER_SECOND
 
     async def _reserve_once(
         self, op_id: str, scopes: tuple[BudgetScope, ...], amount: Spend, meters: frozenset[Meter]

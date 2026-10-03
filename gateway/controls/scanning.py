@@ -12,9 +12,13 @@ touches:
   finding covers the full original range, invisible characters inside it included.
 - **Split values.** A secret cut across content parts, messages or argument fields is
   rebuilt by scanning the joined views around every boundary between consecutive segments
-  (`WINDOW` characters each side, so the cost stays linear; protocol fields such as ``role``
-  are left out of the join, see `TextSegment.joinable`). Only findings that cross a
-  boundary are taken from the joined scan; each contributing fragment gets its own hit.
+  (`WINDOW` characters each side, widened to whole tokens, so the cost stays linear;
+  protocol fields such as ``role`` are left out of the join, see `TextSegment.joinable`).
+  No window may cut a value short: when a finding in one segment runs up to a boundary (an
+  unterminated quoted value, a PEM block without its ``END``, a token at the very end), or a
+  window finding touches a window edge, the whole joined text is scanned instead. Only
+  findings that cross a boundary are taken from the joined scan; each contributing fragment
+  gets its own hit.
 """
 
 import re
@@ -28,6 +32,7 @@ from gateway.controls.text import TextSegment
 
 type Detector = Callable[[str], Iterable[tuple[int, int, str]]]
 
+_SPACES: Final = (" ", "\n", "\t", "\r")  # where a window edge may cut (C-speed searches)
 WINDOW: Final = 4096  # characters of joined context scanned on each side of a boundary
 
 
@@ -94,15 +99,22 @@ def scan(segments: Sequence[TextSegment], detector: Detector) -> list[Hit]:
     """Every finding of ``detector`` in ``segments`` (see the module docstring)."""
     views = [NormalizedView.of(segment.text) for segment in segments]
     hits: list[Hit] = []
-    for segment, view in zip(segments, views, strict=True):
+    reaches_boundary = False  # a finding runs into the next or previous joinable segment
+    joinable = [i for i, segment in enumerate(segments) if segment.joinable]
+    inner_ends = set(joinable[:-1])  # joinable segments followed by another one
+    inner_starts = set(joinable[1:])  # ... and preceded by one
+    for index, (segment, view) in enumerate(zip(segments, views, strict=True)):
         for start, end, label in detector(view.text):
-            if end > start:
-                hits.append(Hit(segment, *view.original(start, end), label))
-    joinable = [(s, v) for s, v in zip(segments, views, strict=True) if s.joinable]
+            if end <= start:
+                continue
+            hit = Hit(segment, *view.original(start, end), label)
+            hits.append(hit)
+            reaches_boundary |= (index in inner_ends and hit.end == len(segment.text)) or (
+                index in inner_starts and hit.start == 0
+            )
     if len(joinable) > 1:
-        hits.extend(
-            _across_boundaries([s for s, _ in joinable], [v for _, v in joinable], detector)
-        )
+        joined = _Joined([segments[i] for i in joinable], [views[i] for i in joinable])
+        hits.extend(_whole(joined, detector) if reaches_boundary else _windowed(joined, detector))
     return hits
 
 
@@ -119,12 +131,17 @@ class _Joined:
         self.text = "".join(view.text for view in views)
 
     def windows(self) -> list[tuple[int, int]]:
-        """Merged ranges of `WINDOW` characters around every boundary between segments."""
-        windows: list[tuple[int, int]] = []
+        """Merged ranges of about `WINDOW` characters around every boundary between segments,
+        each edge widened to the end of the run of non-space characters it falls in (a token
+        is never cut in two by a window edge)."""
+        text, windows = self.text, list[tuple[int, int]]()
         for boundary in self.starts[1:]:
-            low, high = max(0, boundary - WINDOW), min(len(self.text), boundary + WINDOW)
+            low, high = max(0, boundary - WINDOW), min(len(text), boundary + WINDOW)
+            low = max((text.rfind(space, 0, low) + 1 for space in _SPACES), default=0)
+            ends = [found for space in _SPACES if (found := text.find(space, high)) != -1]
+            high = min(ends, default=len(text))
             if windows and low <= windows[-1][1]:
-                windows[-1] = (windows[-1][0], high)
+                windows[-1] = (windows[-1][0], max(windows[-1][1], high))
             else:
                 windows.append((low, high))
         return windows
@@ -139,12 +156,23 @@ class _Joined:
         return pieces if len(pieces) > 1 else []
 
 
-def _across_boundaries(
-    segments: Sequence[TextSegment], views: Sequence[NormalizedView], detector: Detector
-) -> list[Hit]:
-    joined = _Joined(segments, views)
+def _windowed(joined: _Joined, detector: Detector) -> list[Hit]:
+    """Findings that cross a boundary, from the windows. A finding touching a window edge
+    inside the joined text may still have been cut short (a quoted value with spaces in it):
+    then the whole joined text is scanned instead."""
     hits: list[Hit] = []
     for low, high in joined.windows():
         for start, end, label in detector(joined.text[low:high]):
+            if (start == 0 < low) or (low + end == high < len(joined.text)):
+                return _whole(joined, detector)
             hits.extend(joined.split(low + start, low + end, label))
     return hits
+
+
+def _whole(joined: _Joined, detector: Detector) -> list[Hit]:
+    """Findings that cross a boundary, from one scan of the whole joined text."""
+    return [
+        hit
+        for start, end, label in detector(joined.text)
+        for hit in joined.split(start, end, label)
+    ]

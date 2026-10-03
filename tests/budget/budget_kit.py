@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -50,6 +51,7 @@ class ScriptedLLM(httpx.AsyncBaseTransport):
     bodies: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
     usage: dict[str, int] | None = None  # overrides completion()'s usage
     omit_usage: bool = False  # answer without a `usage` object
+    trickle_s: float = 0.0  # stream the body one byte per this many seconds
 
     @property
     def calls(self) -> int:
@@ -69,7 +71,14 @@ class ScriptedLLM(httpx.AsyncBaseTransport):
             answer["usage"] = self.usage
         if self.omit_usage:
             del answer["usage"]
+        if self.trickle_s:  # every gap stays under a per-read timeout; the total does not
+            return httpx.Response(200, content=self._trickle(json.dumps(answer).encode()))
         return httpx.Response(200, json=answer)
+
+    async def _trickle(self, body: bytes) -> AsyncIterator[bytes]:
+        for start in range(0, len(body), 64):
+            await asyncio.sleep(self.trickle_s)
+            yield body[start : start + 64]
 
 
 class FlakyStore:

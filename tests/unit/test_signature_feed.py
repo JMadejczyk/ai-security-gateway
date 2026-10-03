@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 import pytest
+import regex
 import respx
 import yaml
 
@@ -139,6 +140,67 @@ def test_patterns_outside_the_bounded_subset_are_refused(pattern, refusal):
 )
 def test_bounded_patterns_are_accepted(pattern):
     assert parse_feed(feed_bytes(signature(pattern=pattern))).version == "t.1"
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "(?x)(a{100}) {300}",  # verbose: the space is not an atom, the group repeats 300 times
+        "(?x)(a+) +",  # verbose: nested unbounded quantifiers behind a space
+        "(?x:(a+) +)",  # scoped verbose
+        "(?ix)a",  # x combined with an allowed flag
+        "(?sx:a{10}) {50}",
+        "(?-x)a",  # even switching it off: the scan never tracks verbose state
+        "a(?x) {300}",  # a global flag in the middle still applies to the whole pattern
+    ],
+)
+def test_verbose_mode_is_refused(pattern):
+    with pytest.raises(PatternTooComplexError) as raised:
+        pattern_weight(pattern)
+    assert raised.value.refusal is Refusal.VERBOSE_MODE
+
+
+# Accepted patterns, each heavy in a different way, for the differential checks below.
+DIFFERENTIAL_CORPUS = [
+    *(entry["pattern"] for entry in json.loads(STARTER_FEED.read_text())["signatures"]
+      if entry["pattern_type"] != "path_glob"),
+    "a{1000}",
+    "(?:a{100}){100}",
+    "(?:(?:ab){10}c){50}",
+    "[ ]{1000}",  # literal spaces: atoms, since verbose mode is refused
+    "(?s).{1000}",
+    "(?m)^a{500}$",
+    "(?u)\\w{1000}",
+    "(?a)(?:x{30}){30}",
+    "(?i)(?:foo|bar){300}",
+    "(?-i:a{999})",
+    "(?s:(?:.{10}\\s?){90})",
+]  # fmt: skip
+ALLOWED_FLAGS = ["a", "i", "m", "s", "u", "-i"]
+BYTES_PER_WEIGHT = 1000  # measured ~275 B peak per unit while compiling; 3.6x headroom
+COMPILE_BASELINE = 256 * 1024
+
+
+@pytest.mark.parametrize("pattern", DIFFERENTIAL_CORPUS)
+def test_weight_bounds_what_regex_actually_allocates(pattern):
+    """Differential: compiling with the real engine never costs more than the weight allows."""
+    weight = pattern_weight(pattern)
+    regex.purge()  # no cached compile
+    tracemalloc.start()
+    try:
+        regex.compile(pattern)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak <= weight * BYTES_PER_WEIGHT + COMPILE_BASELINE
+
+
+@pytest.mark.parametrize("flag", ALLOWED_FLAGS)
+@pytest.mark.parametrize("pattern", DIFFERENTIAL_CORPUS)
+def test_allowed_flags_do_not_change_the_tokens(pattern, flag):
+    """The remaining flags change what atoms match, never how the scan splits the pattern."""
+    assert pattern_weight(f"(?{flag}){pattern}") == pattern_weight(pattern)
+    assert pattern_weight(f"(?{flag}:{pattern})") == pattern_weight(pattern)
 
 
 def test_a_huge_counted_repeat_is_refused_without_compiling_it():

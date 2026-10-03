@@ -224,6 +224,58 @@ async def test_a_statement_changed_after_sql_guard_is_never_dispatched(stack, mo
     assert stack.log.of("query") == []
 
 
+def tamper_budget_hold(stack: MCPStack, monkeypatch, change) -> None:
+    """Make the budget hold (the step between sql_guard and dispatch) apply ``change``."""
+    ledger = stack.gateway.container.pipeline._budgets
+    assert ledger is not None
+    reserve = ledger.reserve
+
+    async def tampering(*args, **kwargs):
+        return change(await reserve(*args, **kwargs))
+
+    monkeypatch.setattr(ledger, "reserve", tampering)
+
+
+async def test_an_in_place_change_after_sql_guard_is_never_dispatched(stack, monkeypatch):
+    """Codex: mutating the dict sql_guard sealed must not move the seal's baseline with it."""
+
+    def in_place(reservation):
+        reservation.payload["arguments"]["sql"] = HEAVY  # a cross join without LIMIT
+        return reservation
+
+    tamper_budget_hold(stack, monkeypatch, in_place)
+    sales = await connect(stack, ANNA, "sales_db")
+    result = await sales.call("query", sql="SELECT COUNT(*) FROM sales.customers")
+    assert error_text(result) == "sql_changed_after_guard"
+    assert stack.log.of("query") == []
+    assert stack.transport.tool_calls("mcp-postgres", "query") == []
+
+
+async def test_an_equal_but_different_json_value_is_a_change(stack, monkeypatch, tmp_path):
+    """``True == 1`` in Python, not on the wire: the seal compares serialized bytes."""
+    pinned = {
+        "type": "object",
+        "properties": {"sql": {"type": "string"}, "dry_run": {"type": ["boolean", "integer"]}},
+    }
+    pins = tmp_path / "pins"
+    pins.mkdir(exist_ok=True)
+    (pins / "sales_db.json").write_text(
+        json.dumps({"tools": [{"name": "query", "inputSchema": pinned}]})
+    )
+
+    def true_to_one(reservation):
+        arguments = {**reservation.payload["arguments"], "dry_run": 1}
+        return reservation.model_copy(
+            update={"payload": {**reservation.payload, "arguments": arguments}}
+        )
+
+    tamper_budget_hold(stack, monkeypatch, true_to_one)
+    sales = await connect(stack, ANNA, "sales_db")
+    result = await sales.call("query", sql="SELECT COUNT(*) FROM sales.customers", dry_run=True)
+    assert error_text(result) == "sql_changed_after_guard"
+    assert stack.transport.tool_calls("mcp-postgres", "query") == []
+
+
 # ----------------------------------------------- the plan uses the admitted snapshot
 
 

@@ -238,11 +238,24 @@ class _Trace:
 
 @dataclass(frozen=True, slots=True)
 class _Seal:
-    """The payload sealing controls allowed: the only payload that may be dispatched."""
+    """The payload sealing controls allowed, as immutable canonical JSON bytes: the only
+    payload that may be dispatched. Bytes, not the object: a later step could mutate a shared
+    dict in place, and ``==`` would call ``true`` and ``1`` the same."""
 
     control_id: str
     reason_code: str  # refusal when the dispatched payload differs
-    payload: object
+    canonical: bytes
+
+
+def _canonical_bytes(payload: object) -> bytes | None:
+    """Sorted-key, compact, UTF-8 JSON without NaN; None if ``payload`` is not plain JSON."""
+    try:
+        text = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+        )
+    except (TypeError, ValueError):
+        return None
+    return text.encode()
 
 
 def _parse_json_object(body: bytes) -> dict[str, Any]:
@@ -528,15 +541,19 @@ class Pipeline:
     ) -> PipelineOutcome:
         """Steps 6-7: run once upstream, then post controls on the complete result."""
         snapshot = trace.snapshot
-        if trace.seal is not None and payload != trace.seal.payload:
-            changed = Verdict(
-                decision=Decision.BLOCK,
-                control_id=trace.seal.control_id,
-                reason_code=trace.seal.reason_code,
-            )
-            for step in trace.steps:
-                step.add(Stage.PRE, [changed])
-            return self._outcome(trace, merge_verdicts(trace.verdicts()))
+        if trace.seal is not None:
+            if _canonical_bytes(payload) == trace.seal.canonical:
+                # Dispatch a fresh object decoded from the sealed bytes: nothing can alias it.
+                payload = json.loads(trace.seal.canonical)
+            else:
+                changed = Verdict(
+                    decision=Decision.BLOCK,
+                    control_id=trace.seal.control_id,
+                    reason_code=trace.seal.reason_code,
+                )
+                for step in trace.steps:
+                    step.add(Stage.PRE, [changed])
+                return self._outcome(trace, merge_verdicts(trace.verdicts()))
         try:
             trace.upstream = await call.route.upstream.execute(payload, snapshot)
         except UpstreamError as exc:
@@ -672,8 +689,16 @@ class Pipeline:
             return self._hold_for_approval(trace, merged)
         sealed = _final(payload, candidates, MergedVerdict(decision=Decision.ALLOW))  # no spans
         last = sealing[-1]
-        trace.seal = _Seal(control_id=last.id, reason_code=str(last.seal), payload=sealed)
-        return sealed
+        canonical = _canonical_bytes(sealed)
+        if canonical is None:  # not plain JSON: nothing to seal it by, so nothing runs
+            refused = Verdict(
+                decision=Decision.BLOCK, control_id=last.id, reason_code=str(last.seal)
+            )
+            for step in trace.steps:
+                step.add(Stage.PRE, [refused])
+            return self._outcome(trace, merge_verdicts(trace.verdicts()))
+        trace.seal = _Seal(control_id=last.id, reason_code=str(last.seal), canonical=canonical)
+        return json.loads(canonical)  # later steps get their own copy, never the sealed object
 
     async def _run_controls(
         self,

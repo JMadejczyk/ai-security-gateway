@@ -22,6 +22,7 @@ import pytest
 import yaml
 from budget_kit import FlakyStore, ScriptedLLM, StoreUnderTest, scope
 from gateway_testkit import T0, Harness, MutableClock, bearer, chat, running_gateway
+from test_budget_pipeline import session_of
 
 import gateway.container
 from gateway.budget.ledger import SESSION_TTL_SLACK_S, BudgetLedger
@@ -275,3 +276,38 @@ async def test_session_counters_follow_an_extended_lifetime(
     ttl = await store_under_test.ttl(session.key)
     assert ttl is not None
     assert ttl >= 7200 + SESSION_TTL_SLACK_S - 10  # the new lifetime plus slack
+
+
+# ------------------------------------------- 1b. every LLM call has a total deadline (P1)
+
+
+def with_upstream_timeout(harness: Harness, seconds: float) -> None:
+    document = yaml.safe_load(harness.policy_path.read_text())
+    document["limits"]["upstream_timeout_s"] = seconds
+    configure(harness, limits=document["limits"])
+
+
+@pytest.mark.parametrize(
+    "budgets",
+    [
+        {"per_user": {"daily_tokens": 10_000}},  # no GPU budget at all
+        {"per_session": {"gpu_seconds": 100}},  # a GPU budget far above the timeout
+    ],
+    ids=["no-gpu-budget", "gpu-budget-above-timeout"],
+)
+async def test_a_trickling_upstream_cannot_outlast_the_upstream_timeout(
+    tmp_path, monkeypatch, budgets
+):
+    """The codex reproduction: ~0.12 s of chunks 20 ms apart against a 50 ms timeout. httpx
+    times each read, so only a total deadline stops it."""
+    llm = ScriptedLLM(trickle_s=0.02)
+    async with gateway_with(tmp_path, monkeypatch, llm, budgets=budgets) as gateway:
+        with_upstream_timeout(gateway, 0.05)
+        token = await gateway.token("anna@demo")
+        started = time.perf_counter()
+        response = await ask(gateway, token)
+        assert code(response) == (502, "upstream_timeout")
+        assert time.perf_counter() - started < 0.1
+        if "per_session" in budgets:
+            session = await usage(gateway, ScopeKind.SESSION, session_of(token))
+            assert session.gpu_ms <= 50  # charged at most the 50 ms it was allowed

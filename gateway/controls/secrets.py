@@ -1,18 +1,22 @@
 """``secrets``: credentials in prompts, answers, tool arguments and tool results (mandatory).
 
 Our own reviewed rule set, no third-party rule files. Each `SecretRule` is one regex with
-bounded repetition and no nested quantifiers (linear time on any input), the capture group
-that is the secret itself, and an optional validator that rejects look-alikes:
+possessive or fixed repetition and no nested quantifiers (linear time on any input), the
+capture group that is the secret itself, and an optional validator that rejects look-alikes.
+No rule has a length cap that could cut a secret short: a value longer than any cap would be
+masked only in part, so lengths are unbounded and quoted values and PEM blocks are measured
+by a plain scan to their end:
 
 - provider keys with a fixed prefix: AWS access key IDs, GitHub, OpenAI, Anthropic, Slack,
   Stripe live keys, Google API keys;
 - an AWS secret access key, only next to a name that says so (40 base64 characters alone
   are indistinguishable from a hash);
 - JWTs, whose header must decode to a JSON object with ``alg``;
-- PEM private key blocks, including a truncated one (no ``END`` line);
+- PEM private key blocks, including a truncated one (no ``END`` line: masked to the end);
 - the password of a connection string (``postgres://user:pass@host``);
 - ``password=`` / ``api_key:`` / ``secret=`` style assignments with a non-trivial value
-  (a quoted value is taken whole, up to its closing quote, escapes respected);
+  (a quoted value is taken whole, up to its closing quote, escapes respected, or to the end
+  of the text when it never closes);
 - any value whose JSON key names a credential (``{"password": "..."}``, ``"api_key"``,
   ``"authorization"``...), in tool arguments, tool results and decoded tool-call arguments.
 
@@ -37,6 +41,8 @@ it). Redaction masks only the secret, e.g. the password inside a connection stri
 
 import base64
 import binascii
+import bisect
+import functools
 import json
 import re
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -70,6 +76,7 @@ class SecretKind(StrEnum):
 
 type Validator = Callable[[str], bool]
 type Classifier = Callable[[re.Match[str]], SecretKind]
+type Extender = Callable[[str, re.Match[str]], tuple[int, int]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +96,9 @@ class SecretRule:
     the whole match when it depends on context (``db_password=`` vs ``api_key=``). ``hints``
     are lower-case literals every match contains: a text holding none of them is skipped
     without running the regex (a substring test is far cheaper than a regex scan).
+    ``extend`` computes the secret's span itself when the regex only finds where it starts
+    (a quoted value, a PEM block): a plain linear scan to its end, never a length bound, so a
+    long secret is masked whole instead of up to the bound.
     """
 
     id: str
@@ -98,15 +108,18 @@ class SecretRule:
     validate: Validator | None = None
     classify: Classifier | None = None
     hints: tuple[str, ...] = ()
+    extend: Extender | None = None
 
     def find(self, text: str) -> Iterator[SecretFinding]:
         groups = (self.group,) if isinstance(self.group, int) else self.group
         for match in self.pattern.finditer(text):
-            group = next((g for g in groups if match.start(g) >= 0), groups[0])
-            start, end = match.span(group)
+            if self.extend is not None:
+                start, end = self.extend(text, match)
+            else:
+                start, end = match.span(next((g for g in groups if match.start(g) >= 0), 0))
             if end <= start:
                 continue
-            if self.validate is not None and not self.validate(match[group]):
+            if self.validate is not None and not self.validate(text[start:end]):
                 continue
             kind = self.classify(match) if self.classify is not None else self.kind
             yield SecretFinding(self.id, kind, start, end)
@@ -232,6 +245,46 @@ def _assigned_kind(match: re.Match[str]) -> SecretKind:
     return SecretKind.SECRET
 
 
+def closing_quote(text: str, start: int, quote: str) -> int:
+    """Index of the quote closing a value that starts at ``start`` (backslash escapes
+    skipped), or ``len(text)`` when it never closes. Linear: each quote is looked at once."""
+    position = start
+    while (found := text.find(quote, position)) != -1:
+        backslashes = 0
+        while found - backslashes - 1 >= start and text[found - backslashes - 1] == "\\":
+            backslashes += 1
+        if backslashes % 2 == 0:
+            return found
+        position = found + 1
+    return len(text)
+
+
+def _assigned_value(text: str, match: re.Match[str]) -> tuple[int, int]:
+    """A quoted value runs to its closing quote; one that never closes runs to the end of the
+    text: masking the rest is safe, releasing a tail is not (and a stray quote in prose should
+    not refuse the whole request). An unquoted value is the regex's own group."""
+    if (quote := match[2]) is not None:
+        return match.end(), closing_quote(text, match.end(), quote)
+    return match.span(3)
+
+
+_PEM_END: Final = re.compile(r"-----END (?:[A-Z0-9]{1,16} ){0,3}PRIVATE KEY(?: BLOCK)?-----")
+
+
+@functools.lru_cache(maxsize=4)
+def _pem_ends(text: str) -> tuple[int, ...]:
+    """End offsets of every PEM ``END`` line in ``text``, found once per text."""
+    return tuple(match.end() for match in _PEM_END.finditer(text))
+
+
+def _pem_block(text: str, match: re.Match[str]) -> tuple[int, int]:
+    """From the ``BEGIN`` line to the next ``END`` line, or to the end of the text when the
+    block is cut off: key material is masked whole however long it is."""
+    ends = _pem_ends(text)
+    index = bisect.bisect_left(ends, match.end())
+    return match.start(), ends[index] if index < len(ends) else len(text)
+
+
 RULES: Final[tuple[SecretRule, ...]] = (
     SecretRule(
         "aws_access_key_id",
@@ -255,7 +308,7 @@ RULES: Final[tuple[SecretRule, ...]] = (
         "github_token",
         SecretKind.ACCESS_TOKEN,
         re.compile(
-            rf"{_BOUNDARY_BEFORE}(?:gh[pousr]_[A-Za-z0-9]{{36,251}}|github_pat_[A-Za-z0-9_]{{82,240}})"
+            rf"{_BOUNDARY_BEFORE}(?:gh[pousr]_[A-Za-z0-9]{{36,}}+|github_pat_[A-Za-z0-9_]{{82,}}+)"
             rf"{_BOUNDARY_AFTER}"
         ),
         validate=_has_digit,
@@ -265,7 +318,7 @@ RULES: Final[tuple[SecretRule, ...]] = (
         "anthropic_key",
         SecretKind.API_KEY,
         re.compile(
-            rf"{_BOUNDARY_BEFORE}sk-ant-[a-z]{{2,10}}[0-9]{{0,4}}-[A-Za-z0-9_-]{{32,250}}"
+            rf"{_BOUNDARY_BEFORE}sk-ant-[a-z]{{2,10}}[0-9]{{0,4}}-[A-Za-z0-9_-]{{32,}}+"
             rf"{_BOUNDARY_AFTER}"
         ),
         validate=_mixed_token,
@@ -275,8 +328,8 @@ RULES: Final[tuple[SecretRule, ...]] = (
         "openai_key",
         SecretKind.API_KEY,
         re.compile(
-            rf"{_BOUNDARY_BEFORE}sk-(?:(?:proj|svcacct|admin)-[A-Za-z0-9_-]{{40,250}}"
-            rf"|[A-Za-z0-9]{{32,200}}){_BOUNDARY_AFTER}"
+            rf"{_BOUNDARY_BEFORE}sk-(?:(?:proj|svcacct|admin)-[A-Za-z0-9_-]{{40,}}+"
+            rf"|[A-Za-z0-9]{{32,}}+){_BOUNDARY_AFTER}"
         ),
         validate=_mixed_token,
         hints=("sk-",),
@@ -284,14 +337,14 @@ RULES: Final[tuple[SecretRule, ...]] = (
     SecretRule(
         "slack_token",
         SecretKind.ACCESS_TOKEN,
-        re.compile(rf"{_BOUNDARY_BEFORE}xox[abposr]-[A-Za-z0-9-]{{10,250}}{_BOUNDARY_AFTER}"),
+        re.compile(rf"{_BOUNDARY_BEFORE}xox[abposr]-[A-Za-z0-9-]{{10,}}+{_BOUNDARY_AFTER}"),
         validate=_has_digit,
         hints=("xox",),
     ),
     SecretRule(
         "stripe_live_key",
         SecretKind.API_KEY,
-        re.compile(rf"{_BOUNDARY_BEFORE}(?:sk|rk)_live_[A-Za-z0-9]{{20,250}}{_BOUNDARY_AFTER}"),
+        re.compile(rf"{_BOUNDARY_BEFORE}(?:sk|rk)_live_[A-Za-z0-9]{{20,}}+{_BOUNDARY_AFTER}"),
         hints=("_live_",),
     ),
     SecretRule(
@@ -304,8 +357,8 @@ RULES: Final[tuple[SecretRule, ...]] = (
         "jwt",
         SecretKind.ACCESS_TOKEN,
         re.compile(
-            rf"{_BOUNDARY_BEFORE}eyJ[A-Za-z0-9_-]{{6,4096}}\.[A-Za-z0-9_-]{{2,16384}}"
-            rf"\.[A-Za-z0-9_-]{{0,4096}}{_BOUNDARY_AFTER}"
+            rf"{_BOUNDARY_BEFORE}eyJ[A-Za-z0-9_-]{{6,}}+\.[A-Za-z0-9_-]{{2,}}+"
+            rf"\.[A-Za-z0-9_-]*+{_BOUNDARY_AFTER}"
         ),
         validate=_jwt_header,
         hints=("eyj",),
@@ -313,18 +366,16 @@ RULES: Final[tuple[SecretRule, ...]] = (
     SecretRule(
         "private_key",
         SecretKind.PRIVATE_KEY,
-        re.compile(
-            # A whole block, or a header followed by key material when the END line is missing.
-            r"-----BEGIN (?:[A-Z0-9]{1,16} ){0,3}PRIVATE KEY(?: BLOCK)?-----"
-            r"(?:[A-Za-z0-9+/=\s\\:,.-]{0,16384}?-----END (?:[A-Z0-9]{1,16} ){0,3}PRIVATE KEY"
-            r"(?: BLOCK)?-----|[A-Za-z0-9+/=\s\\:,.-]{0,16384})"
-        ),
+        re.compile(r"-----BEGIN (?:[A-Z0-9]{1,16} ){0,3}PRIVATE KEY(?: BLOCK)?-----"),
         hints=("private key",),
+        extend=_pem_block,
     ),
     SecretRule(
         "connection_string_password",
         SecretKind.CONNECTION_STRING,
-        re.compile(rf"(?i:{_SCHEMES})://[^\s:/@'\"]{{0,128}}:([^\s/@'\"]{{1,256}})@"),
+        # Possessive and unbounded: a long user or password is found whole, never cut off. A
+        # raw `/` is allowed in the password (base64 passwords carry it unencoded).
+        re.compile(rf"(?i:{_SCHEMES})://[^\s:/@'\"]*+:([^\s@'\"]++)@"),
         group=1,
         validate=_real_uri_password,
         hints=("://",),
@@ -334,13 +385,12 @@ RULES: Final[tuple[SecretRule, ...]] = (
         SecretKind.SECRET,
         re.compile(
             rf"(?i:{_ASSIGNED_NAME})(?![A-Za-z0-9])[\"']?\s{{0,4}}[:=]{{1,2}}\s{{0,4}}"
-            # A quoted value runs to its closing quote (escapes skipped), or 256 characters.
-            r"(?:\"((?:[^\"\\\n]|\\.){1,256})|'((?:[^'\\\n]|\\.){1,256})"
-            # An unquoted one to a space or separator. `&` is kept: masking the rest of a
-            # query string is safer than leaving part of a password behind.
-            r"|([^\s\"'`,;<>(){}\[\]]{8,256}))"
+            # A quoted value: the regex stops at the opening quote, `_assigned_value` scans to
+            # the closing one. An unquoted value runs to a space or separator (`&` is kept:
+            # masking the rest of a query string beats leaving part of a password behind).
+            r"(?:([\"'])|([^\s\"'`,;<>(){}\[\]]{8,}+))"
         ),
-        group=(2, 3, 4),
+        extend=_assigned_value,
         validate=_real_password,
         classify=_assigned_kind,
         hints=("pass", "pwd", "key", "secret", "token"),

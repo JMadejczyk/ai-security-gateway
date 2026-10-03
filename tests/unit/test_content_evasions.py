@@ -377,3 +377,75 @@ async def test_10_disguised_characters_are_seen_and_the_whole_range_masked(
     verdict, redacted = await evaluate(make_ctx, control, Channel.LLM, Stage.PRE, request)
     assert verdict.decision is Decision.REDACT
     assert redacted["messages"][0]["content"] == masked
+
+
+# --------------------------------------------------- 11. no bound cuts a value short
+
+
+def _b64url(document: dict[str, str]) -> str:
+    return base64.urlsafe_b64encode(json.dumps(document).encode()).rstrip(b"=").decode()
+
+
+LONG_PASSWORD = "Ab1 " * 80  # 320 characters, spaces included
+LONG_JWT = f"{_b64url({'alg': 'HS256', 'kid': 'k' * 5000})}.{_b64url({'sub': 'a' * 20000})}.sig_-1"
+PEM_BODY = "MIIEow" + "A" * 20_000
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        (f'password="{LONG_PASSWORD}" tail', LONG_PASSWORD),
+        (f"password='{LONG_PASSWORD}' tail", LONG_PASSWORD),
+        (f'password="{LONG_PASSWORD}', LONG_PASSWORD),  # never closes: to the end of the text
+        ('password="Ab12345\\\\" tail', "Ab12345\\\\"),  # an escaped backslash, then the quote
+        (f"password={'Xy9' * 100} tail", "Xy9" * 100),  # 300 characters unquoted
+        (f"postgres://{'u' * 200}:{'Pw1' * 100}@db/x", "Pw1" * 100),
+        ("redis://:pa/ss/W0rd@cache", "pa/ss/W0rd"),  # unencoded `/` in the password
+        (f"key {STRIPE}{'a1' * 150} tail", f"{STRIPE}{'a1' * 150}"),
+        (f"key {OPENAI}{'Zz9' * 100} tail", f"{OPENAI}{'Zz9' * 100}"),
+        (f"Bearer {LONG_JWT} tail", LONG_JWT),
+        (
+            f"-----BEGIN RSA PRIVATE KEY-----\n{PEM_BODY}\n-----END RSA PRIVATE KEY----- ok",
+            f"-----BEGIN RSA PRIVATE KEY-----\n{PEM_BODY}\n-----END RSA PRIVATE KEY-----",
+        ),
+        (f"-----BEGIN PRIVATE KEY-----\n{PEM_BODY} no end",
+         f"-----BEGIN PRIVATE KEY-----\n{PEM_BODY} no end"),
+    ],
+    ids=[
+        "quoted-320", "single-quoted-320", "unterminated", "escaped-backslash", "unquoted-300",
+        "uri-long-user-and-password", "uri-slash", "stripe-long", "openai-long", "jwt-long",
+        "pem-20k", "pem-20k-truncated",
+    ],
+)  # fmt: skip
+def test_11_long_values_are_found_whole(text, secret):
+    (finding,) = SecretScanner().find(text)
+    assert text[finding.start : finding.end] == secret
+
+
+async def test_11_a_320_character_quoted_password_releases_no_tail(make_ctx):
+    request = chat({"role": "user", "content": f'config: password="{LONG_PASSWORD}" done'})
+    _, redacted = await evaluate(make_ctx, SECRETS, Channel.LLM, Stage.PRE, request)
+    assert redacted["messages"][0]["content"] == 'config: password="[REDACTED:PASSWORD]" done'
+
+
+@pytest.mark.parametrize(
+    "parts",
+    [
+        # the key starts far before the boundary: the window must widen to the whole token
+        ["x " * 3000 + OPENAI + "Ab3" * 2000, "Xy9" * 10 + " end"],
+        # the first part alone is an unterminated quote: its value continues in the next part
+        [f'password="{"Ab1 " * 1500}', f'{"Cd2 " * 1500}" end'],
+        # a PEM block cut off in one part continues in the next
+        [f"-----BEGIN PRIVATE KEY-----\n{PEM_BODY}", "B" * 9000 + "\n-----END PRIVATE KEY-----"],
+    ],
+    ids=["long-token", "long-quoted-value", "long-pem"],
+)
+async def test_11_a_split_value_longer_than_the_join_window_is_masked_in_every_part(
+    make_ctx, parts
+):
+    request = chat({"role": "user", "content": [{"type": "text", "text": t} for t in parts]})
+    verdict, redacted = await evaluate(make_ctx, SECRETS, Channel.LLM, Stage.PRE, request)
+    assert verdict.decision is Decision.REDACT
+    released = " ".join(part["text"] for part in redacted["messages"][0]["content"])
+    for leaked in ("Xy9Xy9", "Cd2 Cd2", "BBBB", "Ab3Ab3", "AAAA"):
+        assert leaked not in released

@@ -118,6 +118,9 @@ def test_overlapping_rules_report_one_finding():
         "password=" * 20_000,
         "postgres://" + "a" * 200_000,
         "sk-" + "a1B" * 60_000,
+        "-----BEGIN PRIVATE KEY-----\n" * 20_000,  # many blocks, no END line
+        'password="' + "\\" * 200_000 + '"',  # one long backslash run before the quote
+        "postgres://" + "u" * 100_000 + ":" + "p" * 100_000,  # never reaches an @
     ],
 )
 def test_adversarial_input_scans_in_linear_time(text):

@@ -446,8 +446,9 @@ ai-control-layer/
     controls/          # one class = one file
     approvals.py       # approval queue, throttling, kill switch
     telemetry.py       # metrics, audit
-  feeds/signatures.json
-  policy.yaml
+  config/            # mounted read-only as a directory so hot reload sees editor saves
+    policy.yaml
+    feeds/signatures.json
   demo/                # agent, identities, database seed, MCP servers
   grafana/             # dashboards/, provisioning/
   tests/

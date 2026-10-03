@@ -18,7 +18,7 @@ from gateway.policy.evaluator import PrincipalContext
 from gateway.policy.schema import SignaturesConfig
 from gateway.proxies.mcp import wire
 
-STARTER_FEED = Path(__file__).resolve().parents[2] / "feeds" / "signatures.json"
+STARTER_FEED = Path(__file__).resolve().parents[2] / "config" / "feeds" / "signatures.json"
 BLOCK = SignaturesConfig(mode=ControlMode.BLOCK, risk_delta=0.4)
 LOG_ONLY = SignaturesConfig(mode=ControlMode.LOG_ONLY, risk_delta=0.4)
 ALLOWED = pytest.mark.control("signatures", "allow")

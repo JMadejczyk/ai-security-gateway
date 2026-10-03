@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 from injection_kit import DOUBT_MARKER, INJECT_MARKER, MarkerClassifier, ScriptedJudge
+from judge_kit import drop_judges, set_judges
 
 from gateway.controls.prompt_injection import (
     MAX_JUDGED,
@@ -910,7 +911,7 @@ async def test_a_reload_to_another_judge_model_asks_the_judge_again(
 
     def with_model(model: str) -> Any:
         document = copy.deepcopy(policy_doc)
-        document["judges"] = {"model": model, "timeout_s": 5}
+        set_judges(document, {"model": model, "timeout_s": 5})
         return snapshot_from(document)
 
     upstream = ModelUpstream({"lenient-judge": False, "strict-judge": True})
@@ -1096,9 +1097,29 @@ def test_authored_messages_by_role():
 
 
 def test_user_judge_timeout_must_fit_the_judge_timeout(policy_doc, snapshot_from):
-    policy_doc["judges"] = {"model": "qwen3:8b", "timeout_s": 10}
+    set_judges(policy_doc, {"model": "qwen3:8b", "timeout_s": 10})
     policy_doc["controls"]["prompt_injection"]["user_judge_timeout_s"] = 15
     with pytest.raises(PolicyLoadError, match="user_judge_timeout_s"):
         snapshot_from(policy_doc)
     policy_doc["controls"]["prompt_injection"]["user_judge_timeout_s"] = 5
     assert snapshot_from(policy_doc).policy.controls.prompt_injection.user_judge_timeout_s == 5
+
+
+def test_the_demo_policy_gives_the_cpu_judge_time_to_decide(snapshot):
+    """The root policy waits 35 s for the judge on a flagged user prompt (a CPU judge takes
+    ~25 s), within its own judges.timeout_s."""
+    injection = snapshot.policy.controls.prompt_injection
+    judges = snapshot.policy.judges
+    assert injection is not None
+    assert judges is not None
+    assert injection.user_judge_timeout_s == 35
+    assert injection.user_judge_timeout_s <= judges.timeout_s
+
+
+def test_swapping_in_a_faster_judge_drops_the_longer_user_timeout(policy_doc, snapshot_from):
+    """Tests that install a judge of a few seconds keep the policy valid (`set_judges`)."""
+    snapshot = snapshot_from(set_judges(policy_doc, {"model": "qwen3:8b", "timeout_s": 5}))
+    injection = snapshot.policy.controls.prompt_injection
+    assert injection is not None
+    assert "user_judge_timeout_s" not in injection.model_fields_set
+    assert snapshot_from(drop_judges(policy_doc)).policy.judges is None

@@ -18,6 +18,7 @@ from typing import Any
 from pydantic import BaseModel, ValidationError
 
 from gateway.judges.client import JudgeClient, JudgeResult, JudgeUnavailableError, forbids_extra
+from gateway.policy.schema import Judges
 
 type Answer = dict[str, Any] | JudgeUnavailableError | Callable[[str, str], Any]
 
@@ -67,3 +68,42 @@ class FakeJudgeClient(JudgeClient):
         except ValidationError:  # like the real client: a garbled verdict is no verdict
             raise JudgeUnavailableError(JudgeResult.SCHEMA_MISMATCH) from None
         return validated
+
+
+# ------------------------------------------------- editing a policy document's judges
+
+
+def _injection(document: dict[str, Any]) -> dict[str, Any]:
+    controls: dict[str, Any] = document.get("controls") or {}
+    return controls.get("prompt_injection") or {}
+
+
+def set_judges(document: dict[str, Any], judges: Any) -> dict[str, Any]:
+    """``document`` with its ``judges`` section replaced. A judge-bound setting the new
+    section cannot carry is dropped with it, so the control falls back to its default:
+    ``prompt_injection.user_judge_timeout_s`` must not exceed ``judges.timeout_s`` (the root
+    policy sets 35 s for a CPU judge; tests use judges of a few seconds)."""
+    document["judges"] = judges
+    try:
+        timeout_s = Judges.model_validate(judges).timeout_s
+    except ValidationError:
+        timeout_s = None  # an invalid section, under test: keep the rest of the document valid
+    injection = _injection(document)
+    bound = injection.get("user_judge_timeout_s")
+    if bound is not None and (timeout_s is None or bound > timeout_s):
+        injection.pop("user_judge_timeout_s")
+    return document
+
+
+def drop_judges(document: dict[str, Any]) -> dict[str, Any]:
+    """``document`` without ``judges``, and without the explicit settings that need one: the
+    judge controls' sections and the judge-dependent prompt_injection/tool_poisoning keys
+    (the schema rejects them without a judge)."""
+    document.pop("judges", None)
+    controls: dict[str, Any] = document.get("controls") or {}
+    for control in ("intent_judge", "output_policy"):
+        controls.pop(control, None)
+    for key in ("judge_band", "user_judge_timeout_s"):
+        _injection(document).pop(key, None)
+    (controls.get("tool_poisoning") or {}).pop("judge_band", None)
+    return document

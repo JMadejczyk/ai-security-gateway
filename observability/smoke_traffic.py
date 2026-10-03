@@ -7,7 +7,7 @@ detection, a signature hit, ``sql_guard``, the kill switch and a policy reload, 
 what each step got.
 
     uv run python -m observability.smoke_traffic                  # ports from ACL_*_HOST_PORT
-    uv run python -m observability.smoke_traffic --bump-policy policy.yaml
+    uv run python -m observability.smoke_traffic --bump-policy config/policy.yaml
 
 ``--bump-policy PATH`` edits ``controls.sql_guard.max_cost`` in the policy file the gateway
 mounts, reloads, then restores it and reloads again (two "policy changed" annotations; demo

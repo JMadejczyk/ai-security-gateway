@@ -29,7 +29,7 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="ACL_", frozen=True, extra="ignore")
 
-    policy_path: Path = Path("policy.yaml")
+    policy_path: Path = Path("config/policy.yaml")
     identities_path: Path = Path("demo/identities.yaml")
     jwt_secret: Secret  # signs and verifies agent and operator JWTs
     internal_key: Secret  # X-ACL-Principal assertions and audit payload HMACs

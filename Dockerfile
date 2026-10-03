@@ -3,7 +3,7 @@
 #   ACL_OPERATOR_HOST:9090  operator API (/auth/demo-token, /admin/*, /metrics, /healthz)
 # Both default to 127.0.0.1; docker-compose.yml binds the operator listener to the gateway's
 # static IP on the `ops` network only, so it is unreachable from `edge` and the upstream networks.
-# policy.yaml and feeds/ are bind-mounted read-only at runtime; secrets come from the environment.
+# config/ (policy.yaml, feeds/) is bind-mounted read-only at runtime; secrets come from the environment.
 # /app/models holds the injection classifier: the `models-init` service fetches it into a volume
 # the gateway mounts read-only, and the gateway verifies every file's SHA-256 before loading it.
 FROM ghcr.io/astral-sh/uv:0.12.22 AS uv
@@ -33,7 +33,7 @@ FROM python:3.12.15-slim
 ENV PATH=/opt/venv/bin:$PATH \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    ACL_POLICY_PATH=/app/policy.yaml \
+    ACL_POLICY_PATH=/app/config/policy.yaml \
     ACL_AGENT_HOST=127.0.0.1 \
     ACL_AGENT_PORT=8080 \
     ACL_OPERATOR_HOST=127.0.0.1 \

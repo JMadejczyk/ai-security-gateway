@@ -15,6 +15,7 @@ import jwt
 import pytest
 import yaml
 from gateway_testkit import Harness, bearer, completion, running_gateway
+from judge_kit import set_judges
 from mcp_harness import MCPStack, connect_all, error_text
 from pin_kit import capture_pins, write_pins
 from upstreams import running_upstreams
@@ -95,7 +96,7 @@ class ScriptedLLM:
 
 def enable_judges(harness: Harness, **controls: Any) -> None:
     document = yaml.safe_load(harness.policy_path.read_text())
-    document["judges"] = {"model": JUDGE_MODEL, "timeout_s": 5}
+    set_judges(document, {"model": JUDGE_MODEL, "timeout_s": 5})
     document.setdefault("controls", {}).update(controls)
     harness.policy_path.write_text(yaml.safe_dump(document))
     outcome = harness.container.policy_store.reload()

@@ -40,7 +40,7 @@ from gateway.policy.loader import PolicyLoader, PolicySnapshot
 from gateway.telemetry import REGISTRY, FeedReloadResult
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-STARTER_FEED = REPO_ROOT / "feeds" / "signatures.json"
+STARTER_FEED = REPO_ROOT / "config" / "feeds" / "signatures.json"
 FEED_URL = "http://feed.test/signatures.json"
 # Passes the static bounds (no nested unbounded quantifier) yet backtracks exponentially.
 SLOW, SLOW_INPUT = "(?:a|aa)+$", "a" * 3000 + "!"
@@ -424,8 +424,8 @@ async def test_http_source_has_an_overall_deadline(respx_mock):
 
 @pytest.fixture
 def policy_dir(tmp_path) -> Path:
-    shutil.copy(REPO_ROOT / "policy.yaml", tmp_path / "policy.yaml")
-    shutil.copytree(REPO_ROOT / "feeds", tmp_path / "feeds")
+    shutil.copy(REPO_ROOT / "config" / "policy.yaml", tmp_path / "policy.yaml")
+    shutil.copytree(REPO_ROOT / "config" / "feeds", tmp_path / "feeds")
     return tmp_path
 
 

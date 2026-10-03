@@ -19,7 +19,7 @@ from gateway.policy.evaluator import PolicyEvaluator
 from gateway.policy.loader import PolicyLoader, PolicySnapshot
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-ROOT_POLICY = REPO_ROOT / "policy.yaml"
+ROOT_POLICY = REPO_ROOT / "config" / "policy.yaml"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 NOW = datetime(2026, 10, 4, 10, 0, tzinfo=UTC)
 

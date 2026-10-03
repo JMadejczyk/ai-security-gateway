@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 import pytest
 import respx
+from judge_kit import drop_judges, set_judges
 from pydantic import BaseModel, ConfigDict
 
 from gateway.controls.intent_judge import IntentAssessment
@@ -64,8 +65,9 @@ def judged(control: str, result: str) -> float:
 
 @pytest.fixture
 def judge_policy(policy_doc):
-    policy_doc["judges"] = {"model": "judge-model", "timeout_s": 0.5, "max_content_chars": 200}
-    return policy_doc
+    return set_judges(
+        policy_doc, {"model": "judge-model", "timeout_s": 0.5, "max_content_chars": 200}
+    )
 
 
 @pytest.fixture
@@ -240,7 +242,7 @@ async def test_router_key_from_the_policy_not_the_agent(judge_policy, snapshot_f
 
 async def test_call_scope_snapshot_wins_over_the_store(client, upstream, policy_doc, snapshot_from):
     """Inside a call the judge reads the call's pinned snapshot, never a newer one."""
-    policy_doc["judges"] = {"model": "pinned-model"}
+    set_judges(policy_doc, {"model": "pinned-model"})
     pinned = snapshot_from(policy_doc)
     route = upstream.post("/chat/completions").mock(return_value=answer('{"aligned": true}'))
     principal = PrincipalContext(
@@ -330,13 +332,13 @@ async def test_unknown_control_label_is_bounded(client, upstream):
     ],
 )
 def test_judges_section_is_validated(policy_doc, snapshot_from, judges):
-    policy_doc["judges"] = judges
+    set_judges(policy_doc, judges)
     with pytest.raises(PolicyLoadError):
         snapshot_from(policy_doc)
 
 
 def test_judges_section_defaults(policy_doc, snapshot_from):
-    policy_doc["judges"] = {"model": "qwen3:8b"}
+    set_judges(policy_doc, {"model": "qwen3:8b"})
     judges = snapshot_from(policy_doc).policy.judges
     assert judges is not None
     assert (judges.timeout_s, judges.max_content_chars, judges.max_output_tokens) == (
@@ -391,11 +393,7 @@ def test_forbids_extra_checks_nested_models():
 
 
 def without_judges(policy_doc):
-    del policy_doc["judges"]
-    for control in ("intent_judge", "output_policy"):
-        policy_doc["controls"].pop(control, None)
-    policy_doc["controls"]["prompt_injection"].pop("judge_band", None)
-    return policy_doc
+    return drop_judges(policy_doc)
 
 
 @pytest.mark.parametrize(

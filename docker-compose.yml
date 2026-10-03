@@ -70,7 +70,11 @@ services:
     build: .
     image: ai-control-layer/gateway:dev
     environment:
-      ACL_POLICY_PATH: /app/policy.yaml
+      # config/ holds policy.yaml and feeds/ (the policy names its feed relative to itself). It is
+      # mounted as a directory, never as single files: editors and `git checkout` replace a file
+      # with a new inode, which a file bind mount never sees, so the policy watcher would miss
+      # every host edit until a restart.
+      ACL_POLICY_PATH: /app/config/policy.yaml
       ACL_IDENTITIES_PATH: /app/demo/identities.yaml
       # The agent listener serves `edge`; the demo agent reaches it there as http://gateway:8080.
       ACL_AGENT_HOST: 0.0.0.0
@@ -106,8 +110,8 @@ services:
         target: /app/models
         read_only: true
       - type: bind
-        source: ./policy.yaml
-        target: /app/policy.yaml
+        source: ./config
+        target: /app/config
         read_only: true
         bind: { create_host_path: false }
       - type: bind
@@ -115,10 +119,6 @@ services:
         target: /app/demo/identities.yaml
         read_only: true
         bind: { create_host_path: false }
-      - type: bind
-        source: ./feeds
-        target: /app/feeds
-        read_only: true
       - type: bind
         source: ./pins
         target: /app/pins

@@ -48,4 +48,4 @@ Notes:
 
 ## Content we wrote
 
-`feeds/signatures.json` is written by us. It is inspired by public descriptions (OWASP Top 10 for LLM applications, published MCP tool-poisoning write-ups) but copies no text from them.
+`config/feeds/signatures.json` is written by us. It is inspired by public descriptions (OWASP Top 10 for LLM applications, published MCP tool-poisoning write-ups) but copies no text from them.

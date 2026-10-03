@@ -9,6 +9,7 @@ import pytest
 import yaml
 from gateway_testkit import Harness, bearer, chat, completion, echo_completion, running_gateway
 from injection_kit import DOUBT_MARKER, INJECT_MARKER, MarkerClassifier
+from judge_kit import set_judges
 
 from gateway.judges.client import JudgeClient, JudgeResult, JudgeUnavailableError
 
@@ -150,7 +151,7 @@ async def real_judge(tmp_path: Path) -> AsyncIterator[Harness]:
     whatever the root policy ships (so these tests depend on neither state)."""
     async with running_gateway(tmp_path, judge_factory=JudgeClient) as harness:
         document = yaml.safe_load(harness.policy_path.read_text())
-        document["judges"] = {"model": "qwen3:8b", "timeout_s": 5}
+        set_judges(document, {"model": "qwen3:8b", "timeout_s": 5})
         harness.policy_path.write_text(yaml.safe_dump(document))
         assert harness.container.policy_store.reload().result == "ok"
         yield harness

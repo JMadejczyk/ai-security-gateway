@@ -12,7 +12,7 @@ from gateway.core.types import ControlMode, Profile
 from gateway.policy.loader import PolicyLoader, PolicyLoadError, canonical_digest
 from gateway.policy.schema import Controls, PiiConfig, Policy
 
-ROOT_POLICY = Path(__file__).resolve().parents[2] / "policy.yaml"
+ROOT_POLICY = Path(__file__).resolve().parents[2] / "config" / "policy.yaml"
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 
 type Doc = dict[str, Any]

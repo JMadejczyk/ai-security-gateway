@@ -8,6 +8,7 @@ from typing import Any, cast
 
 import pytest
 from injection_kit import DOUBT_MARKER, INJECT_MARKER, MarkerClassifier, ScriptedJudge
+from judge_kit import set_judges
 
 from gateway.controls.prompt_injection import InjectionJudgement
 from gateway.controls.tool_pinning import PinnedListing, PinStatus, listing_scope
@@ -444,7 +445,7 @@ class ModelUpstream(Upstream):
 
 def with_judge_model(policy_doc: dict[str, Any], snapshot_from: Any, model: str) -> Any:
     document = copy.deepcopy(policy_doc)
-    document["judges"] = {"model": model, "timeout_s": 5}
+    set_judges(document, {"model": model, "timeout_s": 5})
     return snapshot_from(document)
 
 

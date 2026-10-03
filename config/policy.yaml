@@ -90,7 +90,11 @@ controls:
   pii:              { mode: redact, threshold: 0.6,
                       entities: [PL_PESEL, PL_NIP, IBAN_CODE, EMAIL_ADDRESS, PHONE_NUMBER] }
   secrets:          { mode: block }
-  prompt_injection: { mode: block, threshold: 0.85, judge_band: [0.5, 0.85], risk_delta: 0.6 }
+  # user_judge_timeout_s: how long a flagged user/system prompt waits for the judge before it
+  # is allowed and the session tainted (must be <= judges.timeout_s). CPU judge ~25 s, so 35
+  # here; use ~5-10 on a GPU.
+  prompt_injection: { mode: block, threshold: 0.85, judge_band: [0.5, 0.85], risk_delta: 0.6,
+                      user_judge_timeout_s: 35 }
   sql_guard:        { mode: block, max_cost: 10000, force_limit: 500, timeout_ms: 3000 }
   egress:           { mode: block, allowed_ports: [80, 443] }   # http-adapter servers: public destinations only
   signatures:       { mode: block, feed: feeds/signatures.json, refresh_s: 30 }  # relative to this file, or an http(s) URL

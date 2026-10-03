@@ -9,12 +9,13 @@ Grafana password from ``ACL_GRAFANA_ADMIN_PASSWORD`` (as in ``.env``).
 import os
 import subprocess
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import httpx
 import pytest
 
+from observability.smoke_traffic import MAX_COST
 from observability.verify_panels import DASHBOARD_UIDS, Grafana, check
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -178,3 +179,60 @@ def test_audit_lines_written_while_alloy_is_down_all_reach_loki(grafana: httpx.C
         time.sleep(3)
         shipped = _loki_count(grafana, start, end)
     assert shipped == written
+
+
+POLICY_FILE = Path(os.environ.get("ACL_LIVE_POLICY_PATH", REPO_ROOT / "config" / "policy.yaml"))
+
+
+def _replace_atomically(path: Path, text: str) -> None:
+    """What editors and `git checkout` do: write a temp file, rename it over (a new inode)."""
+    temp = path.with_name(f".{path.name}.tmp-live-test")
+    temp.write_text(text)
+    temp.replace(path)
+
+
+def _revision() -> str:
+    return str(httpx.get(f"{OPERATOR}/healthz", timeout=10).json()["policy_revision"])
+
+
+def _wait_for_revision(predicate: Callable[[str], bool], timeout_s: float = 20) -> str:
+    deadline = time.monotonic() + timeout_s
+    revision = _revision()
+    while not predicate(revision) and time.monotonic() < deadline:
+        time.sleep(0.5)
+        revision = _revision()
+    return revision
+
+
+def test_a_host_edit_of_the_policy_reloads_without_restart(grafana: httpx.Client) -> None:
+    """Demo step 7: edit config/policy.yaml on the host the way an editor saves it; the
+    running gateway picks it up by itself (no restart, no /admin/reload) and the reload
+    reaches Loki for the dashboards' annotation."""
+    original = POLICY_FILE.read_text()
+    before = _revision()
+    edited, count = MAX_COST.subn(lambda m: f"{m.group(1)}{int(m.group(2)) + 1}", original, 1)
+    assert count == 1
+    try:
+        _replace_atomically(POLICY_FILE, edited)
+        after = _wait_for_revision(lambda revision: revision != before)
+        assert after != before, "the gateway never saw the host edit"
+    finally:
+        _replace_atomically(POLICY_FILE, original)
+    assert _wait_for_revision(lambda revision: revision == before) == before
+
+    query = (
+        '{job="acl", event="policy_reload"} | json revision="revision", result="result" '
+        f'| result="ok" | revision="{after}"'
+    )
+    deadline = time.monotonic() + 60
+    lines: list[object] = []
+    while time.monotonic() < deadline and not lines:
+        now = time.time_ns()
+        response = grafana.get(
+            f"{PROXY}/acl-loki/loki/api/v1/query_range",
+            params={"query": query, "start": str(now - 600 * 10**9), "end": str(now)},
+        )
+        lines = [v for stream in response.json()["data"]["result"] for v in stream["values"]]
+        if not lines:
+            time.sleep(2)
+    assert lines, "the reload event never reached Loki"

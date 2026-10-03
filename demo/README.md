@@ -23,6 +23,12 @@ temporary `bootstrap` network, which has internet access. The `ollama` service i
 `llm_backend` only, so it has no way out. Pull the model before `up`, or stop `ollama` while
 pulling, so two processes don't write the volume at once.
 
+`config/` (the policy and the signature feed) is mounted into the gateway as a read-only
+directory, so editing `config/policy.yaml` on the host takes effect without a restart: the
+gateway's watcher reloads it within a few seconds (a Grafana annotation marks the new
+revision). A single-file bind mount would not work: editors and `git checkout` replace the
+file with a new inode, and the container would keep seeing the old one.
+
 If 9090, 8080 or 3300 is already taken on your machine, set `ACL_OPERATOR_HOST_PORT`,
 `ACL_AGENT_HOST_PORT` or `ACL_GRAFANA_HOST_PORT` in `.env`. All three are published on
 `127.0.0.1` only.
@@ -184,7 +190,7 @@ called `MCPServer`. Each one serves streamable HTTP on `0.0.0.0:8000/mcp`, and t
 | `mcp-fetch` | `fetch(url)` | http(s) GET on port 80/443 only, with a 10 s timeout and a 256 KiB cap. It resolves the host itself and refuses the call if any answer is not a public address (loopback, private, CGNAT, link-local/metadata, ULA, multicast, and IPv4-mapped/6to4 forms of those). It then connects to the validated IP, keeping the original Host header and TLS SNI, so DNS rebinding can't redirect the connection. It does not follow redirects: the agent has to fetch the new URL through the gateway. |
 
 Tool annotations (`readOnlyHint`, `destructiveHint`, ...) are only hints. The gateway's operator
-mapping in `policy.yaml` decides what each tool means.
+mapping in `config/policy.yaml` decides what each tool means.
 
 ### `X-ACL-Principal`
 

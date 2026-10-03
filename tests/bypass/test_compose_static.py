@@ -341,3 +341,24 @@ def test_ollama_keeps_a_cache_slot_for_the_agent_and_one_for_the_judge(
     assert environment["OLLAMA_NUM_PARALLEL"] == "2"
     assert environment["OLLAMA_MAX_LOADED_MODELS"] == "1"  # bounded memory: one model, 2 slots
     assert int(environment["OLLAMA_CONTEXT_LENGTH"] or "0") in range(1024, 8193)
+
+
+def test_policy_is_mounted_through_a_read_only_directory(compose_config: ComposeConfig) -> None:
+    """A file bind mount pins the inode: an editor's save (new inode) would never reach the
+    gateway's watcher. The directory holding the policy is mounted instead, read-only, and it
+    is never the repository root (which holds `.env`)."""
+    policy = compose_config.environment_of("gateway")["ACL_POLICY_PATH"]
+    assert policy is not None
+    mounts = cast(list[dict[str, Any]], compose_config.service("gateway").get("volumes", []))
+    binds = {str(m["target"]): m for m in mounts if m.get("type") == "bind"}
+    assert policy not in binds  # not a single-file mount
+    directory = binds[str(Path(policy).parent)]
+    assert directory.get("read_only") is True
+    source = Path(str(directory["source"])).resolve()
+    assert source.is_dir()
+    assert source != REPO_ROOT
+    assert source.is_relative_to(REPO_ROOT)
+    assert (source / Path(policy).name).is_file()
+    assert not (source / ".env").exists()
+    for mount in binds.values():  # nothing in the container sees the repo root itself
+        assert Path(str(mount["source"])).resolve() != REPO_ROOT

@@ -28,8 +28,8 @@ from gateway.main import create_agent_app, create_operator_app
 from gateway.settings import Settings
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-ROOT_POLICY = REPO_ROOT / "policy.yaml"
-FEEDS = REPO_ROOT / "feeds"  # policy.yaml names its signature feed relative to itself
+ROOT_POLICY = REPO_ROOT / "config" / "policy.yaml"
+FEEDS = REPO_ROOT / "config" / "feeds"  # policy.yaml names its signature feed relative to itself
 IDENTITIES = REPO_ROOT / "demo" / "identities.yaml"
 # 64+ bytes, so the identity suite's HS512 probes do not trip PyJWT key-length warnings.
 JWT_SECRET = "test-jwt-secret-" + "0123456789abcdef" * 4

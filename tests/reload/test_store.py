@@ -13,7 +13,7 @@ from gateway.policy.loader import PolicyLoadError, PolicySnapshot
 from gateway.policy.store import PolicyStore
 from gateway.telemetry import REGISTRY, ReloadResult
 
-ROOT_POLICY = Path(__file__).resolve().parents[2] / "policy.yaml"
+ROOT_POLICY = Path(__file__).resolve().parents[2] / "config" / "policy.yaml"
 BARTEK = PrincipalContext(
     principal="bartek@demo", roles=("intern",), agent="databot", mode=SessionMode.INTERACTIVE
 )

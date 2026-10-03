@@ -1,12 +1,12 @@
 # AI Control Layer — tech spec
 
-Oct 3, 2026 · @Jakub
+Oct 3, 2026 · @Jakub · v2 (after review, see [Changelog](#changelog))
 
 ## Goal and thesis
 
 We are building a security layer that all agent traffic passes through, both to models and to tools. It is not an LLM router. It sits in front of any OpenAI-compatible gateway (LiteLLM, Ollama, OpenRouter) and in front of MCP servers.
 
-Thesis: detecting a threat should not just block one request. It should change what the agent may do for the rest of the session. In an interactive session that means narrowing permissions. For a registered autonomous system it means throttling and human approval instead, because cutting it off could stop a business process. Effective permissions are always user permissions ∩ agent permissions ∩ task scope, reduced by session risk.
+Thesis: detecting a threat should not just block one request. It should change what the agent may do for the rest of the session. In an interactive session that means narrowing permissions. For a registered autonomous system it means throttling and human approval instead: configured grants are preserved while execution is temporarily withheld. Base permissions are always principal permissions ∩ agent permissions ∩ task scope; session risk can only add restrictions and obligations on top, never widen them.
 
 The problem raised by the challenge owner: an agent acts on behalf of a specific person but must not inherit all of that person's rights, and the same agent triggered by two people must see different data.
 
@@ -16,7 +16,7 @@ In 22 hours we ship two entry points (LLM and MCP), a shared policy core with ho
 
 | Area | In scope | Out of scope (extension point) |
 | --- | --- | --- |
-| Entry points | LLM proxy (OpenAI-compatible), MCP proxy (streamable HTTP) | A2A proxy, in-process SDK/library |
+| Entry points | LLM proxy (OpenAI-compatible `/v1/chat/completions`, `/v1/models`), MCP proxy (streamable HTTP, tools-only subset) | A2A proxy, in-process SDK/library, MCP resources/prompts/sampling/elicitation |
 | Identity | Our own JWT with `sub` (user) and `act` (agent), signed with a demo key | Real IdP, full OAuth Token Exchange |
 | Policies | One YAML file, validation, hot reload without restart | Policy editing UI, versioning in a database |
 | Adapters | Generic MCP, SQL (Postgres), HTTP egress, filesystem, LLM | More systems (Jira, S3, Slack) |
@@ -32,42 +32,78 @@ One service with two entry points and a shared core. The agent knows only the ga
 
 The LLM proxy sees intent (a `tool_call` in the model's response); the MCP proxy enforces the decision when the tool runs. Both share the same session state, so taint from a tool result narrows rights on the next turn. The LLM upstream is any OpenAI-compatible URL, so the layer sits in front of an existing router instead of replacing it. A2A would be a third entry point into the same core, out of scope for the hackathon.
 
-**No bypassing the gateway.** Upstreams accept traffic only from the gateway. Ollama, the router and MCP servers live on an internal Docker network with no published ports, and the router key (e.g. the LiteLLM master key) is known only to the gateway. In production this maps to network policies or mTLS between the gateway and upstreams. The demo shows that a direct request from the agent to Ollama does not get through. An employee connecting straight to a public provider API is a matter of company egress policy, outside this project's scope.
+**No bypassing the gateway.** Upstreams accept traffic only from the gateway. Containers on a shared Docker bridge can reach each other, so "internal network, no published ports" alone is not enough. The topology is:
+
+- `edge` network (`internal: true`): the agent and the gateway's agent listener (`:8080`, serving `/v1` and `/mcp`). The gateway is the only service the agent can resolve or reach, and the agent has no internet access.
+- `ops` network: the gateway's operator listener (`:9090`, serving `/auth/demo-token`, `/admin/*`, `/metrics`), Prometheus, Loki and Grafana. Only this listener and Grafana are published, on `127.0.0.1`.
+- `llm_backend` network (`internal: true`): the gateway and Ollama (and LiteLLM if used).
+- `mcp_backend` network (`internal: true`): the gateway and the internal MCP servers (`mcp-postgres`) plus Postgres.
+- `mcp_untrusted` network: the gateway and `mcp-fetch`. Only this network has outbound internet access, so a compromised fetch server cannot reach Postgres or Ollama.
+- No upstream publishes a port to the host. No container gets the Docker socket, `privileged` or host networking.
+
+The router key (e.g. the LiteLLM master key) is known only to the gateway; gateway bearer tokens are never forwarded upstream. Ollama models are pulled before the network is locked down (an init step on a separate, temporary network). In production this maps to network policies or mTLS between the gateway and upstreams. The threat boundary excludes a hostile host or Docker administrator. The bypass tests run **from inside the agent container** against Ollama, MCP servers and Postgres. An employee connecting straight to a public provider API is a matter of company egress policy, outside this project's scope.
 
 ## Identity and permission model
 
 Every request carries two identities: the person who triggered the agent and the agent itself. The decision is made on the intersection of their rights, and session risk can only narrow it, never widen it.
 
-**Identity.** The agent sends `Authorization: Bearer <JWT>` with claims `sub` (user), `act.sub` (agent), `roles`, `session_id`, `exp`. The claim shape follows OAuth Token Exchange (RFC 8693). For the demo, tokens are issued by `/auth/demo-token`. An agent without a user token gets only its own rights, flagged `autonomous: true`.
+**Identity.** The agent sends `Authorization: Bearer <JWT>` with claims `iss`, `aud`, `sub` (principal), `act.sub` (agent), `roles`, `mode` (`interactive` | `autonomous`), `session_id`, optional `scope`, `iat`, `exp`. The claim shape follows OAuth Token Exchange (RFC 8693); the shape alone does not prove delegation, so the gateway also checks it:
+
+- Algorithm pinned (`HS256` for the demo key; `RS256`/`EdDSA` in production), signature, `iss`, `aud = ai-control-layer`, `exp`, and a maximum token lifetime (default 1 h).
+- `act.sub` must be an agent registered in the policy; `mode` must equal that agent's registered `type`; the principal must be allowed for the agent (`principals` on the agent, default: any human principal for interactive agents).
+- `roles` must exist in the policy.
+- A session is bound on first use to `(sub, act.sub, mode)`. A token presenting the same `session_id` with a different binding is rejected. Refreshing a token never clears session state (taint, risk).
+
+For an **autonomous** agent there is no human. `sub` is the agent's own service principal (`svc:<agent>`), and `U` is the agent's own `allow` grants, so the formula below is unchanged. A missing user never silently selects autonomous mode: `mode` is asserted by the issuer and validated against the registration.
+
+Demo identities: `anna@demo` (analyst), `bartek@demo` (intern), `olga@demo` (ops-team), `root@demo` (admin), and the service principal `svc:nightly_etl`. Tokens come from `POST /auth/demo-token`, which only issues tokens for identities predefined in `demo/identities.yaml` and is bound to the operator network (disabled when `ACL_DEMO_TOKENS=0`). The signing key lives only in the gateway, never in the agent container. `/admin/*` requires an operator token: role `admin` for everything, or an approver role, which may only list and decide approvals for the agents that name it in `approvers`. Bearer-token theft still means impersonation; we do not claim workload attestation.
 
 **Credentials.** Real keys to databases, APIs and models live only in the gateway. The agent knows only the gateway URL, so it cannot bypass the layer for managed resources.
 
-**Effective permissions** are computed per call:
+**Decision model.** Every call is decided in two layers.
 
-```latex
-E = U(\text{user}) \cap A(\text{agent}) \cap T(\text{task}) \setminus R(\text{risk}, \text{taint})
+```text
+base_allowed =
+      principal grants match (action, resource)      # U: union of the principal's role grants
+  AND agent grants match (action, resource)           # A: agent's allow list, filtered by max_actions
+  AND task scope matches (action, resource)           # T: token `scope`; absent = unrestricted, [] = nothing
+  AND no explicit deny matches                        # agent deny, blocklist
+
+if not base_allowed or agent killed or principal/agent/use case blocklisted:
+    deny
+else:
+    apply session restrictions (risk rules for the session mode)    # can only remove or condition
+    run controls, collect verdicts and obligations (approval, throttle, redaction)
+    execute only after every obligation is satisfied
 ```
 
-- `U`: the user's role permissions, e.g. `read:db:sales.*`.
-- `A`: the agent's maximum scope, e.g. DataBot may only `read` and `generate`.
-- `T`: optional task scope passed in the token (`scope`), unrestricted by default.
-- `R`: actions removed by risk rules.
+Grants are matched against the concrete `(action, resource)` of each interaction; we never intersect pattern sets symbolically (that would wrongly decide `read:db:sales.*` and `read:db:sales.orders` do not overlap). Approval and throttling are obligations on an already allowed call; **an approval never grants an operation outside `base_allowed`**.
 
-**Risk score and taint.** A session starts at `risk = 0`. Each control returns a `risk_delta`, and the score decays over time. Taint is set when untrusted content reaches the agent's context: a tool result flagged `untrusted` (web, email, external document) or a prompt-injection detector hit. Taint lasts until the session ends.
+**Permission grammar.**
 
-**The reaction depends on session type.** The token decides the type: a human `sub` means an interactive session; `autonomous: true` on an agent registered in the policy means an autonomous system.
+```text
+permission       := action ":" resource_pattern        # split at the FIRST colon only
+action           := "read" | "write" | "delete" | "execute" | "egress" | "generate" | "*"
+resource_pattern := "*" | namespace ":" identifier_pattern   # split at the next colon, later colons preserved
+```
+
+`generate:model:qwen3:8b` → action `generate`, namespace `model`, identifier `qwen3:8b`. `*` matches any run of characters (it crosses `.` and `:`), there are no other wildcards, matching is case-sensitive and anchored on the whole string, `*` as the whole resource pattern matches every resource, so `*:*` is every action on every resource and `egress:*` is egress anywhere. A concrete resource (on an `Interaction`) always has the `namespace:identifier` form.
+
+**Risk score and taint.** A session starts at `risk = 0`. Risk is bounded to `[0, 1]`. Each control verdict adds its `risk_delta` (clamped), including verdicts on calls that end up blocked. Risk decays exponentially with a configurable half-life (`risk.half_life_s`, default 600 s, wall clock on the gateway). Thresholds are strict (`risk_gt: 0.5` means `> 0.5`). Each detection control has a configurable `risk_delta` (defaults: `prompt_injection` 0.6, `secrets` 0.3, `signatures` 0.4, `pii` 0.1, `authz` deny 0.1); an allow verdict adds nothing. Taint is set when untrusted content reaches the agent's context: a tool result from a server with `trust: untrusted` (web, email, external document) or a prompt-injection detector hit. A tool result that is blocked or replaced still taints the session, because the attempt reached the gateway on the agent's behalf. **Taint lasts until the session ends, and decay never clears it.** Taint from a tool result is persisted before that result is released to the agent. Calls within one session are serialized, so a call never races past a restriction set by the previous one. A session ends on `DELETE /v1/session`, after `sessions.idle_ttl_s` (default 3600) without calls, or after `sessions.max_lifetime_s` (default 86400); a token naming an ended session is rejected and a new `session_id` must be issued. `/v1/models` lists only the models the session may `generate`.
+
+**The reaction depends on session mode.** The mode is the token's `mode` claim, validated against the agent's registered `type`.
 
 | Session state | Interactive session (human) | Autonomous system (registered) |
 | --- | --- | --- |
 | `taint = true` | `write`, `delete`, `egress` removed until session end | `write`, `delete`, `egress` need human approval |
-| `risk > 0.5` | `write` needs approval, denied actions get a 5 min cooldown | Throttling with backoff + alert |
-| `risk > 0.8` | Tools frozen for 5 min, `generate` only | Everything except `read` goes to the approval queue + alert |
+| `risk > 0.5` | `write` needs approval; a call denied in this state starts a 5 min cooldown on the same `action:resource` | Throttling with exponential backoff + alert |
+| `risk > 0.8` | Tool calls (MCP channel) frozen for 5 min, LLM `generate` still allowed | Every action except `read` and `generate` goes to the approval queue + alert |
 
-Automation never permanently revokes rights granted in the policy. It can slow down, hold for approval, or freeze a human's session for a few minutes. Permanently disabling an agent (kill switch, `POST /admin/kill`) is always a human decision.
+A `cooldown_s` starts when a call is denied in that state and applies to the same `action:resource`; a `freeze_tools` `duration_s` starts when the threshold is first crossed. Neither timer is refreshed by further calls; when the timer ends the rule applies again only if risk is still above the threshold, so a freeze can be re-entered but never extends itself indefinitely. Automation never permanently revokes rights granted in the policy. It can slow down, hold for approval, or freeze a human's session for a few minutes. `throttle` caps an autonomous agent at `max_actions` per `per_s`; each call over the cap is rejected with `Retry-After`, and consecutive rejections grow it exponentially from `throttle.base_s` up to `throttle.max_s`, resetting after one compliant window. Approval timeout means deny, so an autonomous process may still stop; availability never overrides authorization. Permanently disabling an agent (kill switch, `POST /admin/kill`) is always a human decision.
 
-**Human in the loop.** On `require_approval` the MCP proxy returns a tool error with an `approval_id`. Approvers see the queue at `GET /admin/approvals` (plus a CLI and a Grafana panel). After approval the agent retries the call with the same `approval_id`. No decision within the timeout means deny.
+**Human in the loop.** On `require_approval` the MCP proxy returns a tool error with an `approval_id`. An approval authorizes **one exact pending operation**: it is bound to principal, agent, session, server, tool, a digest of the canonical (sorted-key JSON) arguments and the policy version, and expires with `approvals.timeout_s`. Approvers see the queue at `GET /admin/approvals` (plus a CLI and a Grafana panel); an approver must hold the agent's `approvers` role and can never be the session's own principal or agent. On retry with the `approval_id` the gateway re-authenticates, verifies the binding, re-checks base authorization, blocklist, kill switch and controls, satisfies only the approval obligation, and atomically moves the operation `approved → executing`. States: `pending`, `approved`, `denied`, `expired`, `executing`, `succeeded`, `failed`, `uncertain` (upstream outcome unknown after a lost response; never auto-retried). A retry of a pending operation returns the same `approval_id` instead of creating a new entry, and approval retries are excluded from loop detection. Exactly-once side effects are not guaranteed for upstreams without idempotency keys.
 
-Row-level filtering is done by the adapter, not the model. For Postgres the gateway sets `app.user_id` via `set_config` and relies on RLS, so `COUNT(*)` returns the number of rows visible to that user.
+**Row-level filtering** is done by the data layer, not the model. The SQL MCP server is trusted (`trust: internal`) and owns the database transaction. The gateway forwards the authenticated principal in a header signed with an internal key (`X-ACL-Principal`, never the agent's bearer token). For each call the server takes one pooled connection, begins a transaction, runs `SELECT set_config('app.user_id', $1, true)` (transaction-local, parameterized), executes the exact query `sql_guard` approved, then commits or rolls back before returning the connection. A missing principal fails closed. The database role is a non-owner without superuser or `BYPASSRLS`, tables use `FORCE ROW LEVEL SECURITY`, and `sql_guard` rejects any statement that could touch `set_config`/`current_setting` or session state. `COUNT(*)` therefore returns the number of rows visible to that user.
 
 ## Pipeline and interfaces
 
@@ -75,65 +111,91 @@ The core knows nothing about SQL or any specific provider. Every interaction is 
 
 **Order for every call:**
 
-1. Authentication: verify the JWT, load session state.
-2. Adapter: normalize into `Interaction` (action, resource).
-3. `pre` controls: deterministic first (cheap), semantic only when needed.
-4. Policy decision: effective permissions + control verdicts → allow / redact / block / require\_approval.
-5. Execute on the upstream (model, MCP server).
-6. `post` controls: redact the result, set taint, check the model that actually answered.
-7. Audit and metrics, update session state.
+1. Authentication: verify the JWT, load and lock session state (one call per session at a time).
+2. Adapter: normalize into one or more `Interaction`s (action, resource).
+3. Base authorization (decision model above) on every interaction; any deny stops here.
+4. `pre` controls: deterministic first (cheap), semantic only when needed.
+5. Merge verdicts → allow / redact / block / require\_approval, plus obligations.
+6. Execute on the upstream (model, MCP server) **once** for the original request, only if every interaction passed.
+7. `post` controls on the complete (buffered) result: redact, set taint, check the model that actually answered.
+8. Audit and metrics; persist session state (risk deltas from every verdict, including blocked calls) before releasing the result.
+
+Every decision reads one immutable policy snapshot taken at step 1, so a reload mid-call never mixes two policy versions.
 
 ```python
-@dataclass
-class Interaction:
-    session_id: str
-    principal: str          # user (sub)
-    actor: str              # agent (act.sub)
-    channel: Literal["llm", "mcp", "a2a"]
-    action: Literal["read", "write", "delete", "execute", "egress", "generate"]
-    resource: str           # "db:sales.orders", "http:api.stripe.com", "model:qwen3:8b"
-    payload: Any
-    context: SessionContext # risk, taint, budgets, call history
+Action = Literal["read", "write", "delete", "execute", "egress", "generate"]
+Decision = Literal["allow", "redact", "block", "require_approval"]
+Stage = Literal["pre", "post"]
 
-@dataclass
-class Verdict:
-    decision: Literal["allow", "redact", "block", "require_approval"]
+class Interaction(BaseModel, frozen=True):
+    session_id: str
+    principal: str            # sub (human, or svc:<agent> for autonomous)
+    actor: str                # act.sub
+    mode: Literal["interactive", "autonomous"]
+    channel: Literal["llm", "mcp", "a2a"]
+    action: Action
+    resource: str             # "db:sales.orders", "http:api.stripe.com", "model:qwen3:8b"
+    payload: Any              # request payload (pre) ...
+    result: Any = None        # ... and upstream result (post)
+    context: SessionContext   # risk, taint, budgets, call history (read-only snapshot)
+
+class Span(BaseModel, frozen=True):
+    path: str                 # JSON pointer into payload/result, e.g. "/messages/0/content"
+    start: int                # code-point offsets within that string
+    end: int
+    label: str                # "PESEL", "API_KEY", ...
+
+class Verdict(BaseModel, frozen=True):
+    decision: Decision
     control_id: str
-    reason: str
+    reason_code: str          # structured, e.g. "resource_outside_scope"
+    reason: str = ""          # human text, never contains payload data
+    enforced: bool = True     # False = log_only: recorded, decision not applied
     risk_delta: float = 0.0
-    redactions: list[Span] = field(default_factory=list)
+    redactions: tuple[Span, ...] = ()
+    rewrite: Any = None       # replacement payload (pre) or result (post), e.g. sql_guard's LIMIT-ed query
     latency_ms: float = 0.0
 
-class Adapter(Protocol):
+class Adapter(ABC):
+    @abstractmethod
     def matches(self, raw: RawCall) -> bool: ...
+    @abstractmethod
     def normalize(self, raw: RawCall, ctx: SessionContext) -> list[Interaction]: ...
 
-class Control(Protocol):
-    id: str
-    stage: Literal["pre", "post"]
-    kind: Literal["deterministic", "semantic"]
-    async def evaluate(self, i: Interaction, cfg: dict) -> Verdict: ...
+class Control(ABC):
+    id: ClassVar[str]
+    stages: ClassVar[frozenset[Stage]]          # a control can run pre, post, or both
+    kind: ClassVar[Literal["deterministic", "semantic"]]
+    mandatory: ClassVar[bool] = False           # enforces in every profile, cannot be set to log_only
+    @abstractmethod
+    async def evaluate(self, i: Interaction, stage: Stage, cfg: ControlConfig) -> Verdict: ...
 ```
 
-One request can produce several envelopes: an SQL query reading two tables becomes two `Interaction`s, each checked separately. The strictest verdict wins (block > require\_approval > redact > allow).
+One request can produce several envelopes: an SQL query reading two tables becomes two `Interaction`s, each checked separately; the request executes once (with any rewrites), only after all of them pass. Merging: the strictest **enforced** decision wins (block > require\_approval > redact > allow), but obligations accumulate: approval plus redaction yields both. Controls run in a fixed order; when a control returns `rewrite`, the pipeline builds a new `Interaction` (`model_copy(update=...)`) carrying it, and later controls and the upstream see the rewritten payload. The upstream executes the final payload, never the agent's original when a rewrite exists. Redaction spans are applied to the payload/result after merging; overlapping spans on the same path are unioned. `log_only` is not a decision: a control in `log_only` mode returns its would-be decision with `enforced=False`, which is audited and counted but not applied.
 
-`GenericMCPAdapter` handles any MCP server out of the box by mapping tool annotations (`readOnlyHint`, `destructiveHint`, `openWorldHint`) to `action`. A tool without annotations is treated as `execute` and needs an explicit rule.
+`GenericMCPAdapter` maps MCP tools to `(action, resource)` from an **operator-owned mapping** in the policy (`upstreams.mcp.<server>.tools`), keyed by tool name. MCP tool annotations (`readOnlyHint`, `destructiveHint`, `openWorldHint`) come from the server and are untrusted: they are shown to the operator as hints when building the mapping, but never authorize anything. A tool missing from the mapping is denied. Arguments are validated against the tool's input schema: the one pinned in `pins/<server>.json` (written by `acl pin <server>` from an operator-reviewed `tools/list` snapshot; it becomes mandatory with `tool_pinning` in stage 3), or until then the schema the upstream advertised when the gateway first connected. `tools/list` is filtered: a tool is listed only if it is mapped, its action is in the agent's `max_actions`, and the session's restrictions do not currently remove that action. Resource-level checks happen on `tools/call`, once arguments exist.
+
+The MCP proxy supports a pinned protocol version (`2025-06-18`) and a tools-only subset: `initialize`, `notifications/initialized`, `tools/list`, `tools/call`, `ping`. Resources, prompts, sampling, elicitation and other server-initiated requests are answered with a JSON-RPC "method not found" error. Each downstream (agent) MCP session maps to its own upstream session; upstream sessions are never shared across principals.
 
 ## Control catalog
 
-Deterministic controls always run and are cheap (target p95 < 5 ms combined). Semantic controls run in tiers: a small classifier on every input, and an LLM judge only when the classifier score falls in the uncertain band.
+Deterministic controls always run and are cheap (target p95 < 5 ms combined, excluding Presidio's NLP pass, which is measured separately). Semantic controls run in tiers: a small classifier on every input, and an LLM judge only when the classifier score falls in the uncertain band. Controls marked *mandatory* enforce in every profile and reject `mode: log_only`.
+
+**Streaming.** Post controls need the complete output, and an SSE chunk that has reached the agent cannot be retracted. For `stream: true` the LLM proxy therefore calls the upstream **non-streaming**, runs every post control on the full response (text and `tool_calls`), and then re-emits the approved result to the agent as OpenAI-compatible SSE chunks ending in `data: [DONE]`. Agents that expect streaming keep working; first-token latency equals full-response latency. Responses are bounded (`limits.max_response_bytes`).
+
+**Intent vs enforcement.** `session_id` correlates a conversation, not an authorized tool invocation: an agent can change arguments, call a different tool, or call MCP without any LLM request. So `intent_judge` is advisory and every MCP call goes through full authorization on its own. Its verdict never holds an LLM response: the response is released, and a `require_approval` verdict marks that `tool_call` (tool name + argument digest) as flagged in the session, so the matching MCP `tools/call` then requires approval through the normal MCP flow. It also adds its `risk_delta`. The user goal the judge compares against comes from trusted session metadata (the first user message recorded by the gateway), not from the transcript the agent sends later.
 
 | ID | Type | Stage | Channel | What it does | Modes |
 | --- | --- | --- | --- | --- | --- |
-| `authn` | det. | pre | all | Verify JWT, agent and role exist | block |
-| `authz` | det. | pre | all | Effective permissions vs `action:resource` | block, require\_approval |
+| `authn` | det. | pre | all | Verify JWT, agent and role exist, session binding (mandatory) | block |
+| `authz` | det. | pre | all | Base authorization + session restrictions vs `action:resource` (mandatory) | block, require\_approval |
 | `model_allowlist` | det. | pre+post | llm | Allowed models per role/agent; also checks the model in the upstream response | block, log\_only |
 | `pii` | det. | pre+post | all | Presidio + Polish regexes (PESEL, NIP, IBAN) | redact, block, log\_only |
-| `secrets` | det. | pre+post | all | API keys, tokens, private keys, connection strings | redact, block |
-| `sql_guard` | det. | pre | mcp (SQL) | Parse, classify read/write/DDL, `EXPLAIN` + cost threshold, forced `LIMIT` and timeout | block |
-| `egress` | det. | pre | mcp (HTTP) | Domain allowlist, block under taint | block, require\_approval |
-| `signatures` | det. | pre+post | all | Match against an external attack signature feed | block, log\_only |
-| `tool_pinning` | det. | pre | mcp | Hash MCP tool descriptions, detect changes after approval (rug pull) | block |
+| `secrets` | det. | pre+post | all | API keys, tokens, private keys, connection strings (mandatory) | redact, block |
+| `sql_guard` | det. | pre | mcp (SQL) | Parse with `sqlglot` (Postgres dialect), allow only a supported `SELECT` subset (single statement, no DDL/DML, no CTE writes, no `COPY`, no session or settings functions, only allowlisted functions, every table resolved), `EXPLAIN (FORMAT JSON)` without `ANALYZE` against a planner-cost threshold, forced `LIMIT`, `statement_timeout`/`lock_timeout`, result-byte limit; the exact rewritten query is what executes (mandatory) | block |
+| `egress` | det. | pre | mcp (HTTP) | Parsed scheme/host/port allowlist, DNS resolution checked against private, loopback and metadata ranges, redirects re-validated; taint handling comes from `risk_rules` per session mode | block, require\_approval |
+| `signatures` | det. | pre+post | all | Match against an external attack signature feed (size-bounded, schema-validated, regex with a timeout, last valid feed kept) | block, log\_only |
+| `tool_pinning` | det. | pre | mcp | Pin tool names, input schemas, descriptions and annotations to the approved baseline; any change (rug pull) blocks the tool until re-approved. Does not prove server implementation integrity | block |
 | `budget` | det. | pre+post | all | Tokens, cost, tool calls, GPU time per user/agent/session | block |
 | `loop_detect` | det. | pre | all | Same call N times within window T | block |
 | `prompt_injection` | sem. | pre+post | llm, mcp | Classifier on prompts and on tool results (indirect injection) | block, log\_only |
@@ -141,9 +203,9 @@ Deterministic controls always run and are cheap (target p95 < 5 ms combined). Se
 | `intent_judge` | sem. | post | llm | LLM judge compares a `tool_call` with the user's goal | require\_approval, log\_only |
 | `output_policy` | sem. | post | llm | Does the answer reveal data outside the session scope | redact, block |
 
-**Historical attacks.** The `signatures` control reads a feed from a URL or file (JSON, refreshed every N seconds) in the form `{id, source, pattern_type, pattern, severity, channels}`. Pattern types: regex, pickle opcode sequences in model files, MCP tool names and descriptions, path globs. The starter feed is built from public sources (OWASP Top 10 for LLM, documented MCP tool poisoning incidents, known model deserialization attacks). The feed is separate from the code, so a judge can add a signature and see the effect without a restart.
+**Historical attacks.** The `signatures` control reads a feed from a URL or file (JSON, refreshed every N seconds) in the form `{version, signatures: [{id, source, pattern_type, pattern, severity, channels}]}`. Pattern types: regex, MCP tool names and descriptions, path globs (pickle opcode scanning only applies once model-file ingestion exists, so it is out of scope). The starter feed is written by us, inspired by public sources (OWASP Top 10 for LLM, documented MCP tool poisoning incidents), without copying their text. The feed is separate from the code and has its own version, recorded in audit entries next to the policy version, so a judge can add a signature and see the effect without a restart.
 
-**Budgets.** Cost uses `litellm.cost_per_token` for commercial models and a configurable price per 1k tokens or per GPU second for local ones. Counters are atomic in Redis with periodic resets (day, session). Crossing the soft limit raises a warning in Grafana; crossing the hard limit blocks.
+**Budgets.** Cost uses `litellm.cost_per_token` for commercial models and a configurable price per 1k tokens or per GPU second for local ones ("GPU seconds" for Ollama are upstream wall time, an estimate, labelled as such). Budget is **reserved** atomically in Redis before dispatch (estimated from `max_tokens`) and reconciled with actual usage on completion, failure or cancellation, so concurrent calls cannot overspend. Counters reset per day (UTC) and per session. Crossing the soft limit raises a warning in Grafana; crossing the hard limit blocks. If Redis is unavailable, budget-limited calls fail closed.
 
 **Operator levers.** Beyond control verdicts, the operator has three levers. First, blocking a user, agent or use case via `blocklist` in the YAML. Second, throttling with exponential backoff, like failed logins, applied automatically to autonomous systems at elevated risk. Third, a manual per-agent kill switch via `POST /admin/kill`.
 
@@ -152,50 +214,98 @@ Deterministic controls always run and are cheap (target p95 < 5 ms combined). Se
 One source of truth: `policy.yaml`, validated with a Pydantic schema and reloaded without restart. An invalid file never replaces a working one: the gateway logs the error and keeps the last valid version.
 
 ```yaml
-version: 3
+schema_version: 2
 profile: strict            # strict | balanced | permissive
-default: deny              # allowlist: anything not in the policy is forbidden
+default: deny              # the only accepted value: anything not granted is forbidden
 
-upstreams:                 # internal network, reachable only from the gateway
-  llm: { base_url: http://ollama:11434/v1 }   # or LiteLLM
+upstreams:                 # internal networks, reachable only from the gateway
+  llm:
+    base_url: http://ollama:11434/v1        # or LiteLLM
+    api_key_env: null                       # env var holding the router key, if any
   mcp:
-    sales_db: { url: http://mcp-postgres:8000/mcp, adapter: sql, trust: internal }
-    web:      { url: http://mcp-fetch:8000/mcp,    adapter: http, trust: untrusted }
+    sales_db:
+      url: http://mcp-postgres:8000/mcp
+      adapter: sql
+      trust: internal
+      tools:
+        query: { action: read }             # sql adapter derives resources from the parsed tables
+    web:
+      url: http://mcp-fetch:8000/mcp
+      adapter: http
+      trust: untrusted
+      tools:
+        fetch: { action: read, resource: "web:{url}" }     # http adapter reduces {url} to its host
+    reports:
+      url: http://mcp-files:8000/mcp
+      adapter: fs
+      trust: internal
+      tools:
+        write_report: { action: write, resource: "fs:reports/{name}" }
 
 roles:
-  analyst: { allow: ["read:db:sales.*", "generate:model:*"] }
-  intern:  { allow: ["read:db:sales.orders", "generate:model:qwen3:8b"] }
-  admin:   { allow: ["*:*"] }
+  analyst:  { allow: ["read:db:sales.*", "read:web:*", "write:fs:reports/*", "generate:model:*"] }
+  intern:   { allow: ["read:db:sales.orders", "read:db:sales.customers", "read:web:*",
+                      "write:fs:reports/*", "generate:model:qwen3:8b"] }
+  admin:    { allow: ["*:*"] }
+  ops-team: { allow: [] }                   # approvers; grants nothing by itself
 
 agents:
-  databot:     { type: interactive, max_actions: [read, generate], deny: ["egress:*"] }
-  nightly_etl: { type: autonomous,  max_actions: [read, write], approvers: [ops-team] }
+  databot:
+    type: interactive
+    max_actions: [read, write, generate]
+    allow: ["read:db:sales.*", "read:web:*", "write:fs:reports/*", "generate:model:*"]
+    deny: ["egress:*"]
+    approvers: [ops-team]
+  nightly_etl:
+    type: autonomous                        # principal is svc:nightly_etl, U = this allow list
+    max_actions: [read, write, generate]
+    allow: ["read:db:sales.*", "read:web:*", "write:fs:reports/*", "generate:model:qwen3:8b"]
+    approvers: [ops-team]                   # must be a role defined above
 
-risk_rules:
+risk:
+  half_life_s: 600
+
+risk_rules:                                 # profile-independent session restrictions
   interactive:
-    - when: { taint: true }   then: { deny_actions: [write, delete, egress] }
-    - when: { risk_gt: 0.5 }  then: { actions: [write], mode: require_approval, cooldown_s: 300 }
-    - when: { risk_gt: 0.8 }  then: { freeze_tools: true, duration_s: 300 }
+    - when: { taint: true }
+      then: { deny_actions: [write, delete, egress] }
+    - when: { risk_gt: 0.5 }
+      then: { actions: [write], mode: require_approval, cooldown_s: 300 }
+    - when: { risk_gt: 0.8 }
+      then: { freeze_tools: true, duration_s: 300 }
   autonomous:
-    - when: { taint: true }   then: { actions: [write, delete, egress], mode: require_approval }
-    - when: { risk_gt: 0.5 }  then: { throttle: { max_actions: 1, per_s: 10 }, alert: true }
-    - when: { risk_gt: 0.8 }  then: { actions: [write, delete, execute, egress], mode: require_approval, alert: true }
+    - when: { taint: true }
+      then: { actions: [write, delete, egress], mode: require_approval }
+    - when: { risk_gt: 0.5 }
+      then: { throttle: { max_actions: 1, per_s: 10 }, alert: true }
+    - when: { risk_gt: 0.8 }
+      then: { actions: [write, delete, execute, egress], mode: require_approval, alert: true }
 
 approvals: { timeout_s: 600, on_timeout: deny }
+
+sessions: { idle_ttl_s: 3600, max_lifetime_s: 86400 }
+
+throttle: { backoff: exponential, base_s: 5, max_s: 300 }
 
 blocklist:                 # manual blocks, effective right after reload
   users: []
   agents: []
-  use_cases: []            # e.g. "egress:http:pastebin.com"
+  use_cases: []            # permission patterns, e.g. "egress:http:pastebin.com"
+
+limits:
+  max_request_bytes: 1048576
+  max_response_bytes: 4194304
+  upstream_timeout_s: 120
 
 controls:
-  pii:              { mode: redact, threshold: 0.6, entities: [PESEL, EMAIL, IBAN, PHONE] }
+  model_allowlist:  { mode: block }
+  pii:              { mode: redact, threshold: 0.6,
+                      entities: [PL_PESEL, PL_NIP, IBAN_CODE, EMAIL_ADDRESS, PHONE_NUMBER] }
   secrets:          { mode: block }
-  prompt_injection: { mode: block, threshold: 0.85, judge_band: [0.5, 0.85] }
+  prompt_injection: { mode: block, threshold: 0.85, judge_band: [0.5, 0.85], risk_delta: 0.6 }
   sql_guard:        { mode: block, max_cost: 10000, force_limit: 500, timeout_ms: 3000 }
   signatures:       { mode: block, feed: http://feed:9000/signatures.json, refresh_s: 30 }
   loop_detect:      { mode: block, max_repeats: 5, window_s: 60 }
-  throttle:         { backoff: exponential, base_s: 5, max_s: 300 }
 
 budgets:
   per_user:    { daily_tokens: 200000, daily_cost_usd: 2.0 }
@@ -204,17 +314,26 @@ budgets:
   soft_limit_pct: 80
 ```
 
-**Strictness profiles** change the default mode of every control with one field; a setting on a specific control always wins:
+**Schema rules** (Pydantic, `extra="forbid"` everywhere):
 
-| Profile | Control with a detection | No rule for a resource | Taint in an interactive session |
-| --- | --- | --- | --- |
-| strict | block | deny | removes write/delete/egress |
-| balanced | redact or require\_approval | deny | removes egress |
-| permissive | log\_only | deny | log only |
+- Loaded with a safe YAML loader that rejects duplicate keys; size capped at 1 MiB.
+- Actions, modes, profiles, agent types, adapters and trust levels are enums. Every permission string is validated against the grammar above.
+- Cross-references are checked: approver roles exist, every MCP tool maps to a known action, resource templates only use `{arg}` placeholders, `judge_band` is ordered and inside `[0, 1]`, durations and budgets are positive, risk thresholds are in `[0, 1]`.
+- Mandatory controls (`authn`, `authz`, `secrets`, `sql_guard`) cannot be given `mode: log_only` and are active even when omitted from `controls`.
+- Each control declares its supported modes; a configured mode it does not support is a validation error.
+- `schema_version` is the file format; the **policy revision** is the SHA-256 of the canonicalized document (first 12 hex chars in audit). The signature feed has its own `version`.
 
-Default deny applies in every profile. A profile changes how detections are handled, but never opens resources outside the allowlist.
+**Strictness profiles** set the default mode of every non-mandatory detection control; a mode set on a specific control always wins. Profiles never touch `risk_rules`, base grants, or mandatory controls:
 
-**Hot reload:** a file watcher (`watchfiles`) and `POST /admin/reload`. Every change gets a version hash that goes into every audit entry and into a Grafana annotation, so you can see exactly when the new policy took effect.
+| Profile | Detection control default mode | Mandatory controls | No grant for a resource | Risk rules |
+| --- | --- | --- | --- | --- |
+| strict | most enforcing supported mode | enforce | deny | as configured |
+| balanced | `redact` if supported, else `require_approval` if supported, else most enforcing | enforce | deny | as configured |
+| permissive | least enforcing supported mode (`log_only` where supported) | enforce | deny | as configured |
+
+Each control declares its supported modes ordered from most to least enforcing (`block` > `require_approval` > `redact` > `log_only`), which is how a profile resolves; e.g. `intent_judge` gets `require_approval` under strict and `log_only` under permissive, and `tool_pinning` stays `block` everywhere. Default deny applies in every profile. A profile changes how detections are handled, but never opens resources outside the allowlist.
+
+**Hot reload:** a file watcher (`watchfiles`) and `POST /admin/reload` (admin token). Reload parses and validates the whole file, then atomically swaps an immutable snapshot; an invalid file is logged, counted (`acl_policy_reloads_total{result="invalid"}`) and never replaces the working one. The gateway refuses to start without a valid policy. Pending approvals stay bound to the revision they were created under and are re-checked against the current revision when consumed; a kill switch takes effect for in-flight calls at their next pipeline step. Every change gets a revision hash that goes into every audit entry and into a Grafana annotation, so you can see exactly when the new policy took effect.
 
 ## Audit, metrics and Grafana
 
@@ -225,12 +344,13 @@ Every decision leaves one audit entry with the full "why", and metrics feed dash
 ```json
 {"ts":"2026-10-04T10:12:03Z","session_id":"s-81f","principal":"intern@demo","actor":"databot",
  "channel":"mcp","action":"read","resource":"db:sales.customers","decision":"block",
- "verdicts":[{"control":"authz","decision":"block","reason":"resource outside effective scope"}],
+ "verdicts":[{"control":"authz","decision":"block","enforced":true,"reason_code":"resource_outside_scope"}],
  "effective_scope":["read:db:sales.orders"],"risk":0.35,"taint":false,
- "policy_version":"a1c9e2","latency_ms":{"total":7.4,"controls":{"authz":0.2,"pii":3.1}}}
+ "policy_revision":"a1c9e2f04b7d","feed_version":"2026-10-03.1",
+ "latency_ms":{"total":7.4,"controls":{"authz":0.2,"pii":3.1}}}
 ```
 
-The full payload is never logged: we store a hash and redacted excerpts, so the audit log does not become a leak itself.
+Payloads, SQL text, tool arguments and upstream errors are never logged. An entry carries structured reason codes and metadata only; a keyed HMAC of the payload (not a plain hash, which is guessable for low-entropy inputs) lets an operator match an entry to a known payload. The JSONL export lives on an operator-only volume with a retention limit.
 
 **Prometheus metrics** (`/metrics`):
 
@@ -239,9 +359,11 @@ The full payload is never logged: we store a hash and redacted excerpts, so the 
 - `acl_control_latency_seconds{control}` (histogram) and `acl_overhead_seconds{channel}` (gateway overhead excluding upstream)
 - `acl_tokens_total{user,agent,model}`, `acl_cost_usd_total{user,agent,model}`
 - `acl_budget_usage_ratio{scope,id}`
-- `acl_session_risk{session}`, `acl_tainted_sessions`
+- `acl_session_risk` (histogram over sessions; per-session risk lives in Loki, never as a label), `acl_tainted_sessions`
 - `acl_approvals_pending`, `acl_throttled_total{agent}`
-- `acl_policy_reloads_total{result}`
+- `acl_policy_reloads_total{result}`, `acl_policy_info{revision}` (gauge set to 1 for the active revision)
+
+`user` and `agent` labels are bounded by the identities defined in the policy; unknown values are bucketed as `other`. `/metrics` is served on the operator network only.
 
 | Dashboard | Audience | Panels |
 | --- | --- | --- |
@@ -261,39 +383,40 @@ The competition rules weight the test suite at 20%, so every control has at leas
 - `tests/unit/`: each control on its own, with a case table (`pytest.mark.parametrize`): input → expected verdict.
 - `tests/policy/`: role × agent × action × resource matrix → allow/deny. Same request, different user, different result. Resources and tools outside the policy are denied in every profile (default deny).
 - `tests/session_modes/`: the same event (taint, high risk) removes actions in an interactive session, while an autonomous session gets throttling and the approval queue, without losing rights.
-- `tests/approvals/`: `require_approval` → queue → approve, deny, timeout; manual kill switch and blocklist take effect after reload.
-- `tests/bypass/`: a direct request from the agent network to Ollama, the router or MCP servers does not get through.
+- `tests/approvals/`: `require_approval` → queue → approve, deny, timeout; replay of a consumed approval, an approval with altered arguments, self-approval, revocation by a policy reload; manual kill switch and blocklist take effect after reload.
+- `tests/bypass/`: run from inside the agent container, a direct request to Ollama, the router, MCP servers or Postgres does not get through; the fetch tool cannot reach internal addresses (SSRF).
+- `tests/identity/`: forged, expired, wrong-audience and wrong-algorithm tokens; an unregistered agent; `mode` not matching registration; session reuse with a different principal.
 - `tests/e2e/`: real requests through the gateway to Ollama and MCP servers in docker compose.
 - `tests/attacks/`: a corpus of attack prompts and payloads (direct and indirect injection, secret leakage, tool poisoning, pickle in a model file) with the expected block.
 - `tests/budget/`: token and call budget exhaustion, loop detection, throttling with backoff.
 - `tests/reload/`: changing `policy.yaml` mid-test changes the verdict without restart; a broken file does not break the working policy.
 - `tests/perf/`: p50/p95 overhead with a mocked upstream, written into the report.
 
-Output: JUnit XML + HTML report (`pytest-html`) summarizing positive and negative cases per control.
+Output: JUnit XML + HTML report (`pytest-html`) summarizing positive and negative cases per control. Tests are written alongside each stage, not saved for the end: every stage in the schedule ends with its own passing tests.
 
 **Demo script (3 minutes):**
 
-1. Anna (analyst) and Bartek (intern) send DataBot the same prompt asking for the customer count. Anna gets the full result; Bartek gets only his rows or a block.
-2. DataBot reads a page with hidden injection through the `web` tool. The session is tainted, the attempt to write a report is blocked, and the risk score rises in Grafana.
-3. The same injection hits the autonomous `nightly_etl`. The write is not blocked; it waits in the approval queue, and the process slows down instead of stopping.
+1. Anna (analyst) and Bartek (intern) send DataBot the same prompt asking for the customer count. Both may read `sales.customers`; RLS returns a different `COUNT(*)` for each (seeded so the numbers clearly differ). Bartek asking for `sales.payments` is blocked at the table level.
+2. DataBot writes a report (allowed: `write:fs:reports/*`). It then reads a page with hidden injection through the `web` tool. The session is tainted, the same report write is now blocked, and the risk score rises in Grafana.
+3. The same injection hits the autonomous `nightly_etl`. The write is not blocked; it waits in the approval queue, and the process slows down instead of stopping. An operator approves it and the exact call goes through once.
 4. The agent generates a heavy query. `sql_guard` rejects it after `EXPLAIN`.
-5. A prompt with an API key and a PESEL number: the secret is blocked, the PESEL is redacted.
-6. The agent tries to bypass the gateway and call Ollama directly. The connection does not go through.
-7. A judge raises `max_cost` in `policy.yaml` or adds a signature to the feed. The same request gets a different verdict, and Grafana shows an annotation for the new policy version.
+5. A prompt with a PESEL number is answered with the PESEL redacted. A second prompt with an API key is blocked.
+6. From inside the agent container, a direct call to Ollama does not connect.
+7. A judge raises `max_cost` in `policy.yaml` or adds a signature to the feed. The same request gets a different verdict, and the audit entry shows the new policy revision or feed version; a policy change also shows as a Grafana annotation.
 
 ## Stack, repo layout and schedule
 
-Python throughout, everything local in `docker compose`, no paid APIs. We check the license of every dependency before using it.
+Python 3.12 throughout, managed with `uv`; `ruff` (lint + format) and `pyright` gate every change; Pydantic models for every boundary (policy, tokens, envelopes, API payloads). Everything local in `docker compose`, no paid APIs. We check the license of every dependency before using it and pin exact versions in `uv.lock`; images and models are pinned by tag/digest. "No paid dependencies" is not "all permissively licensed": Grafana and Loki are AGPLv3 and Redis ≥ 7.4 is RSALv2/SSPLv1 (≥ 8.0 adds AGPLv3), so we use `redis:7.2` (BSD-3) or Valkey and record the terms in `LICENSES.md`. The LiteLLM package mixes MIT code with an `enterprise/` directory under a separate license; we import only its MIT cost tables. Presidio is MIT, but its spaCy models are reviewed separately and the Polish recognizers (PESEL, NIP) are ours.
 
 | Layer | Choice | Notes |
 | --- | --- | --- |
-| Proxy | FastAPI + httpx, uvicorn | SSE streaming for LLM and MCP |
+| Proxy | FastAPI + httpx, uvicorn | Buffered upstream calls; SSE re-emitted to the agent after post controls |
 | LLM client / cost | `litellm` as a library | We do not use LiteLLM Proxy |
 | MCP | official MCP Python SDK | Proxy acts as an MCP server to the agent and a client to upstreams |
 | Policies | Pydantic + our own evaluator | Option: Cedar (`cedarpy`) if time allows |
 | PII | Presidio + Polish regexes |  |
 | SQL | `sqlglot`, Postgres with RLS |  |
-| Injection classifier | small Hugging Face model on CPU | Check the license before choosing |
+| Injection classifier | small Hugging Face model on CPU | Candidate `protectai/deberta-v3-base-prompt-injection-v2` (Apache-2.0, English-only, 512-token window): pin the revision, load `safetensors` only, no `trust_remote_code`, chunk long inputs, and test Polish inputs before relying on it |
 | LLM judge and demo models | Ollama (e.g. Qwen3 8B) |  |
 | Session state, budgets, approvals | Redis |  |
 | Telemetry | prometheus-client, Loki, Grafana | Provisioned from the repo |
@@ -302,26 +425,30 @@ Python throughout, everything local in `docker compose`, no paid APIs. We check 
 ```
 ai-control-layer/
   gateway/
-    main.py            # FastAPI, two routers: /v1 (LLM), /mcp/{server}, plus /admin
-    pipeline.py        # step order, verdict merging
-    identity.py        # JWT, delegation, session state, session type
-    policy/            # schema, loader, hot reload, evaluator
+    main.py            # FastAPI app factory, routers: /v1 (LLM), /mcp/{server}, /auth, /admin
+    core/              # Interaction, Verdict, Span, SessionContext, Adapter, Control, verdict merging
+    pipeline.py        # step order
+    identity.py        # JWT verification, delegation checks, demo token issuer
+    sessions.py        # session store (in-memory now, Redis later), binding, per-session lock
+    policy/            # schema, permission grammar, loader, hot reload, evaluator
+    proxies/           # llm.py, mcp.py
     adapters/          # generic_mcp, sql, http, fs, llm
     controls/          # one class = one file
     approvals.py       # approval queue, throttling, kill switch
     telemetry.py       # metrics, audit
   feeds/signatures.json
   policy.yaml
-  demo/                # agent, database seed, MCP servers
+  demo/                # agent, identities, database seed, MCP servers
   grafana/             # dashboards/, provisioning/
   tests/
-  docker-compose.yml   # upstreams on an internal network only
-  Makefile             # up, test, demo, report
+  docker-compose.yml   # edge / llm_backend / mcp_backend / mcp_untrusted networks
+  pyproject.toml       # uv, ruff, pyright, pytest config
+  Makefile             # up, test, lint, demo, report
 ```
 
 **Schedule (hours from now, 22h):**
 
-1. 0–5: gateway skeleton, LLM proxy to Ollama, generic MCP proxy, JWT and session state, policy loader with default deny and hot reload, upstream isolation in the compose network.
+1. 0–5: gateway skeleton, core interfaces, policy loader with default deny and hot reload, JWT and session state, LLM proxy to Ollama (non-streaming upstream, SSE re-emission), generic MCP proxy (tools-only subset, operator-mapped tools), upstream isolation across compose networks. Each step ends with its own pytest tests; the compose isolation test is marked `docker` and runs only against a live stack.
 2. 5–10: deterministic controls (authz, PII, secrets, budgets, loops, signatures, model allowlist), SQL adapter with RLS and `EXPLAIN`.
 3. 10–14: semantic controls, taint and risk rules per session type, approval queue, throttling, blocklist, kill switch, tool pinning.
 4. 14–18: test suite, then Grafana dashboards and Loki.
@@ -353,6 +480,30 @@ The market is crowded and every individual piece of this project already exists 
 4. **A security layer in front of any router.** We do not replace LiteLLM, Kong or Portkey; we sit in front of them.
 5. **Open, local, editable live.** One YAML file, an external signature feed, Grafana from the repo, zero paid dependencies.
 
-The honest pitch line: we do not claim to have invented taint or on-behalf-of. We show that only their combination in one layer closes the agent permission problem the challenge owner called the biggest one.
+The honest pitch line: we do not claim to have invented taint or on-behalf-of, and a feature missing from a vendor's public docs is not proof it does not exist. We show that combining them in one layer addresses the agent permission problem the challenge owner called the biggest one.
 
 **Sources** (as of 2026-10-03): links in the table.
+
+## Changelog
+
+**v2 (2026-10-03), after an external review of v1:**
+
+- Fixed `policy.yaml`: v1's `risk_rules` lines put `when:` and `then:` on one line, which is not valid YAML.
+- Replaced the single `E = U ∩ A ∩ T \ R` formula with base grants plus session restrictions and obligations; an approval never grants anything outside base grants.
+- Autonomous agents get a service principal (`svc:<agent>`) and explicit `allow` grants; session mode is a token claim validated against the agent's registration.
+- Defined the permission grammar (split at the first colon, `*` only, anchored) and evaluate grants per concrete interaction.
+- Profiles affect only detection controls; `authn`, `authz`, `secrets`, `sql_guard` are mandatory and always enforce; `log_only` is `enforced=false` on a verdict, not a decision.
+- `Control.stages` (pre, post or both); verdict merging keeps obligations (approval + redaction); requests execute once after all envelopes pass.
+- JWT hardening (pinned algorithm, `iss`/`aud`, lifetime cap, session binding), a demo token issuer restricted to predefined identities, admin auth.
+- Split compose networks (edge, llm_backend, mcp_backend, mcp_untrusted); bypass tests run from inside the agent container, plus SSRF.
+- MCP: operator-owned tool mappings (annotations are hints only), filtered `tools/list`, pinned protocol version, tools-only subset, no shared upstream sessions.
+- `intent_judge` is advisory; every MCP call is authorized on its own.
+- Approvals bind one exact operation (argument digest, policy revision) with explicit states, including `uncertain`.
+- RLS: the trusted SQL MCP server owns the transaction and uses transaction-local `set_config`; non-owner role, `FORCE ROW LEVEL SECURITY`.
+- `sql_guard`: supported-subset allowlist, `EXPLAIN (FORMAT JSON)` without `ANALYZE`, timeouts, and the exact rewritten query is what runs.
+- Streaming: upstream calls are buffered; SSE is re-emitted after post controls.
+- Budget reservation before dispatch; fail closed without Redis; per-session serialization; immutable policy snapshots; refuse to start without a valid policy.
+- Audit: reason codes and keyed HMACs instead of excerpts; no per-session metric labels.
+- Demo repaired so restricted actions are visibly allowed before taint, RLS shows different counts on the same table, and PII and secrets are separate requests.
+- Licensing notes for Redis, Grafana/Loki, LiteLLM, Presidio and the injection classifier; pickle scanning removed from scope.
+- Second review pass: whole-resource `*` wildcard; profile resolution by each control's ordered supported modes; `Verdict.rewrite` for payload rewrites; MCP schema provenance and `tools/list` eligibility; DataBot approvers and approver-scoped `/admin`; `intent_judge` flags the later MCP call instead of holding the LLM response; cooldown vs freeze vs throttle timers; `ops` network and two gateway listeners; `/v1/models` filtering; session end and TTLs; per-control `risk_delta` defaults and taint on blocked results.

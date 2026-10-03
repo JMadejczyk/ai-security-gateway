@@ -1,16 +1,15 @@
-"""Session store: binding, refresh, decay, clamp, sticky taint, lifetimes and serialization."""
+"""The `SessionStore` contract: binding, refresh, decay, clamp, sticky taint, lifetimes and
+serialization, against every store (``backend`` in conftest: memory, fakeredis, real Redis)."""
 
 import asyncio
 from datetime import timedelta
 
 import pytest
-from gateway_testkit import MutableClock
 
 from gateway.core.envelope import Cooldown
 from gateway.core.types import SessionMode
 from gateway.policy.schema import Sessions
 from gateway.sessions import (
-    InMemorySessionStore,
     SessionBinding,
     SessionError,
     SessionReason,
@@ -20,16 +19,6 @@ from gateway.sessions import (
 ANNA = SessionBinding(principal="anna@demo", actor="databot", mode=SessionMode.INTERACTIVE)
 LIMITS = Sessions(idle_ttl_s=3600, max_lifetime_s=86400)
 HALF_LIFE = 600.0
-
-
-@pytest.fixture
-def clock() -> MutableClock:
-    return MutableClock()
-
-
-@pytest.fixture
-def store(clock) -> InMemorySessionStore:
-    return InMemorySessionStore(clock=clock)
 
 
 async def open_anna(store, session_id="s-1", limits=LIMITS):

@@ -13,6 +13,7 @@ import jwt
 import pytest
 from gateway_testkit import INTERNAL_KEY, bearer
 from mcp_harness import MCPStack, connect, error_text
+from pin_kit import pin_with_schema
 
 from gateway.core.envelope import Span, Verdict
 from gateway.core.interfaces import Control
@@ -257,11 +258,10 @@ async def test_an_equal_but_different_json_value_is_a_change(stack, monkeypatch,
         "type": "object",
         "properties": {"sql": {"type": "string"}, "dry_run": {"type": ["boolean", "integer"]}},
     }
-    pins = tmp_path / "pins"
-    pins.mkdir(exist_ok=True)
-    (pins / "sales_db.json").write_text(
-        json.dumps({"tools": [{"name": "query", "inputSchema": pinned}]})
-    )
+    # A pinned schema the upstream does not advertise: take tool_pinning out of the way, so
+    # the call reaches the seal with the pinned schema as its argument schema.
+    pin_with_schema(tmp_path / "pins", "sales_db", "query", pinned)
+    stack.gateway.container.pipeline.controls.remove("tool_pinning")
 
     def true_to_one(reservation):
         arguments = {**reservation.payload["arguments"], "dry_run": 1}

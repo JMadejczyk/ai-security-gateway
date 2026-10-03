@@ -316,23 +316,15 @@ async def test_malformed_call_params_are_a_protocol_error(stack: MCPStack):
     assert response.json()["error"]["code"] == -32602
 
 
-async def test_pinned_schema_wins_over_the_advertised_one(stack: MCPStack, tmp_path):
-    pins = tmp_path / "pins"
-    pins.mkdir()
-    # 50 fits COUNT_CUSTOMERS with sql_guard's forced " LIMIT 500" (the rewrite is validated
-    # against the pin too), not long_sql.
-    pinned = {"type": "object", "properties": {"sql": {"type": "string", "maxLength": 50}}}
-    (pins / "sales_db.json").write_text(
-        json.dumps({"tools": [{"name": "query", "inputSchema": pinned}]})
-    )
+async def test_arguments_are_validated_against_the_pinned_schema(stack: MCPStack, tmp_path):
+    """The stack's pins are the servers' own listings (`pin_kit`); a pin that differs from
+    what the upstream advertises is a rug pull (tests/mcp/test_tool_pinning.py)."""
     sales = await connect(stack, ANNA, "sales_db")
     assert rows(await sales.call("query", sql=COUNT_CUSTOMERS)) == [{"count": 40}]
-    long_sql = COUNT_CUSTOMERS + " WHERE 1 = 1 AND 2 = 2"
-    assert error_text(await sales.call("query", sql=long_sql)) == "invalid_arguments"
-    # With a pin, the gateway never needed the upstream's own listing.
-    assert stack.transport.sent("mcp-postgres", "tools/list") == []
-
-    (pins / "sales_db.json").write_text("{broken")
+    assert error_text(await sales.call("query", sql=COUNT_CUSTOMERS, extra="x")) == (
+        "invalid_arguments"
+    )
+    (tmp_path / "pins" / "sales_db.json").write_text("{broken")
     assert error_text(await sales.call("query", sql=COUNT_CUSTOMERS)) == "tool_pin_invalid"
 
 

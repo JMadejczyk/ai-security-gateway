@@ -11,18 +11,21 @@ upstreams:                 # internal networks, reachable only from the gateway
       url: http://mcp-postgres:8000/mcp
       adapter: sql
       trust: internal
+      require_pin: true                     # tool_pinning: pins/sales_db.json
       tools:
         query: { action: read }             # sql adapter derives resources from the parsed tables
     web:
       url: http://mcp-fetch:8000/mcp
       adapter: http
       trust: untrusted
+      require_pin: true                     # tool_pinning: pins/web.json
       tools:
         fetch: { action: read, resource: "web:{url}" }     # http adapter reduces {url} to its host
     reports:
       url: http://mcp-files:8000/mcp
       adapter: fs
       trust: internal
+      require_pin: true                     # tool_pinning: pins/reports.json
       tools:
         write_report: { action: write, resource: "fs:reports/{name}" }
 
@@ -101,3 +104,9 @@ budgets:
   per_agent:   { daily_tokens: 1000000 }
   per_session: { tool_calls: 50, gpu_seconds: 120 }
   soft_limit_pct: 80
+
+# LLM judges (intent_judge, output_policy, the prompt_injection judge band) call
+# upstreams.llm directly, uncharged and unaudited. Without this section intent_judge and
+# output_policy stay off (judge_not_configured); with it, a judge that cannot answer within
+# timeout_s fails its control closed. Enable once the judge model is pulled and fast enough:
+# judges: { model: "qwen3:8b", timeout_s: 10, max_content_chars: 16000, max_output_tokens: 1024 }

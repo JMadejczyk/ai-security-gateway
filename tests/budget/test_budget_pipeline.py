@@ -240,7 +240,10 @@ async def test_soft_limit_warns_once_and_tracks_the_usage_ratio(tmp_path, caplog
 
 async def test_redis_down_fails_closed_with_503(tmp_path):
     llm = ScriptedLLM()
-    async with llm_gateway(tmp_path, llm, budget_store="redis", redis_url=DEAD_REDIS) as gateway:
+    # Session state stays in memory: this is the budget store alone going down.
+    async with llm_gateway(
+        tmp_path, llm, budget_store="redis", session_store="memory", redis_url=DEAD_REDIS
+    ) as gateway:
         response = await ask(gateway, await gateway.token("anna@demo"))
         assert refusal(response) == (
             503,

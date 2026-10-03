@@ -5,7 +5,12 @@
   as ``code`` and never any payload or upstream data. ``/mcp/{server}`` speaks MCP streamable
   HTTP (`gateway.proxies.mcp.downstream`) and answers in JSON-RPC instead.
 - Operator API (``ops`` network only): ``/healthz``, ``/metrics``, ``/auth/demo-token``,
-  ``/admin/reload``.
+  ``/admin/reload``, ``/admin/mcp/{server}/tools`` (candidate pin file for ``acl pin``),
+  ``/admin/approvals*`` and ``/admin/kill``/``/admin/unkill`` (`gateway.approvals.api`).
+
+A call held for approval answers 403 ``approval_required`` with ``error.approval_id``; the
+agent retries the same request with the ``X-ACL-Approval-Id`` header once it is approved
+(MCP: ``_meta["ai-control-layer/approval_id"]``, see `gateway.approvals.oversight`).
 
 Both apps share one `GatewayContainer`; each lifespan enters its ``running()`` context.
 """
@@ -22,16 +27,19 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from gateway.adapters.llm import ChatCompletionRequest
+from gateway.approvals.api import admin_router
 from gateway.container import GatewayContainer
 from gateway.core.types import Action, Channel, Decision
 from gateway.errors import RejectionError, RequestTooLargeError
 from gateway.identity import DemoTokenRequest, IssuedToken
 from gateway.pipeline import CallRequest, PipelineOutcome
 from gateway.proxies.llm import sse_events
+from gateway.proxies.mcp.admin import capture_pin
 from gateway.proxies.mcp.downstream import MCPHttpRequest, MCPReply, refusal_reply
 from gateway.telemetry import REGISTRY, ReloadResult, set_tainted_sessions
 
 ADMIN_ROLE: Final = "admin"
+APPROVAL_HEADER: Final = "x-acl-approval-id"  # retry of an approved LLM call
 
 _ERROR_TYPES: Final = {
     HTTPStatus.BAD_REQUEST: "invalid_request_error",
@@ -46,14 +54,22 @@ _ERROR_TYPES: Final = {
 
 
 def error_response(
-    status: int, code: str, message: str, *, retry_after_s: int | None = None
+    status: int,
+    code: str,
+    message: str,
+    *,
+    retry_after_s: int | None = None,
+    approval_id: str | None = None,
 ) -> JSONResponse:
     """An OpenAI-style error; ``code`` is the structured reason code."""
     kind = _ERROR_TYPES.get(HTTPStatus(status), "api_error")
     headers = {"www-authenticate": "Bearer"} if status == HTTPStatus.UNAUTHORIZED else {}
     if retry_after_s is not None:
         headers["retry-after"] = str(retry_after_s)
-    body = {"error": {"message": message, "type": kind, "code": code}}
+    error = {"message": message, "type": kind, "code": code}
+    if approval_id is not None:  # held for approval: retry with X-ACL-Approval-Id once approved
+        error["approval_id"] = approval_id
+    body = {"error": error}
     return JSONResponse(body, status_code=status, headers=headers)
 
 
@@ -63,6 +79,7 @@ def outcome_error(outcome: PipelineOutcome) -> JSONResponse:
         outcome.reason_code,
         outcome.message,
         retry_after_s=outcome.retry_after_s,
+        approval_id=outcome.approval_id,
     )
 
 
@@ -132,7 +149,12 @@ def create_agent_app(container: GatewayContainer) -> FastAPI:
         except RequestTooLargeError as exc:
             early = CallRequest(channel=Channel.LLM, token=token, body=b"")
             return outcome_error(container.pipeline.record_refusal(early, snapshot, exc))
-        call = CallRequest(channel=Channel.LLM, token=token, body=body)
+        call = CallRequest(
+            channel=Channel.LLM,
+            token=token,
+            body=body,
+            approval_id=request.headers.get(APPROVAL_HEADER),
+        )
         outcome = await container.pipeline.handle(call, snapshot)
         if not outcome.released:
             return outcome_error(outcome)
@@ -254,6 +276,17 @@ def create_operator_app(container: GatewayContainer) -> FastAPI:
         async def demo_token(body: DemoTokenRequest) -> IssuedToken:
             return await issuer.issue(body, container.policy_store.current)
 
+    app.include_router(
+        admin_router(
+            verifier=container.verifier,
+            policy=lambda: container.policy_store.current,
+            approvals=container.oversight.approvals,
+            kill_switch=container.oversight.kill_switch,
+            token_of=bearer_token,
+            clock=container.clock,
+        )
+    )
+
     @app.post("/admin/reload")
     async def reload_policy(request: Request) -> Response:
         claims = container.verifier.verify(bearer_token(request), container.policy_store.current)
@@ -262,5 +295,17 @@ def create_operator_app(container: GatewayContainer) -> FastAPI:
         outcome = await asyncio.to_thread(container.policy_store.reload)
         status = 422 if outcome.result is ReloadResult.INVALID else 200
         return JSONResponse(outcome.model_dump(mode="json"), status_code=status)
+
+    @app.get("/admin/mcp/{server}/tools")
+    async def mcp_tools(server: str, request: Request) -> Response:
+        """A candidate pin file from what the gateway sees upstream (``acl pin``)."""
+        snapshot = container.policy_store.current
+        claims = container.verifier.verify(bearer_token(request), snapshot)
+        if ADMIN_ROLE not in claims.roles:
+            raise RejectionError("admin_required", "this operation needs the admin role")
+        pin = await capture_pin(
+            container.mcp_connector, server, snapshot, principal=claims.sub, now=container.clock()
+        )
+        return JSONResponse(pin.model_dump(mode="json", by_alias=True))
 
     return app

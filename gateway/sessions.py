@@ -23,12 +23,22 @@ from typing import Final
 from pydantic import AwareDatetime, Field
 
 from gateway.clock import Clock, utc_now
-from gateway.core.envelope import CallRecord, Cooldown, FrozenModel, SessionContext
+from gateway.core.envelope import (
+    CallRecord,
+    Cooldown,
+    FlaggedToolCall,
+    FrozenModel,
+    SessionContext,
+)
 from gateway.core.types import SessionMode
 from gateway.errors import RejectionError
 from gateway.policy.schema import Sessions
 
 MAX_CALL_HISTORY: Final = 256
+# Newest kept. Each flag comes from a judged-misaligned tool call that also adds risk, so a
+# session flooding past this cap is frozen by its risk rules long before it gets there.
+MAX_FLAGGED_TOOL_CALLS: Final = 1024
+MAX_GOAL_CHARS: Final = 4000
 
 
 class SessionReason(StrEnum):
@@ -66,12 +76,15 @@ class SessionUpdate(FrozenModel):
     freeze_until: AwareDatetime | None = None
     cooldowns: tuple[Cooldown, ...] = ()
     calls: tuple[CallRecord, ...] = ()
+    flagged_tool_calls: tuple[FlaggedToolCall, ...] = ()
+    goal: str | None = Field(default=None, max_length=MAX_GOAL_CHARS, repr=False)  # set once
 
 
 def apply_update(
     ctx: SessionContext, update: SessionUpdate, *, now: datetime, half_life_s: float
 ) -> SessionContext:
-    """The session after ``update``: decay, add, clamp; taint and running timers are kept."""
+    """The session after ``update``: decay, add, clamp; taint and running timers are kept, and
+    so is the goal once set (a later call can never replace it)."""
     risk = min(max(ctx.risk_at(now, half_life_s) + update.risk_delta, 0.0), 1.0)
     cooldowns: dict[str, Cooldown] = {}
     for cooldown in (*ctx.cooldowns, *update.cooldowns):
@@ -89,6 +102,10 @@ def apply_update(
             "freeze_until": max(freezes, default=None),
             "cooldowns": tuple(cooldowns.values()),
             "call_history": (*ctx.call_history, *update.calls)[-MAX_CALL_HISTORY:],
+            "flagged_tool_calls": tuple(
+                dict.fromkeys((*ctx.flagged_tool_calls, *update.flagged_tool_calls))
+            )[-MAX_FLAGGED_TOOL_CALLS:],
+            "goal": ctx.goal if ctx.goal is not None else update.goal,
         }
     )
 

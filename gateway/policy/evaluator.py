@@ -240,6 +240,37 @@ class PolicyEvaluator:
             for rule in policy.risk_rules.for_mode(ctx.mode)
         )
 
+    def effective_scope(
+        self,
+        snapshot: PolicySnapshot,
+        principal: PrincipalContext,
+        ctx: SessionContext,
+        now: datetime,
+    ) -> tuple[str, ...]:
+        """Grants still usable in the session, as permission strings (what the audit entry's
+        ``effective_scope`` shows): the task scope, or else the principal's grants, narrowed to
+        the agent's ``max_actions`` minus what the session's risk rules remove now. The agent's
+        own allow list and denies are listed apart by `agent_scope`; a resource is in scope
+        only if both admit it. Empty for an unknown or refused identity."""
+        policy = snapshot.policy
+        agent = policy.agents.get(principal.agent)
+        if agent is None or _identity_refusal(policy, principal, agent) is not None:
+            return ()
+        grants = principal.task_scope
+        if grants is None:
+            grants = _principal_grants(policy, principal, agent)
+        usable = set(agent.max_actions) - self.removed_actions(snapshot, ctx, now)
+        return tuple(grants.restricted_to(usable).as_strings())
+
+    def agent_scope(
+        self, snapshot: PolicySnapshot, principal: PrincipalContext
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """The agent's ``(allow, deny)`` permission strings (allow filtered by max_actions)."""
+        agent = snapshot.policy.agents.get(principal.agent)
+        if agent is None:
+            return (), ()
+        return tuple(agent.grants.as_strings()), tuple(agent.deny.as_strings())
+
     def decide(  # noqa: PLR0913 -- the union of authorize() and session_restrictions() inputs
         self,
         snapshot: PolicySnapshot,

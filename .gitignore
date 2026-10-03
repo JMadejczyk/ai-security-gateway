@@ -26,3 +26,6 @@ reports/
 .idea/
 .vscode/
 .DS_Store
+
+# Injection classifier weights (python -m gateway.injection.fetch); pinned by gateway/injection/model_manifest.json
+models/cache/

@@ -182,6 +182,7 @@ class MCPUpstream(Upstream):
         self._init_lock = asyncio.Lock()
         self._ids = itertools.count(1)
         self._advertised: wire.ToolSchemas | None = None
+        self._listing: tuple[wire.ToolDefinition, ...] | None = None  # the latest tools/list
         self._closed = False
 
     @property
@@ -230,7 +231,15 @@ class MCPUpstream(Upstream):
             raise UpstreamError("upstream_invalid_response")
         if self._advertised is None:
             self._advertised = {tool.name: tool.input_schema for tool in tools}
+        self._listing = tuple(tools)
         return tools
+
+    async def latest_listing(self, snapshot: PolicySnapshot) -> tuple[wire.ToolDefinition, ...]:
+        """This session's most recent ``tools/list``, fetching one if it never listed
+        (``tool_pinning`` verifies a call against it)."""
+        if self._listing is None:
+            await self.list_tools(snapshot)
+        return self._listing or ()
 
     async def advertised_schemas(self, snapshot: PolicySnapshot) -> wire.ToolSchemas:
         """Input schemas from this session's first ``tools/list``, fetching it if needed."""

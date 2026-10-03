@@ -299,6 +299,7 @@ class AuditEntry(FrozenModel):
     feed_version: str | None = None  # the signature feed arrives with the signatures control
     latency_ms: AuditLatency
     payload_hmac: str | None = None
+    approval_id: str | None = None  # the approval the call was held under or presented
 
     @field_serializer("ts")
     def _utc_z(self, ts: datetime) -> str:

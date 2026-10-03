@@ -10,8 +10,9 @@ window. Any other call (different arguments, tool or resource) has its own count
 Calls retrying a held operation with its ``approval_id`` are neither counted nor blocked: the
 retry is how an approval is consumed (SPEC "Human in the loop").
 
-Counts live behind `CallCounter`: `InMemoryCallCounter` serves one gateway process; a shared
-store (Redis on the ``state`` network) implements the same interface.
+Counts live behind `CallCounter`: `InMemoryCallCounter` serves one gateway process,
+`gateway.controls.loop_counter_redis.RedisCallCounter` every gateway sharing the ``state``
+Redis. A counter that cannot count fails closed (``loop_store_unavailable``).
 """
 
 import hashlib
@@ -31,6 +32,7 @@ from gateway.policy.schema import LoopDetectConfig
 from gateway.telemetry import canonical_json
 
 LOOP_DETECTED: Final = "loop_detected"
+STORE_UNAVAILABLE: Final = "loop_store_unavailable"
 # Top-level payload fields that change how an answer is delivered or attributed, not what the
 # call does: an LLM client toggling streaming is still repeating the same request.
 VOLATILE_FIELDS: Final = frozenset({"stream", "stream_options", "user", "metadata", "_meta"})
@@ -65,13 +67,18 @@ class CallFingerprint(FrozenModel):
         return "|".join((self.channel, self.server or "", self.action, self.resource, self.digest))
 
 
+class CallCounterUnavailableError(Exception):
+    """The counter's store cannot be reached: the call is not counted, so it is refused."""
+
+
 class CallCounter(ABC):
     """Sliding-window occurrence counts per session and fingerprint."""
 
     @abstractmethod
     async def hit(self, session_id: str, key: str, now: datetime, window_s: float) -> int:
         """Record one occurrence of ``key`` at ``now``; return the occurrences within the
-        ``window_s`` ending at ``now``, this one included."""
+        ``window_s`` ending at ``now``, this one included. Raises
+        `CallCounterUnavailableError` when it cannot count."""
 
 
 @dataclass(slots=True)
@@ -155,12 +162,17 @@ class LoopDetectControl(Control):
                 decision=Decision.ALLOW, control_id=self.id, reason_code="approval_retry"
             )
         limits = cfg if isinstance(cfg, LoopDetectConfig) else LoopDetectConfig()
-        count = await self._counter.hit(
-            interaction.session_id,
-            CallFingerprint.of(interaction).key,
-            self._clock(),
-            limits.window_s,
-        )
+        try:
+            count = await self._counter.hit(
+                interaction.session_id,
+                CallFingerprint.of(interaction).key,
+                self._clock(),
+                limits.window_s,
+            )
+        except CallCounterUnavailableError:
+            return Verdict(
+                decision=Decision.BLOCK, control_id=self.id, reason_code=STORE_UNAVAILABLE
+            )
         if count <= limits.max_repeats:
             return Verdict(decision=Decision.ALLOW, control_id=self.id, reason_code="no_loop")
         return Verdict(

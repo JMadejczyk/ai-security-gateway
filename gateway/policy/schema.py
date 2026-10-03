@@ -99,6 +99,9 @@ class McpServer(FrozenModel):
     adapter: Adapter
     trust: Trust
     tools: FrozenDict[Name, McpTool] = Field(default_factory=FrozenDict[str, McpTool])
+    # `tool_pinning`: without `pins/<server>.json` every tool of the server is blocked
+    # (`tool_not_pinned`) unless the operator opts the server out explicitly with false.
+    require_pin: bool = True
 
     @model_validator(mode="after")
     def _resource_per_adapter(self) -> Self:
@@ -378,6 +381,9 @@ class PiiConfig(ControlConfig):
 class PromptInjectionConfig(ControlConfig):
     threshold: Threshold = 0.85
     judge_band: tuple[Threshold, Threshold] = (0.5, 0.85)
+    # Characters of not yet classified text one call may carry; more fails closed. The model
+    # runs at roughly 5 KB/s on 4 CPU threads, so this also bounds the added latency.
+    max_chars: Annotated[int, Field(gt=0, le=10_000_000)] = 50_000
 
     @field_validator("judge_band")
     @classmethod
@@ -387,6 +393,10 @@ class PromptInjectionConfig(ControlConfig):
             msg = f"judge_band {list(value)} must be ordered [low, high]"
             raise ValueError(msg)
         return value
+
+
+class ToolPoisoningConfig(ControlConfig):
+    threshold: Threshold = 0.85  # classifier score at which a tool definition is poisoned
 
 
 class SqlGuardConfig(ControlConfig):
@@ -419,7 +429,25 @@ class ModelAllowlistConfig(ControlConfig):
 
 
 class IntentJudgeConfig(ControlConfig):
-    model: str | None = Field(default=None, min_length=1)
+    model: str | None = Field(default=None, min_length=1)  # overrides `judges.model`
+
+
+class Judges(FrozenModel):
+    """The one `JudgeClient` every LLM judge shares (SPEC "Judges").
+
+    Judges call ``upstreams.llm`` directly with ``model``: they are not agent calls, so the
+    model needs no grant and no ``pricing`` entry, and judge tokens are never charged to an
+    agent's budget. Without this section the judge-backed controls are off (``intent_judge``
+    and ``output_policy`` allow with ``judge_not_configured``); with it, a judge that cannot
+    answer in time fails its control closed.
+    """
+
+    model: ModelName
+    timeout_s: Annotated[float, Field(gt=0.0, le=300.0)] = 10.0  # total deadline per call
+    # Content longer than this is not judged at all: the judge is unavailable for it (fail
+    # closed), never handed a truncated view that could hide the part that matters.
+    max_content_chars: Annotated[int, Field(gt=0, le=1_000_000)] = 16_000
+    max_output_tokens: Annotated[int, Field(gt=0, le=32_768)] = 1024
 
 
 class Controls(FrozenModel):
@@ -437,7 +465,7 @@ class Controls(FrozenModel):
     budget: ControlConfig | None = None
     loop_detect: LoopDetectConfig | None = None
     prompt_injection: PromptInjectionConfig | None = None
-    tool_poisoning: ControlConfig | None = None
+    tool_poisoning: ToolPoisoningConfig | None = None
     intent_judge: IntentJudgeConfig | None = None
     output_policy: ControlConfig | None = None
 
@@ -456,6 +484,7 @@ _CONFIG_TYPES: Mapping[str, type[ControlConfig]] = MappingProxyType(
         "signatures": SignaturesConfig,
         "loop_detect": LoopDetectConfig,
         "prompt_injection": PromptInjectionConfig,
+        "tool_poisoning": ToolPoisoningConfig,
         "intent_judge": IntentJudgeConfig,
     }
 )
@@ -489,6 +518,7 @@ class Policy(FrozenModel):
     pricing: FrozenDict[PricedModel, ModelPrice] = Field(
         default_factory=FrozenDict[str, ModelPrice]
     )
+    judges: Judges | None = None
 
     @model_validator(mode="after")
     def _approver_roles_exist(self) -> Self:

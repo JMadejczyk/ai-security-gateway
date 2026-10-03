@@ -23,6 +23,9 @@ SESSION_HEADER: Final = "mcp-session-id"
 PROTOCOL_HEADER: Final = "mcp-protocol-version"
 PRINCIPAL_HEADER: Final = "x-acl-principal"
 META_PREFIX: Final = "ai-control-layer/"  # `_meta` keys the gateway adds to tool errors
+# The `_meta` key of a held call's id: the gateway sets it on the tool error, and the agent
+# sets it in `tools/call` params to retry the approved call (`gateway.approvals.oversight`).
+APPROVAL_ID_META: Final = f"{META_PREFIX}approval_id"
 
 # JSON-RPC 2.0 error codes.
 PARSE_ERROR: Final = -32700
@@ -147,6 +150,14 @@ class CallToolParams(BaseModel):
     def payload(self) -> dict[str, Any]:
         """What the pipeline authorizes and the upstream executes: name and arguments only."""
         return {"name": self.name, "arguments": self.arguments}
+
+    def approval_id(self) -> str | None:
+        """The approval this call retries under, if ``_meta`` names one. A non-string value
+        is passed on as ``""`` so the pipeline refuses it instead of ignoring it."""
+        if self.meta is None or APPROVAL_ID_META not in self.meta:
+            return None
+        value = self.meta[APPROVAL_ID_META]
+        return value if isinstance(value, str) else ""
 
 
 class CallToolResult(_Lenient):

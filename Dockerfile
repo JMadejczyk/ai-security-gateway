@@ -4,6 +4,8 @@
 # Both default to 127.0.0.1; docker-compose.yml binds the operator listener to the gateway's
 # static IP on the `ops` network only, so it is unreachable from `edge` and the upstream networks.
 # policy.yaml and feeds/ are bind-mounted read-only at runtime; secrets come from the environment.
+# /app/models holds the injection classifier: the `models-init` service fetches it into a volume
+# the gateway mounts read-only, and the gateway verifies every file's SHA-256 before loading it.
 FROM ghcr.io/astral-sh/uv:0.12.22 AS uv
 
 FROM python:3.12.15-slim AS build
@@ -35,13 +37,15 @@ ENV PATH=/opt/venv/bin:$PATH \
     ACL_AGENT_HOST=127.0.0.1 \
     ACL_AGENT_PORT=8080 \
     ACL_OPERATOR_HOST=127.0.0.1 \
-    ACL_OPERATOR_PORT=9090
+    ACL_OPERATOR_PORT=9090 \
+    ACL_MODELS_DIR=/app/models
 RUN groupadd --system --gid 10001 acl \
     && useradd --system --uid 10001 --gid acl --no-create-home --shell /usr/sbin/nologin acl
 COPY --from=trim /opt/venv /opt/venv
 WORKDIR /app
 COPY gateway ./gateway
-RUN python -m compileall -q gateway
+RUN python -m compileall -q gateway \
+    && install -d -o acl -g acl -m 0755 /app/models  # an empty named volume copies its owner
 USER acl
 EXPOSE 8080 9090
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \

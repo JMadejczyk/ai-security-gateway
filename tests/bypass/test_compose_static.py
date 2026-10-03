@@ -19,6 +19,7 @@ EXPECTED_NETWORKS = {
     "agent": {"edge"},
     "ollama": {"llm_backend"},
     "ollama-init": {"bootstrap"},
+    "models-init": {"bootstrap"},
     "mcp-postgres": {"mcp_backend"},
     "mcp-files": {"mcp_backend"},
     "postgres": {"mcp_backend"},
@@ -62,7 +63,8 @@ def test_only_fetch_and_init_join_networks_with_internet(compose_config: Compose
     assert egress == {"fetch_egress", "bootstrap"}
     for network in egress:
         members = {s for s in compose_config.services if network in compose_config.networks_of(s)}
-        assert members == ({"mcp-fetch"} if network == "fetch_egress" else {"ollama-init"})
+        expected = {"mcp-fetch"} if network == "fetch_egress" else {"ollama-init", "models-init"}
+        assert members == expected
 
 
 def test_only_gateway_publishes_ports_and_only_on_loopback(compose_config: ComposeConfig) -> None:
@@ -86,7 +88,17 @@ def test_operator_listener_binds_the_gateway_ops_address(compose_config: Compose
 
 @pytest.mark.parametrize(
     "service",
-    ["gateway", "agent", "ollama", "mcp-postgres", "mcp-files", "mcp-fetch", "postgres", "redis"],
+    [
+        "gateway",
+        "agent",
+        "ollama",
+        "mcp-postgres",
+        "mcp-files",
+        "mcp-fetch",
+        "postgres",
+        "redis",
+        "models-init",
+    ],
 )
 def test_no_service_escapes_docker_isolation(compose_config: ComposeConfig, service: str) -> None:
     spec = compose_config.service(service)
@@ -181,3 +193,31 @@ def test_gateway_uses_redis_for_budgets(compose_config: ComposeConfig) -> None:
     environment = compose_config.environment_of("gateway")
     assert environment["ACL_BUDGET_STORE"] == "redis"
     assert environment["ACL_REDIS_URL"] == "redis://redis:6379/0"
+
+
+def _volume_mounts(compose_config: ComposeConfig, service: str) -> dict[str, dict[str, Any]]:
+    mounts = cast(list[dict[str, Any]], compose_config.service(service).get("volumes", []))
+    return {str(m["source"]): m for m in mounts if m.get("type") == "volume"}
+
+
+def test_injection_model_is_fetched_on_bootstrap_and_mounted_read_only(
+    compose_config: ComposeConfig,
+) -> None:
+    """models-init (internet, bootstrap only) writes the classifier; the gateway only reads it."""
+    holders = {
+        s for s in compose_config.services if "injection_model" in _volume_mounts(compose_config, s)
+    }
+    assert holders == {"gateway", "models-init"}
+    gateway_mount = _volume_mounts(compose_config, "gateway")["injection_model"]
+    assert gateway_mount.get("read_only") is True
+    assert compose_config.environment_of("gateway")["ACL_MODELS_DIR"] == gateway_mount["target"]
+    init = compose_config.service("models-init")
+    assert compose_config.networks_of("models-init") == {"bootstrap"}
+    assert {"init", "models-init"} <= set(init.get("profiles", []))
+    assert init.get("read_only") is True
+    assert init.get("cap_drop") == ["ALL"]
+    assert not init.get("ports")
+    assert not [
+        k for k in compose_config.environment_of("models-init") if AGENT_FORBIDDEN_ENV.search(k)
+    ]
+    assert "gateway.injection.fetch" in " ".join(cast(list[str], init["command"]))

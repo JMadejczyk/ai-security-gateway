@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "server": "reports",
+  "captured_at": "2026-10-03T16:35:24.580327Z",
+  "protocol_version": "2025-06-18",
+  "tools": [
+    {
+      "name": "write_report",
+      "description": "Create a new text report `name` (a plain file name); never replaces an existing one.",
+      "inputSchema": {
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "content": {
+            "title": "Content",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "content"
+        ],
+        "type": "object",
+        "title": "write_reportArguments"
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false,
+        "title": "Write report"
+      },
+      "digest": "d841de8d0cbc0ce15d6adc2256953f6906544f7b4677fed32a91d41ce392c2eb"
+    }
+  ]
+}

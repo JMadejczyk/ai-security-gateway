@@ -56,6 +56,13 @@ class Span(FrozenModel):
         return self
 
 
+class FlaggedToolCall(FrozenModel):
+    """A ``tool_call`` the intent judge flagged; the matching MCP call then needs approval."""
+
+    tool: str = Field(min_length=1)
+    args_digest: str = Field(min_length=1)
+
+
 class Verdict(FrozenModel):
     """One control's opinion on one interaction at one stage."""
 
@@ -68,6 +75,10 @@ class Verdict(FrozenModel):
     redactions: tuple[Span, ...] = ()
     rewrite: Any = None  # replacement payload (pre) or result (post)
     latency_ms: float = Field(default=0.0, ge=0.0)
+    # Tool calls to flag in the session (``intent_judge``). A post ``require_approval`` that
+    # names flags does not hold the released result: its approval obligation moves to the
+    # matching MCP ``tools/call`` instead (SPEC "Intent vs enforcement").
+    flags: tuple[FlaggedToolCall, ...] = ()
 
 
 class Cooldown(FrozenModel):
@@ -75,13 +86,6 @@ class Cooldown(FrozenModel):
 
     key: str = Field(min_length=1)
     until: AwareDatetime
-
-
-class FlaggedToolCall(FrozenModel):
-    """A ``tool_call`` the intent judge flagged; the matching MCP call then needs approval."""
-
-    tool: str = Field(min_length=1)
-    args_digest: str = Field(min_length=1)
 
 
 class CallRecord(FrozenModel):
@@ -114,6 +118,10 @@ class SessionContext(FrozenModel):
     cooldowns: tuple[Cooldown, ...] = ()
     flagged_tool_calls: tuple[FlaggedToolCall, ...] = ()
     call_history: tuple[CallRecord, ...] = ()
+    # The user's goal: the first user message the gateway forwarded to the LLM in this session,
+    # set once and never from a later transcript (SPEC "Intent vs enforcement"). Raw text for
+    # the intent judge only: never audited, logged or exported.
+    goal: str | None = Field(default=None, repr=False)
 
     def risk_at(self, now: datetime, half_life_s: float) -> float:
         """Risk decayed exponentially from ``risk_updated_at`` to ``now``."""

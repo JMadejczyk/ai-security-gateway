@@ -1,6 +1,7 @@
 """Shared fixtures: the root policy, snapshots built from edited copies, session contexts."""
 
 import copy
+import os
 from collections.abc import AsyncIterator, Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -10,6 +11,7 @@ import pytest
 import respx
 import yaml
 from gateway_testkit import LLM_BASE, Harness, running_gateway
+from redis_kit import REDIS_AUTH_ENV, REDIS_IMAGE, REDIS_URL_ENV, RealRedis, docker_redis
 
 from gateway.core.envelope import SessionContext
 from gateway.core.types import SessionMode
@@ -105,3 +107,18 @@ def llm_upstream() -> Iterator[respx.MockRouter]:
     """Mocks the policy's LLM upstream; anything else the gateway calls is an error."""
     with respx.mock(base_url=LLM_BASE, assert_all_called=False) as router:
         yield router
+
+
+# ------------------------------------------------------------------------- real Redis
+
+
+@pytest.fixture(scope="session")
+def real_redis() -> Iterator[RealRedis]:
+    """A real Redis for store contracts marked ``redis`` (see `redis_kit`); skips without one."""
+    if url := os.environ.get(REDIS_URL_ENV):
+        yield RealRedis(url=url, password=os.environ.get(REDIS_AUTH_ENV))
+        return
+    with docker_redis() as server:
+        if server is None:
+            pytest.skip(f"no docker to start {REDIS_IMAGE} and {REDIS_URL_ENV} is not set")
+        yield server

@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "server": "web",
+  "captured_at": "2026-10-03T16:35:24.026131Z",
+  "protocol_version": "2025-06-18",
+  "tools": [
+    {
+      "name": "fetch",
+      "description": "Fetch a public web page with HTTP GET and return its body as text (size-capped).",
+      "inputSchema": {
+        "properties": {
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object",
+        "title": "fetchArguments"
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true,
+        "title": "Fetch URL"
+      },
+      "digest": "15f283f1fb938be2f9fc6a33eeb132cb28d341e32672cfadbfb986c90aa2fba7"
+    }
+  ]
+}

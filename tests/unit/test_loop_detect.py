@@ -1,13 +1,22 @@
-"""``loop_detect`` on its own: fingerprints, the sliding window, approval retries, modes."""
+"""``loop_detect`` on its own: fingerprints, the sliding window, approval retries, modes.
 
+The window tests run against every `CallCounter`: in-memory, Redis over fakeredis, and a real
+Redis (marker ``redis``); a counter that cannot count fails closed."""
+
+from collections.abc import AsyncIterator
 from datetime import timedelta
 from typing import Any
 
+import fakeredis
 import pytest
 from gateway_testkit import MutableClock
+from redis.asyncio import Redis
 
+from gateway.controls.loop_counter_redis import RedisCallCounter
 from gateway.controls.loop_detect import (
+    STORE_UNAVAILABLE,
     SWEEP_EVERY,
+    CallCounter,
     CallFingerprint,
     InMemoryCallCounter,
     LoopDetectControl,
@@ -20,6 +29,7 @@ from gateway.policy.schema import LoopDetectConfig
 
 BLOCK = LoopDetectConfig(mode=ControlMode.BLOCK, max_repeats=5, window_s=60)
 LOG_ONLY = LoopDetectConfig(mode=ControlMode.LOG_ONLY, max_repeats=5, window_s=60)
+DEAD_REDIS = "redis://127.0.0.1:1/0"  # nothing listens on port 1
 
 
 @pytest.fixture
@@ -28,8 +38,26 @@ def clock() -> MutableClock:
 
 
 @pytest.fixture
-def counter() -> InMemoryCallCounter:
+def memory_counter() -> InMemoryCallCounter:
     return InMemoryCallCounter()
+
+
+@pytest.fixture(params=["memory", "fakeredis", pytest.param("redis", marks=pytest.mark.redis)])
+async def counter(request, memory_counter) -> AsyncIterator[CallCounter]:
+    match request.param:
+        case "memory":
+            yield memory_counter
+        case "fakeredis":
+            client = fakeredis.FakeAsyncRedis()
+            yield RedisCallCounter(client)
+            await client.aclose()
+        case _:
+            server = request.getfixturevalue("real_redis")
+            client = Redis.from_url(server.url.rsplit("/", 1)[0] + "/4", password=server.password)
+            await client.flushdb()
+            yield RedisCallCounter(client)
+            await client.flushdb()
+            await client.aclose()
 
 
 @pytest.fixture
@@ -148,7 +176,20 @@ async def test_approval_retries_are_neither_counted_nor_blocked(
     assert count == 7  # the three retries were not recorded
 
 
-async def test_counter_sweeps_expired_sessions(counter, clock):
+async def test_redis_down_fails_closed(interaction):
+    client = Redis.from_url(DEAD_REDIS, socket_connect_timeout=0.2, socket_timeout=0.2)
+    control = LoopDetectControl(RedisCallCounter(client))
+    verdict = await control.evaluate(interaction(), Stage.PRE, BLOCK)
+    assert (verdict.decision, verdict.reason_code, verdict.enforced) == (
+        Decision.BLOCK,
+        STORE_UNAVAILABLE,
+        True,
+    )
+    await client.aclose()
+
+
+async def test_counter_sweeps_expired_sessions(memory_counter, clock):
+    counter = memory_counter
     for i in range(SWEEP_EVERY - 1):
         await counter.hit(f"s-{i}", "k", clock(), 60)
     assert len(counter) == SWEEP_EVERY - 1
@@ -157,8 +198,9 @@ async def test_counter_sweeps_expired_sessions(counter, clock):
     assert len(counter) == 1
 
 
-async def test_memory_is_bounded_by_the_window(counter, clock):
+async def test_memory_is_bounded_by_the_window(memory_counter, clock):
     """A session making 2048 distinct calls, one a second, holds only the last window's."""
+    counter = memory_counter
     for i in range(2 * SWEEP_EVERY):
         await counter.hit("s-busy", f"call-{i}", clock(), 60)
         clock.advance(1)

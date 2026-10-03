@@ -17,8 +17,10 @@ from typing import Any
 
 import httpx
 import jwt
+from injection_kit import MarkerClassifier
 
 from gateway.container import GatewayContainer
+from gateway.injection.classifier import InjectionClassifier
 from gateway.main import create_agent_app, create_operator_app
 from gateway.settings import Settings
 
@@ -156,9 +158,14 @@ class Harness:
 
 @asynccontextmanager
 async def running_gateway(
-    tmp_path: Path, *, transport: httpx.AsyncBaseTransport | None = None, **settings: Any
+    tmp_path: Path,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+    classifier: InjectionClassifier | None = None,
+    **settings: Any,
 ) -> AsyncIterator[Harness]:
-    """``transport`` carries every upstream call (LLM and MCP) when given."""
+    """``transport`` carries every upstream call (LLM and MCP) when given. ``classifier`` is
+    the prompt-injection classifier (default: `MarkerClassifier`, never the real model)."""
     policy_path = tmp_path / "policy.yaml"
     shutil.copy(ROOT_POLICY, policy_path)
     shutil.copytree(FEEDS, tmp_path / FEEDS.name, dirs_exist_ok=True)
@@ -171,6 +178,7 @@ async def running_gateway(
         audit_stream=audit,
         env={},
         transport=transport,
+        classifier=classifier if classifier is not None else MarkerClassifier(),
     )
     agent_app, operator_app = create_agent_app(container), create_operator_app(container)
     async with (

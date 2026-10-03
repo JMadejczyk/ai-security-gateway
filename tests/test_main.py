@@ -3,6 +3,7 @@
 import pytest
 from fastapi import FastAPI
 from gateway_testkit import INTERNAL_KEY, JWT_SECRET, ROOT_POLICY, make_settings
+from injection_kit import MarkerClassifier
 from starlette.routing import Route
 
 from gateway import __main__ as entrypoint
@@ -77,7 +78,7 @@ def test_builds_two_listeners_from_settings():
         operator_host="172.29.90.10",
         operator_port=19090,
     )
-    container = GatewayContainer.from_settings(settings, env={})
+    container = GatewayContainer.from_settings(settings, env={}, classifier=MarkerClassifier())
     agent, operator = entrypoint.build_servers(settings, container)
     assert isinstance(agent.config.app, FastAPI)
     assert isinstance(operator.config.app, FastAPI)
@@ -92,7 +93,7 @@ def test_builds_two_listeners_from_settings():
 
 async def test_lifespan_starts_and_stops_shared_resources():
     settings = make_settings(ROOT_POLICY, policy_watch=True)
-    container = GatewayContainer.from_settings(settings, env={})
+    container = GatewayContainer.from_settings(settings, env={}, classifier=MarkerClassifier())
     agent_app, operator_app = create_agent_app(container), create_operator_app(container)
     async with operator_app.router.lifespan_context(operator_app):
         async with agent_app.router.lifespan_context(agent_app):  # shares the started resources

@@ -16,6 +16,8 @@ a reload mid-call never mixes two policy versions. Nothing here knows about a sp
 provider: a channel is an `Adapter` plus an `Upstream`.
 """
 
+import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -28,9 +30,19 @@ from typing import Any, Final, Literal, cast
 
 from pydantic import Field
 
+from gateway.approvals.kill_switch import KillSwitchUnavailableError
+from gateway.approvals.model import Approval, ApprovalState
+from gateway.approvals.oversight import (
+    AGENT_KILLED,
+    APPROVAL,
+    KILL_SWITCH,
+    ApprovalRefusal,
+    Oversight,
+)
 from gateway.budget.ledger import BudgetLedger
 from gateway.budget.metering import charged_tokens
 from gateway.budget.model import BudgetedCall, BudgetRefusalError
+from gateway.canonical import canonical_bytes as _canonical_bytes
 from gateway.clock import Clock, utc_now
 from gateway.controls.registry import ControlRegistry
 from gateway.controls.scope import CallScope, call_scope
@@ -49,6 +61,7 @@ from gateway.core.verdicts import MergedVerdict, merge_verdicts
 from gateway.errors import InvalidRequestError, RejectionError, RequestTooLargeError
 from gateway.feed.schema import EMPTY_FEED, SignatureFeed
 from gateway.identity import TokenClaims, TokenVerifier
+from gateway.judges.intent import first_user_message, mcp_flag_candidates
 from gateway.policy.evaluator import AccessDecision, PolicyEvaluator, PrincipalContext
 from gateway.policy.loader import PolicySnapshot
 from gateway.policy.permissions import PermissionSet, Resource
@@ -79,9 +92,10 @@ alert_logger = logging.getLogger("gateway.alerts")
 
 AUTHZ: Final = "authz"
 BUDGET: Final = "budget"  # a pipeline seam, not a registered control: see _execute_metered
+INTENT_JUDGE: Final = "intent_judge"
+INTENT_FLAGGED: Final = "intent_flagged"  # an MCP call matching a flagged tool_call
 # Controls whose detections mean untrusted content reached the agent's context.
 TAINTING_CONTROLS: Final = frozenset({"prompt_injection"})
-APPROVAL_ID_CHARS: Final = 24
 REWRITE_UNAUTHORIZED: Final = "rewrite_unauthorized"
 
 
@@ -92,6 +106,9 @@ class CallRequest(FrozenModel):
     token: str | None = Field(default=None, repr=False)
     body: bytes = Field(repr=False)  # read up to max_request_bytes + 1, never more
     server: str | None = None  # MCP upstream name
+    # The approval a retry names (MCP `_meta` "ai-control-layer/approval_id", LLM header
+    # X-ACL-Approval-Id): a pointer the pipeline verifies, never an authorization by itself.
+    approval_id: str | None = None
 
 
 class PipelineOutcome(FrozenModel):
@@ -230,7 +247,14 @@ class _Trace:
     # The upstream failed after untrusted content may have reached the gateway (an error text,
     # a malformed or oversized body, a timeout after the request was sent): it taints.
     untrusted_failure: bool = False
+    dispatched: object = None  # the final payload sent upstream (an LLM session's goal source)
     seal: "_Seal | None" = None  # set when a sealing control allowed the final payload
+    # The approval the call presented, verified as bound to it (pending or approved), or why
+    # it was refused; `approval_covered` once it satisfied the approval obligation.
+    approval: Approval | None = None
+    approval_refusal: ApprovalRefusal | None = None
+    approval_covered: bool = False
+    consumed: Approval | None = None  # moved approved -> executing: its outcome is recorded
 
     def verdicts(self) -> list[Verdict]:
         return [v for step in self.steps for _, v in step.verdicts]
@@ -245,17 +269,6 @@ class _Seal:
     control_id: str
     reason_code: str  # refusal when the dispatched payload differs
     canonical: bytes
-
-
-def _canonical_bytes(payload: object) -> bytes | None:
-    """Sorted-key, compact, UTF-8 JSON without NaN; None if ``payload`` is not plain JSON."""
-    try:
-        text = json.dumps(
-            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
-        )
-    except (TypeError, ValueError):
-        return None
-    return text.encode()
 
 
 def _parse_json_object(body: bytes) -> dict[str, Any]:
@@ -302,6 +315,21 @@ def _effective_scope(snapshot: PolicySnapshot, step: _Step) -> tuple[str, ...]:
     return tuple(PermissionSet.parse(grants).restricted_to(usable).as_strings())
 
 
+def _holding(trace: _Trace) -> list[Verdict]:
+    """The verdicts that decide whether a result is released. A post ``require_approval``
+    that names ``flags`` (``intent_judge``) never holds a result that already exists: its
+    approval obligation moves to the flagged MCP calls instead (SPEC "Intent vs enforcement").
+    One without flags still holds, so no approval obligation is ever dropped."""
+    return [
+        verdict
+        for step in trace.steps
+        for stage, verdict in step.verdicts
+        if not (
+            stage is Stage.POST and verdict.decision is Decision.REQUIRE_APPROVAL and verdict.flags
+        )
+    ]
+
+
 def _model_label(executed: Sequence[Interaction]) -> str:
     """``acl_tokens_total``'s model: the model the call was authorized for and ran with.
 
@@ -331,10 +359,12 @@ class Pipeline:
         controls: ControlRegistry,
         recorder: DecisionRecorder,
         *,
+        oversight: Oversight,
         clock: Clock = utc_now,
         budgets: BudgetLedger | None = None,
     ) -> None:
         self._gate = gate
+        self._oversight = oversight
         self._channels = channels
         self._controls = controls
         self._recorder = recorder
@@ -412,7 +442,14 @@ class Pipeline:
             route=route,
             now=self._clock(),
         )
-        scope = CallScope(snapshot=trace.snapshot, principal=call.principal, feed=trace.feed)
+        await self._resolve_presented(trace, claims, interactions)
+        scope = CallScope(
+            snapshot=trace.snapshot,
+            principal=call.principal,
+            feed=trace.feed,
+            # Only a verified approval (bound to this exact call) excludes it from loop_detect.
+            approval_id=trace.approval.id if trace.approval is not None else None,
+        )
         with call_scope(scope):
             prepared = await self._prepare(trace, call, interactions)
             if isinstance(prepared, PipelineOutcome):
@@ -449,8 +486,9 @@ class Pipeline:
         # Step 3: base authorization and session restrictions.
         trace.steps = [self._authorize(snapshot, call, i) for i in interactions]
         self._raise_alerts(trace, call.ctx)
-        if any(step.access.decision is Decision.BLOCK for step in trace.steps):
-            return self._outcome(trace, merge_verdicts(trace.verdicts()))
+        if (stopped := await self._admission_refusal(trace)) is not None:
+            return stopped
+        self._check_flags(trace, call)
 
         # Steps 4-5: pre controls and merge.
         for step in trace.steps:
@@ -461,8 +499,8 @@ class Pipeline:
         merged = merge_verdicts(trace.verdicts())
         if merged.decision is Decision.BLOCK:
             return self._outcome(trace, merged)
-        if merged.requires_approval:
-            return self._hold_for_approval(trace, merged)
+        if merged.requires_approval and not self._approval_covers(trace):
+            return await self._hold_for_approval(trace, merged)
         payload = _final(original, [s.interaction.payload for s in trace.steps], merged)
         sealed = await self._seal(trace, payload)
         if isinstance(sealed, PipelineOutcome):
@@ -554,11 +592,19 @@ class Pipeline:
                 for step in trace.steps:
                     step.add(Stage.PRE, [changed])
                 return self._outcome(trace, merge_verdicts(trace.verdicts()))
+        if (stopped := await self._before_dispatch(trace)) is not None:
+            return stopped
+        trace.dispatched = payload
         try:
             trace.upstream = await call.route.upstream.execute(payload, snapshot)
         except UpstreamError as exc:
             trace.untrusted_failure = exc.untrusted
-            return self._refusal(trace, exc, decision=merged.decision)
+            await self._record_approval_outcome(trace, exc)
+            return self._refusal(trace, exc, decision=self._satisfied(trace, merged).decision)
+        except asyncio.CancelledError:  # the request may have been sent: outcome unknown
+            await self._record_approval_cancelled(trace)
+            raise
+        await self._record_approval_outcome(trace, None)
         post: list[Verdict] = []
         for step in trace.steps:
             with_result = step.interaction.model_copy(
@@ -568,9 +614,11 @@ class Pipeline:
             step.add(Stage.POST, verdicts)
             post.extend(verdicts)
         merged_post = merge_verdicts(post)
-        overall = merge_verdicts(trace.verdicts())
+        overall = merge_verdicts(_holding(trace))
         if overall.decision is Decision.BLOCK:
             return self._outcome(trace, overall)
+        if (stopped := await self._kill_check(trace)) is not None:  # before releasing a result
+            return stopped
         result = _final(
             trace.upstream.body, [s.interaction.result for s in trace.steps], merged_post
         )
@@ -641,6 +689,28 @@ class Pipeline:
             trace, merge_verdicts(trace.verdicts()), reason_code=REWRITE_UNAUTHORIZED
         )
 
+    def _check_flags(self, trace: _Trace, call: _Admitted) -> None:
+        """An MCP ``tools/call`` matching a ``tool_call`` the intent judge flagged in this
+        session needs approval, through the normal MCP approval flow (SPEC "Intent vs
+        enforcement"). Matched on the agent's own arguments and on the adapter's canonical
+        form, so neither spelling slips past. Honoured while ``intent_judge`` enforces."""
+        if trace.call.channel is not Channel.MCP or not call.ctx.flagged_tool_calls:
+            return
+        candidates = mcp_flag_candidates(
+            _parse_json_object(trace.call.body), *(step.original_payload for step in trace.steps)
+        )
+        if candidates.isdisjoint(call.ctx.flagged_tool_calls):
+            return
+        mode = trace.snapshot.policy.resolved_control_mode(INTENT_JUDGE)
+        verdict = Verdict(
+            decision=Decision.REQUIRE_APPROVAL,
+            control_id=INTENT_JUDGE,
+            reason_code=INTENT_FLAGGED,
+            enforced=mode is not ControlMode.LOG_ONLY,
+        )
+        for step in trace.steps:
+            step.add(Stage.PRE, [verdict])
+
     def _raise_alerts(self, trace: _Trace, ctx: SessionContext) -> None:
         """One structured alert line and counter per risk rule with ``alert: true`` that holds."""
         rules = trace.snapshot.policy.risk_rules.for_mode(ctx.mode)
@@ -685,8 +755,8 @@ class Pipeline:
         merged = merge_verdicts(trace.verdicts())
         if merged.decision is Decision.BLOCK:
             return self._outcome(trace, merged)
-        if merged.requires_approval:
-            return self._hold_for_approval(trace, merged)
+        if merged.requires_approval and not self._approval_covers(trace):
+            return await self._hold_for_approval(trace, merged)
         sealed = _final(payload, candidates, MergedVerdict(decision=Decision.ALLOW))  # no spans
         last = sealing[-1]
         canonical = _canonical_bytes(sealed)
@@ -745,27 +815,130 @@ class Pipeline:
             verdicts.append(verdict)
         return current, verdicts
 
-    def _hold_for_approval(self, trace: _Trace, merged: MergedVerdict) -> PipelineOutcome:
-        """Seam for the approval queue (stages 10-14): until then an approval is a refusal.
+    # ---------------------------------------------------------- oversight seams
 
-        The ``approval_id`` is already bound to the one exact operation an approval will
-        authorize (principal, agent, session, server, payload digest, policy revision), so a
-        retry of the same pending call names the same id. The queue will persist it.
-        """
+    async def _resolve_presented(
+        self, trace: _Trace, claims: TokenClaims, interactions: Sequence[Interaction]
+    ) -> None:
+        """Look up the approval a retry names; a refusal is applied after authorization."""
+        approval_id = trace.call.approval_id
+        if approval_id is None:
+            return
+        binding = self._oversight.binding(
+            claims, trace.call.channel, trace.call.server, interactions[0].payload
+        )
+        presented = await self._oversight.presented(approval_id, binding)
+        if isinstance(presented, ApprovalRefusal):
+            trace.approval_refusal = presented
+        else:
+            trace.approval = presented
+
+    async def _admission_refusal(self, trace: _Trace) -> PipelineOutcome | None:
+        """Step 3's refusals: base authorization, then the kill switch, then a refused
+        presented approval (denied, expired, used, bound to another call). A refused approval
+        is never consumed."""
+        if any(step.access.decision is Decision.BLOCK for step in trace.steps):
+            return self._outcome(trace, merge_verdicts(trace.verdicts()))
+        if (stopped := await self._kill_check(trace)) is not None:
+            return stopped
+        if trace.approval_refusal is not None:
+            return self._stop(trace, APPROVAL, trace.approval_refusal)
+        return None
+
+    def _approval_covers(self, trace: _Trace) -> bool:
+        """An approved record bound to this call satisfies the approval obligation (only
+        that one: every other verdict still applies)."""
+        approval = trace.approval
+        trace.approval_covered = approval is not None and approval.state is ApprovalState.APPROVED
+        return trace.approval_covered
+
+    async def _kill_check(self, trace: _Trace) -> PipelineOutcome | None:
+        """A killed agent's call stops here; an unknown kill state fails closed (503)."""
+        if trace.claims is None:
+            return None
+        try:
+            killed = await self._oversight.killed(trace.claims.agent)
+        except KillSwitchUnavailableError as exc:
+            self._add_seam_verdict(trace, KILL_SWITCH, exc.reason_code)
+            raise
+        if killed is None:
+            return None
+        return self._stop(trace, KILL_SWITCH, AGENT_KILLED)
+
+    async def _before_dispatch(self, trace: _Trace) -> PipelineOutcome | None:
+        """Right before the upstream: the kill switch again, then consume a presented
+        approval (``approved → executing``, atomically: at most one dispatch per approval)."""
+        if (stopped := await self._kill_check(trace)) is not None:
+            return stopped
+        approval = trace.approval
+        if approval is None or approval.state is not ApprovalState.APPROVED:
+            return None
+        consumed = await self._oversight.consume(approval)
+        if isinstance(consumed, ApprovalRefusal):
+            return self._stop(trace, APPROVAL, consumed)
+        trace.consumed = consumed
+        return None
+
+    async def _record_approval_outcome(self, trace: _Trace, error: UpstreamError | None) -> None:
+        if trace.consumed is not None:
+            await self._oversight.finish(trace.consumed, trace.upstream, error)
+
+    async def _record_approval_cancelled(self, trace: _Trace) -> None:
+        if trace.consumed is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.shield(
+                    self._oversight.finish_uncertain(trace.consumed, "dispatch_cancelled")
+                )
+
+    def _stop(self, trace: _Trace, control_id: str, reason_code: str) -> PipelineOutcome:
+        self._add_seam_verdict(trace, control_id, reason_code)
+        return self._outcome(trace, merge_verdicts(trace.verdicts()))
+
+    @staticmethod
+    def _add_seam_verdict(trace: _Trace, control_id: str, reason_code: str) -> None:
+        verdict = Verdict(decision=Decision.BLOCK, control_id=control_id, reason_code=reason_code)
+        for step in trace.steps:
+            step.add(Stage.PRE, [verdict])
+
+    @staticmethod
+    def _satisfied(trace: _Trace, merged: MergedVerdict) -> MergedVerdict:
+        """``merged`` without the approval obligation once an approved record covers it."""
+        if not (trace.approval_covered and merged.requires_approval):
+            return merged
+        return merge_verdicts(
+            [v for v in merged.verdicts if v.decision is not Decision.REQUIRE_APPROVAL]
+        )
+
+    async def _hold_for_approval(self, trace: _Trace, merged: MergedVerdict) -> PipelineOutcome:
+        """The approval queue (SPEC "Human in the loop"): create or get the pending record of
+        this exact operation and answer with its id. A retry of the same pending operation
+        gets the same id; nothing executes until an operator approves and the agent retries
+        with the id."""
+        claims = trace.claims
+        binding = (
+            self._oversight.binding(
+                claims, trace.call.channel, trace.call.server, trace.steps[0].original_payload
+            )
+            if claims is not None and trace.steps
+            else None
+        )
+        if binding is None:  # no canonical form to bind an approval to: nothing to approve
+            return self._stop(trace, APPROVAL, ApprovalRefusal.UNBINDABLE)
+        reasons = tuple(
+            v.reason_code
+            for v in merged.verdicts
+            if v.enforced and v.decision is Decision.REQUIRE_APPROVAL
+        )
+        record = await self._oversight.hold(
+            binding,
+            trace.snapshot,
+            actions=tuple(step.interaction.action for step in trace.steps),
+            resources=tuple(step.interaction.resource for step in trace.steps),
+            reasons=reasons,
+        )
         held = self._outcome(trace, merged, reason_code="approval_required")
-        claims, call = trace.claims, trace.call
-        binding = {
-            "session_id": claims.session_id if claims else None,
-            "principal": claims.sub if claims else None,
-            "actor": claims.agent if claims else None,
-            "channel": call.channel,
-            "server": call.server,
-            "payload": trace.steps[0].original_payload if trace.steps else None,
-            "policy_revision": trace.snapshot.revision,
-        }
-        approval_id = f"apr-{self._recorder.digest(binding)[:APPROVAL_ID_CHARS]}"
         return held.model_copy(
-            update={"message": "this call needs human approval", "approval_id": approval_id}
+            update={"message": "this call needs human approval", "approval_id": record.id}
         )
 
     async def _persist(self, trace: _Trace) -> None:
@@ -798,6 +971,12 @@ class Pipeline:
             ),
             freeze_until=min(freezes, default=None),
             cooldowns=tuple(cooldowns),
+            flagged_tool_calls=tuple(flag for v in verdicts if v.enforced for flag in v.flags),
+            goal=(
+                first_user_message(trace.dispatched)
+                if trace.call.channel is Channel.LLM and trace.context.goal is None
+                else None
+            ),
             calls=tuple(
                 CallRecord(
                     at=now,
@@ -827,6 +1006,7 @@ class Pipeline:
         request: object = None,
         result: object = None,
     ) -> PipelineOutcome:
+        merged = self._satisfied(trace, merged)
         decision = merged.decision
         reason = reason_code or _first_reason(merged)
         released = decision in {Decision.ALLOW, Decision.REDACT}
@@ -889,6 +1069,8 @@ class Pipeline:
             "policy_revision": snapshot.revision,
             "feed_version": trace.feed.version,
             "latency_ms": latency,
+            "approval_id": outcome.approval_id
+            or (trace.approval.id if trace.approval is not None else None),
             **identity,
         }
         if not trace.steps:

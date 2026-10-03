@@ -48,6 +48,10 @@ class ControlRegistry:
         """Drop every control, e.g. for a test that scripts the whole control set itself."""
         self._controls.clear()
 
+    def remove(self, control_id: str) -> None:
+        """Drop one control, e.g. for a test isolating another control's behavior."""
+        self._controls = [control for control in self._controls if control.id != control_id]
+
     def for_stage(self, stage: Stage, channel: Channel) -> tuple[Control, ...]:
         return tuple(
             control

@@ -13,12 +13,14 @@ session, principal, agent and server, plus the ``MCP-Protocol-Version`` header.
 Methods: ``initialize``, ``notifications/initialized`` (and any other notification: 202),
 ``ping``, ``tools/list`` (filtered), ``tools/call`` (the full pipeline). Everything else gets
 ``-32601``. Policy refusals of a tool call are tool errors (``isError: true``) carrying only a
-reason code; a held call also carries its ``approval_id``.
+reason code; a held call also carries its ``approval_id``. Once approved, the agent retries the
+same ``tools/call`` with ``_meta: {"ai-control-layer/approval_id": "<id>"}`` in its params
+(`gateway.approvals.oversight`).
 """
 
 import json
 import logging
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Any, Final
@@ -27,6 +29,7 @@ from pydantic import ValidationError
 
 from gateway.adapters.mcp import mcp_adapter
 from gateway.clock import Clock, utc_now
+from gateway.controls.tool_pinning import ToolPinningControl, listing_scope
 from gateway.core.types import Action, Channel, Decision
 from gateway.errors import RejectionError
 from gateway.identity import TokenClaims
@@ -34,23 +37,18 @@ from gateway.pipeline import CallRequest, ChannelRoute, Pipeline, PipelineOutcom
 from gateway.policy.loader import PolicySnapshot
 from gateway.policy.schema import McpServer
 from gateway.proxies.mcp import wire
-from gateway.proxies.mcp.pins import PinnedSchemas
+from gateway.proxies.mcp.screens import ToolScreen, run_screens
 from gateway.proxies.mcp.sessions import (
     DownstreamSession,
     MCPSessionRegistry,
     UnknownServerError,
 )
 from gateway.sessions import SessionError, SessionReason
-from gateway.upstream import UpstreamError
 
 logger = logging.getLogger(__name__)
 
 SERVER_VERSION: Final = "0.1.0"
 _JSON_MEDIA: Final = frozenset({"application/json", "application/*", "*/*"})
-
-type ToolScreen = Callable[[Sequence[tuple[str, str | None]], PolicySnapshot], Awaitable[set[str]]]
-"""Given the advertised tools as listed ((name, description) per entry, duplicates kept), the
-names to hide from ``tools/list``."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,16 +88,16 @@ class MCPProxy:
         gate: SessionGate,
         pipeline: Pipeline,
         registry: MCPSessionRegistry,
-        pins: PinnedSchemas,
+        pinning: ToolPinningControl,
         allowed_origins: frozenset[str] = frozenset(),
         clock: Clock = utc_now,
-        tool_screen: ToolScreen | None = None,
+        tool_screens: Sequence[ToolScreen] = (),
     ) -> None:
         self._gate = gate
-        self._tool_screen = tool_screen
+        self._tool_screens = tuple(tool_screens)
         self._pipeline = pipeline
         self._registry = registry
-        self._pins = pins
+        self._pinning = pinning
         self._allowed_origins = allowed_origins
         self._clock = clock
 
@@ -209,15 +207,18 @@ class MCPProxy:
         config: McpServer,
         snapshot: PolicySnapshot,
     ) -> MCPReply:
-        """Only tools that are mapped, within the agent's ``max_actions`` and not currently
-        removed by session restrictions and not flagged by the tool screen (``signatures``);
+        """Only tools that match their pinned baseline (``tool_pinning``, listed as pinned),
+        are mapped, within the agent's ``max_actions`` and not currently removed by session
+        restrictions and not flagged by a listing screen (``signatures``, ``tool_poisoning``);
         none while tools are frozen. Listing never starts a session timer. Resource checks
         wait for ``tools/call``."""
         async with self._gate.admit(request.token, snapshot) as (claims, ctx):
             upstream = await self._registry.upstream(session, snapshot)
             try:
-                tools = await upstream.list_tools(snapshot)
-            except UpstreamError as exc:
+                advertised = await upstream.list_tools(snapshot)
+                server = session.binding.server
+                tools = list(self._pinning.screen_listing(server, config, advertised).definitions)
+            except RejectionError as exc:  # upstream down, unreadable pin file
                 return _rpc_error(
                     message, wire.INTERNAL_ERROR, exc.message, {"reason_code": exc.reason_code}
                 )
@@ -227,7 +228,7 @@ class MCPProxy:
             usable = frozenset(agent.max_actions) - removed if agent else frozenset[Action]()
             if evaluator.tools_frozen(snapshot, ctx, now):  # every tool call would be refused
                 usable = frozenset[Action]()
-            hidden = await self._screened(tools, snapshot)
+            hidden = await self._screened(server, tools, snapshot)
             listed = [
                 tool.as_wire()
                 for tool in tools
@@ -252,11 +253,9 @@ class MCPProxy:
         config = snapshot.policy.upstreams.mcp[server]
         try:
             upstream = await self._registry.upstream(session, snapshot)
-            schemas = self._pins.lookup(server)
-            if schemas is None:
-                schemas = await upstream.advertised_schemas(snapshot)
+            listing = await self._pinning.for_call(server, config, upstream, snapshot)
         except RejectionError as exc:  # unreadable pin file, upstream down: no decision made
-            logger.warning("MCP %s: tool schemas unavailable (%s)", server, exc.reason_code)
+            logger.warning("MCP %s: tool listing unavailable (%s)", server, exc.reason_code)
             return MCPReply(
                 HTTPStatus.OK, wire.result(message.id, wire.tool_error(exc.reason_code))
             )
@@ -265,9 +264,12 @@ class MCPProxy:
             token=request.token,
             body=json.dumps(params.payload()).encode(),
             server=server,
+            approval_id=params.approval_id(),
         )
-        route = ChannelRoute(adapter=mcp_adapter(server, config, schemas), upstream=upstream)
-        outcome = await self._pipeline.handle(call, snapshot, route=route)
+        adapter = mcp_adapter(server, config, listing.schemas)
+        route = ChannelRoute(adapter=adapter, upstream=upstream)
+        with listing_scope(listing):  # what `tool_pinning` checks this call against
+            outcome = await self._pipeline.handle(call, snapshot, route=route)
         if outcome.status_code == HTTPStatus.UNAUTHORIZED:  # token or session gone mid-call
             await self._end_if_session_over(outcome.reason_code, outcome.session_id)
             return refusal_reply(outcome.status_code, outcome.reason_code, outcome.message)
@@ -284,15 +286,10 @@ class MCPProxy:
         return MCPReply(HTTPStatus.OK, wire.result(message.id, _tool_result(outcome)))
 
     async def _screened(
-        self, tools: list[wire.ToolDefinition], snapshot: PolicySnapshot
+        self, server: str, tools: list[wire.ToolDefinition], snapshot: PolicySnapshot
     ) -> set[str]:
-        if self._tool_screen is None:
-            return set()
-        advertised: list[tuple[str, str | None]] = []
-        for tool in tools:  # every entry, in order: a duplicate name must not hide the first
-            description = (tool.model_extra or {}).get("description")
-            advertised.append((tool.name, description if isinstance(description, str) else None))
-        return await self._tool_screen(advertised, snapshot)
+        """What the listing screens (``signatures``, ``tool_poisoning``) hide, all at once."""
+        return await run_screens(self._tool_screens, server, tools, snapshot)
 
     # -------------------------------------------------------------------- admission
 

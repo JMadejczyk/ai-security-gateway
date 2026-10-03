@@ -1,13 +1,16 @@
 .DEFAULT_GOAL := help
 REPORTS := reports
 
-.PHONY: help install lint fmt test test-docker test-all up down
+.PHONY: help install models lint fmt test test-docker test-all up down
 
 help: ## List targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
 
 install: ## Create .venv from uv.lock (dev tools included)
 	uv sync --frozen
+
+models: ## Fetch the pinned injection classifier into models/cache (real-model tests, local runs)
+	uv run python -m gateway.injection.fetch --dest models/cache
 
 lint: ## ruff check + ruff format --check + pyright (strict for gateway/)
 	uv run ruff check .

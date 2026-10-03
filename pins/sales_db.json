@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "server": "sales_db",
+  "captured_at": "2026-10-03T16:35:23.481756Z",
+  "protocol_version": "2025-06-18",
+  "tools": [
+    {
+      "name": "explain",
+      "description": "Planner cost of one SELECT, without running it (gateway use only).",
+      "inputSchema": {
+        "properties": {
+          "sql": {
+            "title": "Sql",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sql"
+        ],
+        "type": "object",
+        "title": "explainArguments"
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true,
+        "title": "SQL plan cost"
+      },
+      "digest": "2ace1751e2f141e76928664e345b333289489159d324b69822b629ba1dce6f2e"
+    },
+    {
+      "name": "query",
+      "description": "Run one read-only SQL SELECT against the sales database; rows are filtered per user.",
+      "inputSchema": {
+        "properties": {
+          "sql": {
+            "title": "Sql",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sql"
+        ],
+        "type": "object",
+        "title": "queryArguments"
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true,
+        "title": "SQL query"
+      },
+      "digest": "4ba67262bd3bb4737f7dab967079beb1d47ed5fdd2f4dd84e001409071e6dc83"
+    }
+  ]
+}

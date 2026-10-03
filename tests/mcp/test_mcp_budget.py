@@ -6,6 +6,7 @@ from pathlib import Path
 import yaml
 from gateway_testkit import running_gateway
 from mcp_harness import MCPStack, connect
+from pin_kit import capture_pins, write_pins
 from upstreams import running_upstreams
 
 from gateway.telemetry import ReloadResult
@@ -34,16 +35,21 @@ async def test_the_51st_tool_call_of_a_session_is_blocked(stack: MCPStack):
 
 
 async def test_mcp_calls_fail_closed_with_503_when_redis_is_down(tmp_path: Path):
-    async with (
-        running_upstreams() as (transport, log),
-        running_gateway(
-            tmp_path, transport=transport, budget_store="redis", redis_url=DEAD_REDIS
-        ) as gateway,
-    ):
-        reports = await connect(MCPStack(gateway, transport, log), "anna@demo", "reports")
-        response = await reports.request(
-            "tools/call", {"name": "write_report", "arguments": {"name": "r.md", "content": "ok"}}
+    async with running_upstreams() as (transport, log):
+        write_pins(tmp_path / "pins", await capture_pins(transport))
+        gateway_ctx = running_gateway(
+            tmp_path,
+            transport=transport,
+            budget_store="redis",
+            session_store="memory",  # the budget store alone is down
+            redis_url=DEAD_REDIS,
         )
-        assert response.status_code == 503
-        assert response.json()["error"]["data"]["reason_code"] == "budget_store_unavailable"
-        assert log.of("write_report") == []
+        async with gateway_ctx as gateway:
+            reports = await connect(MCPStack(gateway, transport, log), "anna@demo", "reports")
+            response = await reports.request(
+                "tools/call",
+                {"name": "write_report", "arguments": {"name": "r.md", "content": "ok"}},
+            )
+            assert response.status_code == 503
+            assert response.json()["error"]["data"]["reason_code"] == "budget_store_unavailable"
+            assert log.of("write_report") == []

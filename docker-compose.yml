@@ -5,9 +5,10 @@
 #   llm_backend   internal  gateway <-> ollama
 #   mcp_backend   internal  gateway <-> mcp-postgres, mcp-files, postgres
 #   mcp_untrusted internal  gateway <-> mcp-fetch
-#   state         internal  gateway <-> redis (budget counters)
+#   state         internal  gateway <-> redis (budgets, sessions, loop counters, approvals)
 #   fetch_egress  external  mcp-fetch only: its outbound internet access
-#   bootstrap     external  ollama-init only (profile `init`), to pull models before lock-down
+#   bootstrap     external  ollama-init and models-init only (profile `init`), to fetch models
+#                           before lock-down
 #
 # Only the gateway publishes ports, and only on 127.0.0.1. No container gets the Docker socket,
 # `privileged`, or host networking/namespaces. Verified by tests/bypass/.
@@ -15,6 +16,7 @@
 # First run:
 #   cp .env.example .env                                # then replace every secret
 #   docker compose --profile init run --rm ollama-init  # one-off model pull (several GB)
+#   docker compose --profile init run --rm models-init  # injection classifier (~750 MB, pinned)
 #   docker compose up -d --build
 
 name: ai-control-layer
@@ -49,6 +51,7 @@ volumes:
   pgdata: {}
   reports: {}
   redis_data: {}
+  injection_model: {}  # filled by models-init, mounted read-only by the gateway
 
 services:
   gateway:
@@ -71,7 +74,20 @@ services:
       ACL_BUDGET_STORE: redis
       ACL_REDIS_URL: redis://redis:6379/0
       ACL_REDIS_PASSWORD: ${ACL_REDIS_PASSWORD:?set ACL_REDIS_PASSWORD in .env}
+      # Session state (risk, taint, timers), loop counters, approvals and the kill switch live
+      # in the same Redis, so a gateway restart keeps a tainted session tainted. Fail closed.
+      ACL_SESSION_STORE: redis
+      # Approved MCP tool baselines (tool_pinning), written on the host by
+      # `python -m gateway.cli pin <server> --write`; a changed file applies on the next call.
+      ACL_PINS_DIR: /app/pins
+      # The pinned injection classifier (gateway/injection/model_manifest.json). Every file is
+      # hashed at startup; missing or altered files and the gateway refuses to start.
+      ACL_MODELS_DIR: /app/models
     volumes:
+      - type: volume
+        source: injection_model
+        target: /app/models
+        read_only: true
       - type: bind
         source: ./policy.yaml
         target: /app/policy.yaml
@@ -86,6 +102,11 @@ services:
         source: ./feeds
         target: /app/feeds
         read_only: true
+      - type: bind
+        source: ./pins
+        target: /app/pins
+        read_only: true
+        bind: { create_host_path: false }
     networks:
       edge: {}
       ops:
@@ -165,6 +186,24 @@ services:
         until ollama list >/dev/null 2>&1; do sleep 1; done;
         ollama pull "$$OLLAMA_MODEL"; status=$$?;
         kill $$server; exit $$status
+
+  # One-off fetch of the injection classifier: exactly the files and revision the manifest pins,
+  # each SHA-256 verified before it is moved into the volume. Same image as the gateway, on the
+  # temporary `bootstrap` network only. Run before `up`:
+  #   docker compose --profile init run --rm models-init
+  models-init:
+    <<: *hardening
+    profiles: [init, models-init]
+    build: .
+    image: ai-control-layer/gateway:dev
+    read_only: true
+    tmpfs: [/tmp]
+    command: ["python", "-m", "gateway.injection.fetch", "--dest", "/app/models"]
+    volumes:
+      - injection_model:/app/models
+    networks: [bootstrap]
+    healthcheck:
+      disable: true
 
   mcp-postgres:
     <<: *hardening

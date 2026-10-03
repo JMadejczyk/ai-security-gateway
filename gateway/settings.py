@@ -50,6 +50,20 @@ class Settings(BaseSettings):
     budget_store: Literal["redis", "memory"] = "redis"
     redis_url: str = "redis://127.0.0.1:6379/0"
     redis_password: SecretStr | None = None  # `requirepass` of the Redis on the `state` network
+    # Session state, loop counters, approvals and the kill switch (`gateway.state_redis`).
+    # None = the same store as `budget_store`. `redis` fails closed (503) while Redis is down.
+    session_store: Literal["redis", "memory"] | None = None
+    # How long a call waits for another call of its session to finish before it is refused
+    # with 429 `session_busy` (calls in one session are serialized across gateways).
+    session_lock_wait_s: float = Field(default=30.0, gt=0.0, le=600.0)
+    # Prompt-injection classifier (`gateway.injection`). `models_dir` holds the files the pinned
+    # manifest names; the gateway verifies every SHA-256 and refuses to start on any mismatch.
+    # `disabled` (development only) loads no model: prompt_injection and tool_poisoning then
+    # fail closed on every text they would classify (`classifier_unavailable`).
+    models_dir: Path = Path("models/cache")
+    injection_classifier: Literal["onnx", "disabled"] = "onnx"
+    classifier_threads: int = Field(default=4, ge=1, le=64)  # intra-op threads per inference
+    classifier_workers: int = Field(default=2, ge=1, le=64)  # inferences running at once
     log_level: str = "info"
 
     @property

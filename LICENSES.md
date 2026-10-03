@@ -20,9 +20,9 @@ All permissive. MPL-2.0 (certifi, tqdm) is file-level copyleft: it applies only 
 
 | License | Packages |
 | --- | --- |
-| MIT | annotated-doc, annotated-types, anyio, attrs, catalogue, charset-normalizer, cloudpathlib, confection, cymem, fastapi, filelock, h11, httptools, jsonschema, jsonschema-specifications, markdown-it-py, mdurl, murmurhash, preshed, presidio-analyzer, pydantic, pydantic-core, pydantic-settings, pyjwt, pyyaml, redis (redis-py), referencing, rich, rpds-py, setuptools, smart-open, spacy, spacy-legacy, spacy-loggers, sqlglot, srsly, thinc, typer, typing-inspection, urllib3, wasabi, watchfiles, weasel |
-| BSD-2/3-Clause | blis, click, httpcore, httpx, idna, jinja2, markupsafe, pygments, python-dotenv, starlette, tldextract, uvicorn, websockets, wrapt, colorama (Windows only) |
-| Apache-2.0 | opentelemetry-api, phonenumbers, requests, requests-file |
+| MIT | annotated-doc, annotated-types, anyio, attrs, catalogue, charset-normalizer, cloudpathlib, confection, cymem, fastapi, filelock, h11, httptools, jsonschema, jsonschema-specifications, markdown-it-py, mdurl, murmurhash, onnxruntime, preshed, presidio-analyzer, pydantic, pydantic-core, pydantic-settings, pyjwt, pyyaml, redis (redis-py), referencing, rich, rpds-py, setuptools, smart-open, spacy, spacy-legacy, spacy-loggers, sqlglot, srsly, thinc, typer, typing-inspection, urllib3, wasabi, watchfiles, weasel |
+| BSD-2/3-Clause | blis, click, fsspec, httpcore, httpx, idna, jinja2, markupsafe, protobuf, pygments, python-dotenv, starlette, tldextract, uvicorn, websockets, wrapt, colorama (Windows only) |
+| Apache-2.0 | flatbuffers, hf-xet, huggingface-hub, opentelemetry-api, phonenumbers, requests, requests-file, tokenizers |
 | Mixed permissive | numpy (BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0), packaging (Apache-2.0 OR BSD-2-Clause), prometheus-client (Apache-2.0 AND BSD-2-Clause), regex (Apache-2.0 AND CNRI-Python), uvloop (Apache-2.0 / MIT), shellingham (ISC), typing-extensions (PSF-2.0) |
 | MPL-2.0 | certifi; tqdm (MPL-2.0 AND MIT) |
 
@@ -31,6 +31,12 @@ Notes:
 - **Presidio** runs with its no-op NLP engine; no spaCy model (whose weights have their own licenses) is downloaded or shipped. The Polish recognizers (PESEL, NIP) are ours.
 - **tldextract** uses its bundled public-suffix snapshot (MPL-2.0 data from publicsuffix.org); nothing is fetched at runtime.
 - **LiteLLM is not a dependency.** If it is added for commercial-model pricing, import only its MIT code: its `enterprise/` directory is under a separate license.
+
+## Model weights
+
+| Model | Revision | License | Note |
+| --- | --- | --- | --- |
+| `protectai/deberta-v3-base-prompt-injection-v2` (`onnx/model.onnx`, `onnx/tokenizer.json`, `onnx/config.json`) | `90c9989b1a342275dd0d1a95aad283c04e075671` | Apache-2.0 | The injection classifier. Not in the image or the repository: `models-init` fetches exactly these files at this commit into a volume, and the gateway checks the SHA-256 of each against `gateway/injection/model_manifest.json` before loading. Only the ONNX export is used (no pickle, no remote code). `huggingface-hub` and `hf-xet` are installed as dependencies of `tokenizers`; the gateway never downloads anything at runtime. |
 
 ## Demo MCP servers (`demo/mcp_servers`)
 

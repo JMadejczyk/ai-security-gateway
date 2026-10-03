@@ -10,7 +10,12 @@ from gateway_testkit import MutableClock, completion
 from redis.asyncio import Redis
 
 from gateway.budget.ledger import DAILY_TTL_S
-from gateway.budget.model import BudgetScope, ScopeKind, SpendLimits
+from gateway.budget.model import (
+    BudgetScope,
+    BudgetStoreUnavailableError,
+    ScopeKind,
+    SpendLimits,
+)
 from gateway.budget.store import BudgetStore
 
 
@@ -44,6 +49,7 @@ class ScriptedLLM(httpx.AsyncBaseTransport):
     entered: asyncio.Event = field(default_factory=asyncio.Event)
     bodies: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
     usage: dict[str, int] | None = None  # overrides completion()'s usage
+    omit_usage: bool = False  # answer without a `usage` object
 
     @property
     def calls(self) -> int:
@@ -61,7 +67,38 @@ class ScriptedLLM(httpx.AsyncBaseTransport):
         answer = completion()
         if self.usage is not None:
             answer["usage"] = self.usage
+        if self.omit_usage:
+            del answer["usage"]
         return httpx.Response(200, json=answer)
+
+
+class FlakyStore:
+    """Wraps a store and breaks it on demand. Duck-typed, so it fits any store API version."""
+
+    def __init__(self, inner: BudgetStore) -> None:
+        self.inner = inner
+        self.kind = inner.kind
+        self.fail_settlements = False  # every settlement write fails
+        self.lose_reserve_reply = False  # the reservation commits, then its reply is lost
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+    async def reserve(self, *args: Any, **kwargs: Any) -> Any:
+        outcome = await self.inner.reserve(*args, **kwargs)
+        if self.lose_reserve_reply:
+            raise BudgetStoreUnavailableError
+        return outcome
+
+    async def settle(self, *args: Any, **kwargs: Any) -> Any:
+        if self.fail_settlements:
+            raise BudgetStoreUnavailableError
+        return await self.inner.settle(*args, **kwargs)  # type: ignore[attr-defined]
+
+    async def adjust(self, *args: Any, **kwargs: Any) -> Any:
+        if self.fail_settlements:
+            raise BudgetStoreUnavailableError
+        return await self.inner.adjust(*args, **kwargs)  # type: ignore[attr-defined]
 
 
 def scope(

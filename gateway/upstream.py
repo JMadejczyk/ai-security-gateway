@@ -1,5 +1,6 @@
 """The upstream side of the pipeline: one `Upstream` per channel executes an approved call."""
 
+import asyncio
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
@@ -50,6 +51,25 @@ class Upstream(ABC):
 
     @abstractmethod
     async def execute(self, payload: object, snapshot: PolicySnapshot) -> UpstreamResult: ...
+
+
+class DeadlineUpstream(Upstream):
+    """Another upstream, bounded by a total wall-clock deadline (a call's GPU allowance).
+
+    ``asyncio.timeout`` around the whole call, not an httpx timeout: httpx's timeouts bound
+    each connect/read/write step, so a slow trickle could outlast them; this cannot.
+    """
+
+    def __init__(self, inner: Upstream, deadline_s: float) -> None:
+        self._inner = inner
+        self._deadline_s = deadline_s
+
+    async def execute(self, payload: object, snapshot: PolicySnapshot) -> UpstreamResult:
+        try:
+            async with asyncio.timeout(self._deadline_s):
+                return await self._inner.execute(payload, snapshot)
+        except TimeoutError:
+            raise UpstreamError("upstream_timeout") from None
 
 
 def refuse_encoded(response: httpx.Response) -> None:

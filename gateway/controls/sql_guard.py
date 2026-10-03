@@ -13,6 +13,16 @@ For an MCP call carrying a ``sql`` argument it
    ``Total Cost`` exceeds ``max_cost``. No price, no execution: a planner failure or timeout
    blocks (``sql_plan_unavailable``).
 
+``sql_guard`` is a sealing control (`Control.seal`): the pipeline runs it last, on the final
+payload with every other pre control's rewrites and redactions applied, so the statement it
+prices is the statement that executes, and refuses (``sql_changed_after_guard``) a dispatched
+payload that differs from the one it allowed. A redaction that breaks the statement makes it
+unparseable, which blocks like any unsupported statement.
+
+The planner runs against the admitted call's own policy snapshot (`gateway.controls.scope`),
+never a newer one a reload swapped in mid-call: the endpoint and the signed execution limits
+it prices under are the ones the statement will run under. No call scope, no price.
+
 Applicability is decided from the call itself, never from a policy lookup that a reload could
 change mid-call: every MCP interaction whose arguments carry ``sql`` is guarded. A tool on a
 non-sql server with a ``sql`` argument therefore cannot be priced and is refused (fail closed).
@@ -30,9 +40,11 @@ from typing import Any, ClassVar, Final, Protocol, cast
 from pydantic import Field
 
 from gateway.adapters.sql import QueryPlan, UnsupportedSqlError
+from gateway.controls.scope import current_scope
 from gateway.core.envelope import FrozenModel, Interaction, Verdict
 from gateway.core.interfaces import Control, ControlConfig
 from gateway.core.types import Channel, ControlKind, Decision, Stage
+from gateway.policy.loader import PolicySnapshot
 from gateway.policy.schema import SqlGuardConfig
 
 SQL_ARGUMENT: Final = "sql"
@@ -50,11 +62,13 @@ class SqlGuardReason(StrEnum):
 
 
 class PlanRequest(FrozenModel):
-    """What to price: the exact statement that would execute, for whom, on which server."""
+    """What to price: the exact statement that would execute, for whom, on which server, under
+    which policy snapshot (the admitted call's: its endpoint and execution limits)."""
 
     server: str = Field(min_length=1)
     principal: str = Field(min_length=1)
     sql: str = Field(min_length=1, repr=False)
+    snapshot: PolicySnapshot = Field(repr=False)
 
 
 class PlanUnavailableError(Exception):
@@ -85,6 +99,7 @@ class SqlGuardControl(Control):
     stages: ClassVar[frozenset[Stage]] = frozenset({Stage.PRE})
     kind: ClassVar[ControlKind] = ControlKind.DETERMINISTIC
     mandatory: ClassVar[bool] = True
+    seal: ClassVar[str | None] = "sql_changed_after_guard"
 
     def __init__(self, planner: SqlPlanner) -> None:
         self._planner = planner
@@ -122,9 +137,15 @@ class SqlGuardControl(Control):
         )
 
     async def _price(self, interaction: Interaction, sql: str, config: SqlGuardConfig) -> float:
-        if interaction.server is None:
+        scope = current_scope()
+        if interaction.server is None or scope is None:
             raise PlanUnavailableError
-        request = PlanRequest(server=interaction.server, principal=interaction.principal, sql=sql)
+        request = PlanRequest(
+            server=interaction.server,
+            principal=interaction.principal,
+            sql=sql,
+            snapshot=scope.snapshot,
+        )
         async with asyncio.timeout(config.timeout_ms / 1000 + PLANNER_OVERHEAD_S):
             return await self._planner(request)
 

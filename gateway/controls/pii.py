@@ -3,6 +3,8 @@
 Presidio with our recognizers (`gateway.controls.pii_recognizers`): ``PL_PESEL``, ``PL_NIP``,
 ``IBAN_CODE``, ``EMAIL_ADDRESS``, ``PHONE_NUMBER``, filtered by the policy's ``entities`` and
 ``threshold``. Modes: ``redact`` (spans labelled with the entity ID), ``block``, ``log_only``.
+Every segment is scanned through `gateway.controls.scanning.scan`: normalized (full-width
+digits, zero-width characters) and across segment boundaries (a PESEL split over two parts).
 """
 
 import asyncio
@@ -10,8 +12,9 @@ from typing import ClassVar
 
 from gateway.controls.detection import detection_verdict
 from gateway.controls.pii_recognizers import PresidioPiiAnalyzer, default_analyzer
+from gateway.controls.scanning import Hit, scan
 from gateway.controls.text import TextExtractor, TextSegment
-from gateway.core.envelope import Interaction, Span, Verdict
+from gateway.core.envelope import Interaction, Verdict
 from gateway.core.interfaces import Control, ControlConfig
 from gateway.core.types import ControlKind, Stage
 from gateway.policy.schema import PiiConfig
@@ -39,15 +42,16 @@ class PiiControl(Control):
         settings = cfg if isinstance(cfg, PiiConfig) else PiiConfig(**cfg.model_dump())
         segments = self._extractor.segments(interaction, stage)
         if sum(len(segment.text) for segment in segments) <= INLINE_SCAN_CHARS:
-            spans = self.scan(segments, settings)
+            hits = self.scan(segments, settings)
         else:  # Presidio is synchronous CPU work: keep long scans off the event loop
-            spans = await asyncio.to_thread(self.scan, segments, settings)
-        return detection_verdict(self.id, settings, spans, detected=PII_DETECTED, clean=NO_PII)
+            hits = await asyncio.to_thread(self.scan, segments, settings)
+        return detection_verdict(self.id, settings, hits, detected=PII_DETECTED, clean=NO_PII)
 
-    def scan(self, segments: list[TextSegment], settings: PiiConfig) -> list[Span]:
-        """Spans of every configured entity scoring at least ``settings.threshold``."""
-        return [
-            Span(path=segment.pointer, start=f.start, end=f.end, label=f.entity.value)
-            for segment in segments
-            for f in self._analyzer.find(segment.text, settings.entities, settings.threshold)
-        ]
+    def scan(self, segments: list[TextSegment], settings: PiiConfig) -> list[Hit]:
+        """Every configured entity scoring at least ``settings.threshold``."""
+
+        def detect(text: str) -> list[tuple[int, int, str]]:
+            found = self._analyzer.find(text, settings.entities, settings.threshold)
+            return [(f.start, f.end, f.entity.value) for f in found]
+
+        return scan(segments, detect)

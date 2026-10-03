@@ -16,6 +16,17 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev --no-install-project
 
+# Trim the venv (526 MB image otherwise): phonenumbers' geocoder and carrier tables are read
+# only by phonenumbers.geocoder/carrier, never by number matching (the pii control), and
+# compiled extensions ship symbol tables the runtime never reads. The full (non-slim) image of
+# the same Python carries binutils for `strip`; nothing from it reaches the runtime image.
+FROM python:3.12.15 AS trim
+COPY --from=build /opt/venv /opt/venv
+RUN rm -rf /opt/venv/lib/python3.12/site-packages/phonenumbers/geodata \
+        /opt/venv/lib/python3.12/site-packages/phonenumbers/carrierdata \
+    && find /opt/venv -type f \( -name '*.so' -o -name '*.so.*' \) \
+        -exec strip --strip-unneeded {} +
+
 FROM python:3.12.15-slim
 ENV PATH=/opt/venv/bin:$PATH \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -27,7 +38,7 @@ ENV PATH=/opt/venv/bin:$PATH \
     ACL_OPERATOR_PORT=9090
 RUN groupadd --system --gid 10001 acl \
     && useradd --system --uid 10001 --gid acl --no-create-home --shell /usr/sbin/nologin acl
-COPY --from=build /opt/venv /opt/venv
+COPY --from=trim /opt/venv /opt/venv
 WORKDIR /app
 COPY gateway ./gateway
 RUN python -m compileall -q gateway

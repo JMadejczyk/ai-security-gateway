@@ -18,6 +18,7 @@ import hashlib
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, ClassVar, Final, Self, cast, override
 
@@ -73,37 +74,68 @@ class CallCounter(ABC):
         ``window_s`` ending at ``now``, this one included."""
 
 
+@dataclass(slots=True)
+class _SessionCounts:
+    """One session's occurrences, plus an expiry queue so dead fingerprints leave promptly."""
+
+    occurrences: dict[str, deque[datetime]] = field(default_factory=dict[str, deque[datetime]])
+    expires: dict[str, datetime] = field(default_factory=dict[str, datetime])  # key -> last expiry
+    queue: deque[tuple[datetime, str]] = field(default_factory=deque[tuple[datetime, str]])
+    horizon: datetime | None = None  # when the session's last occurrence leaves its window
+
+    def expire(self, now: datetime) -> None:
+        """Drop every fingerprint whose latest occurrence has left the window (amortized O(1))."""
+        while self.queue and self.queue[0][0] <= now:
+            _, key = self.queue.popleft()
+            if key in self.expires and self.expires[key] <= now:
+                del self.expires[key]
+                del self.occurrences[key]
+
+
 class InMemoryCallCounter(CallCounter):
-    """Single-process counts. Expired occurrences are dropped when their key is next hit, and
-    every `SWEEP_EVERY` hits a sweep drops sessions with nothing left in any window."""
+    """Single-process counts, held only while they can still matter.
+
+    Each hit first expires the session's fingerprints whose latest occurrence has left the
+    window, so a session holds at most the fingerprints seen within one window; every
+    `SWEEP_EVERY` hits a sweep does the same for every session and drops the empty ones.
+    """
 
     def __init__(self) -> None:
-        self._seen: dict[str, dict[str, deque[datetime]]] = {}
-        self._horizon: dict[str, datetime] = {}  # session -> when its last occurrence expires
+        self._sessions: dict[str, _SessionCounts] = {}
         self._hits = 0
 
     @override
     async def hit(self, session_id: str, key: str, now: datetime, window_s: float) -> int:
         window = timedelta(seconds=window_s)
-        occurrences = self._seen.setdefault(session_id, {}).setdefault(key, deque())
+        session = self._sessions.setdefault(session_id, _SessionCounts())
+        session.expire(now)
+        occurrences = session.occurrences.setdefault(key, deque())
         while occurrences and occurrences[0] <= now - window:
             occurrences.popleft()
         occurrences.append(now)
-        self._horizon[session_id] = max(self._horizon.get(session_id, now), now + window)
+        expiry = now + window
+        session.expires[key] = max(session.expires.get(key, expiry), expiry)
+        session.queue.append((expiry, key))
+        session.horizon = max(session.horizon or expiry, expiry)
         self._hits += 1
         if self._hits % SWEEP_EVERY == 0:
             self._sweep(now)
         return len(occurrences)
 
     def _sweep(self, now: datetime) -> None:
-        for session_id, horizon in list(self._horizon.items()):
-            if horizon <= now:
-                del self._horizon[session_id]
-                self._seen.pop(session_id, None)
+        for session_id, session in list(self._sessions.items()):
+            session.expire(now)
+            if not session.occurrences:
+                del self._sessions[session_id]
 
     def __len__(self) -> int:
         """Sessions with counts held (for tests)."""
-        return len(self._seen)
+        return len(self._sessions)
+
+    def held(self, session_id: str) -> tuple[int, int]:
+        """(fingerprints, queued expiries) held for a session (for tests)."""
+        session = self._sessions.get(session_id)
+        return (len(session.occurrences), len(session.queue)) if session else (0, 0)
 
 
 class LoopDetectControl(Control):

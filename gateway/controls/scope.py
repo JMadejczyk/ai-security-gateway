@@ -2,8 +2,9 @@
 
 The `Control` interface hands a control one interaction and its config. A few controls also
 need the call's policy snapshot and authenticated principal (``model_allowlist`` re-checks the
-model through the evaluator against the same snapshot the call was admitted under), or whether
-the call retries an approved operation (approval retries are excluded from ``loop_detect``).
+model through the evaluator against the same snapshot the call was admitted under), the
+signature feed pinned for the call, or whether the call retries an approved operation
+(approval retries are excluded from ``loop_detect``).
 The pipeline sets a `CallScope` for the duration of one call; outside a call there is none.
 """
 
@@ -12,6 +13,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 
+from gateway.feed.schema import SignatureFeed
 from gateway.policy.evaluator import PrincipalContext
 from gateway.policy.loader import PolicySnapshot
 
@@ -22,6 +24,9 @@ class CallScope:
     principal: PrincipalContext
     # Set by the approval queue when the call retries a held operation with its approval_id.
     approval_id: str | None = None
+    # The signature feed pinned for this call: pre and post match against the same instance,
+    # the one whose version the audit entry records, even if a refresh lands mid-call.
+    feed: SignatureFeed | None = None
 
 
 _SCOPE: ContextVar[CallScope | None] = ContextVar("acl_call_scope", default=None)

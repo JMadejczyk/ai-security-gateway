@@ -1,5 +1,5 @@
 {
-  "version": "2026-10-03.1",
+  "version": "2026-10-03.2",
   "signatures": [
     {
       "id": "inj.ignore-previous",
@@ -85,7 +85,7 @@
       "id": "exfil.markdown-image-query",
       "source": "OWASP LLM02 data exfiltration via rendered images (own wording)",
       "pattern_type": "regex",
-      "pattern": "!\\[[^\\]\\n]{0,200}\\]\\(\\s*https?://[^\\s)?]{1,256}\\?[^\\s)]{0,1024}=[^\\s)]{0,1024}\\)",
+      "pattern": "!\\[[^\\]\\n]{0,200}\\]\\(\\s*https?://[^\\s)?]{1,256}\\?[^\\s)]{0,512}=[^\\s)]{0,512}\\)",
       "severity": "high",
       "channels": ["llm", "mcp"]
     },
@@ -182,14 +182,6 @@
       "source": "sensitive paths (own list)",
       "pattern_type": "path_glob",
       "pattern": "**/.env*",
-      "severity": "high",
-      "channels": ["mcp"]
-    },
-    {
-      "id": "path.dotenv-bare",
-      "source": "sensitive paths (own list)",
-      "pattern_type": "path_glob",
-      "pattern": ".env*",
       "severity": "high",
       "channels": ["mcp"]
     },

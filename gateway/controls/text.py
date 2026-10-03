@@ -1,40 +1,105 @@
-"""The free text of an interaction, addressed by JSON pointer, for content-scanning controls.
+"""The content of an interaction, addressed by JSON pointer, for content-scanning controls.
 
-Content controls (``pii``, ``secrets``, later ``signatures`` and ``prompt_injection``) scan
-the strings an interaction carries and answer with spans. A span is a JSON pointer into the
-document the pipeline redacts at that stage plus code-point offsets inside the string it
-names (`gateway.redaction`), so every pointer yielded here addresses exactly that document:
+Content controls (``pii``, ``secrets``, ``signatures``, later ``prompt_injection``) scan what
+an interaction carries and answer with spans: a JSON pointer into the document the pipeline
+redacts at that stage, plus code-point offsets in the string it names (`gateway.redaction`).
 
-- llm, pre: the chat request (``payload``): ``/messages/i/content`` (a string, or
-  ``/messages/i/content/j/text`` of a content-part list), the message's other prose fields
-  (e.g. ``reasoning``) and ``/messages/i/tool_calls/k/function/arguments``;
-- llm, post: the chat completion (``result``): the same fields under ``/choices/i/message``;
-- mcp, pre: ``{"name", "arguments"}`` (``payload``): every string leaf under ``/arguments``;
-- mcp, post: the ``CallToolResult`` (``result``): ``/content/i/text`` and every string leaf
-  under ``/structuredContent``.
+What is scanned is everything that crosses the gateway, not a list of known fields, so a new
+or legacy field (``tools`` definitions, ``function_call``, ``reasoning_details``, an MCP
+``resource``) cannot carry data past the controls:
 
-Tool-call arguments are JSON text: offsets point into that text, and a mask written over a
-match inside one of its string values keeps it valid JSON. Shapes the gateway does not
-recognize yield nothing rather than fail; the adapters and upstreams have validated them.
+- llm, pre: every string in the chat request (``payload``), ``tools`` included;
+- llm, post: every string in the chat completion (``result``); the SSE re-emission is built
+  from that same (redacted) document;
+- mcp, pre: every string and number under ``/arguments`` of ``{"name", "arguments"}``;
+- mcp, post: every string and number in the ``CallToolResult``, ``isError`` results too.
+
+Three encodings are opened before scanning, because a regex over the encoded form misses
+what the encoding hides:
+
+- ``arguments`` strings in LLM documents are JSON text (``\\u0041KIA...`` is ``AKIA...``):
+  they are parsed and their leaves yielded with ``embedded`` pointers, so a span is applied
+  to the decoded value and the JSON serialized again. Arguments that do not parse are
+  scanned as written, unless they contain a backslash: then an escape may hide content the
+  scan cannot see, and the segment is `SegmentKind.UNSCANNABLE` (``secrets`` blocks it).
+  Malformed JSON with an escape in it is rare, and a block is the only safe answer to it.
+- base64 ``blob`` of an MCP resource, ``data`` of an MCP content item (next to its
+  ``mimeType``) and
+  ``data:`` URLs are decoded when they are text, judged by the bytes and not by the claimed
+  type (a ``text/plain`` labelled ``image/png`` is still text): valid UTF-8 without NUL.
+  Decoded text is `SegmentKind.OPAQUE`: a mask cannot be written back into base64, so a
+  detection there blocks. Binary media (longer than a credential could be) is not scanned:
+  regexes over image bytes find noise, not text. Text larger than `MAX_DECODED_BYTES` is
+  UNSCANNABLE rather than skipped.
+- numbers (MCP only, and inside decoded arguments) are rendered as digits: a PESEL sent as
+  ``44051401359`` is still a PESEL. A span on a number replaces the whole value.
+
+Every segment carries ``key``, the nearest object key above it, for key-sensitive detection
+(``{"password": "..."}``). Shapes the gateway does not recognize yield nothing.
 """
 
+import base64
+import binascii
+import codecs
+import json
+import re
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from enum import StrEnum
 from typing import Any, Final, cast
+from urllib.parse import unquote_to_bytes
 
-from gateway.core.envelope import Interaction
+from gateway.core.envelope import Interaction, Span
 from gateway.core.types import Channel, Stage
 
-# Message fields that name or route, never carry prose a person or a model wrote.
-_MESSAGE_METADATA: Final = frozenset({"role", "name", "tool_call_id"})
+MAX_DECODED_BYTES: Final = 1 << 20  # decoded text above this is not scanned: UNSCANNABLE
+_PROBE_BYTES: Final = 4096  # bytes decoded to tell text from binary in an oversized payload
+_RAW_SCAN_CHARS: Final = 4096  # binary payloads up to this length are still scanned as written
+_ARGUMENTS: Final = "arguments"
+_BLOB: Final = "blob"  # an MCP resource's base64 payload
+_DATA: Final = "data"  # an MCP image/audio item's base64 payload, next to its mimeType
+_DATA_URL: Final = re.compile(r"data:([^,]{0,256}),", re.IGNORECASE)
+# Keys of protocol fields (identifiers and enums), not of text a person or model wrote. They
+# are scanned like any value, but left out when consecutive segments are joined into one text:
+# ``role: "user"`` between two messages would otherwise break a value split across them.
+_STRUCTURAL_KEYS: Final = frozenset(
+    {"role", "type", "id", "name", "model", "object", "finish_reason", "mimeType", "uri"}
+)
+
+
+class SegmentKind(StrEnum):
+    """How a detection in a segment can be acted on."""
+
+    TEXT = "text"  # a string: spans redact by offset
+    NUMBER = "number"  # a number rendered as digits: a span replaces the whole value
+    OPAQUE = "opaque"  # text decoded from base64 or a data URL: no mask fits, a hit blocks
+    UNSCANNABLE = "unscannable"  # could not be decoded reliably: content controls fail closed
 
 
 @dataclass(frozen=True, slots=True)
 class TextSegment:
-    """One string of the scanned document and where it lives."""
+    """One scannable value of the stage document and where it lives."""
 
     pointer: str  # JSON pointer (RFC 6901) into the document; "" is the document itself
-    text: str
+    text: str  # what is scanned: the string, the decoded text or the rendered number
+    key: str | None = None  # nearest enclosing object key, if any
+    embedded: str | None = None  # pointer into the JSON text at `pointer` (tool arguments)
+    kind: SegmentKind = SegmentKind.TEXT
+
+    @property
+    def redactable(self) -> bool:
+        return self.kind in {SegmentKind.TEXT, SegmentKind.NUMBER}
+
+    @property
+    def joinable(self) -> bool:
+        """Part of the running text a split value is rebuilt from (not a protocol field)."""
+        return self.key not in _STRUCTURAL_KEYS
+
+    def span(self, start: int, end: int, label: str) -> Span:
+        """A span over ``text[start:end]`` (a number is always replaced whole)."""
+        if self.kind is SegmentKind.NUMBER:
+            start, end = 0, len(self.text)
+        return Span(path=self.pointer, embedded=self.embedded, start=start, end=end, label=label)
 
 
 def pointer(*tokens: str | int) -> str:
@@ -63,21 +128,131 @@ def string_leaves(value: object, base: str = "") -> Iterator[TextSegment]:
             yield from string_leaves(child, base + pointer(index))
 
 
+_EXACT_FLOAT_INTEGERS: Final = 2**53
+
+
+def render_number(value: float) -> str:
+    """Digits as a person would write the number: ``44051401359``, not ``4.4051401359e10``."""
+    if isinstance(value, float) and value.is_integer() and abs(value) < _EXACT_FLOAT_INTEGERS:
+        return str(int(value))
+    return str(value)
+
+
+def _text_of(raw: bytes, *, partial: bool = False) -> str | None:
+    """``raw`` as text when it is UTF-8 without NUL; None for binary. ``partial``: ``raw`` is
+    a prefix, so a character cut at its end is not an error."""
+    if b"\x00" in raw:
+        return None
+    try:
+        return codecs.getincrementaldecoder("utf-8")().decode(raw, final=not partial)
+    except UnicodeDecodeError:
+        return None
+
+
+def decode_blob(encoded: str, *, is_base64: bool = True) -> tuple[SegmentKind, str] | None:
+    """What to scan for an encoded payload.
+
+    ``(OPAQUE, text)`` when it decodes to text; ``(UNSCANNABLE, encoded)`` for text larger
+    than `MAX_DECODED_BYTES`; ``(TEXT, encoded)`` when it is not valid encoding at all, or is
+    binary but short (an ``AKIA...`` key is valid base64 too: what is short enough to be a
+    credential is scanned as written); None for binary media, which is left alone.
+    """
+    oversized = is_base64 and len(encoded) // 4 * 3 > MAX_DECODED_BYTES
+    try:
+        if not is_base64:
+            raw = unquote_to_bytes(encoded)
+        else:  # an oversized payload: decode a prefix, enough to tell text from binary
+            raw = base64.b64decode(
+                encoded[: _PROBE_BYTES // 3 * 4] if oversized else encoded, validate=True
+            )
+    except (binascii.Error, ValueError):
+        return SegmentKind.TEXT, encoded
+    if oversized or len(raw) > MAX_DECODED_BYTES:
+        is_text = _text_of(raw[:_PROBE_BYTES], partial=True) is not None
+        return (SegmentKind.UNSCANNABLE, encoded) if is_text else None
+    text = _text_of(raw)
+    if text is not None:
+        return SegmentKind.OPAQUE, text
+    return (SegmentKind.TEXT, encoded) if len(encoded) <= _RAW_SCAN_CHARS else None
+
+
+@dataclass(frozen=True, slots=True)
+class _LeafWalker:
+    """Depth-first walk over a JSON value yielding every scannable leaf."""
+
+    numbers: bool  # yield numbers too (tool data), not just strings
+    decode_arguments: bool  # parse ``arguments`` strings as JSON (LLM tool calls)
+
+    def walk(
+        self, value: object, base: str, key: str | None, parent: Mapping[str, Any] | None
+    ) -> Iterator[TextSegment]:
+        if isinstance(value, str):
+            yield from self._string(value, base, key, parent)
+        elif isinstance(value, bool) or value is None:
+            return
+        elif isinstance(value, int | float):
+            if self.numbers:
+                yield TextSegment(base, render_number(value), key, kind=SegmentKind.NUMBER)
+        elif (mapping := _as_mapping(value)) is not None:
+            for child_key, child in mapping.items():
+                yield from self.walk(child, base + pointer(child_key), child_key, mapping)
+        else:
+            for index, child in enumerate(_as_list(value)):  # items inherit the list's key
+                yield from self.walk(child, base + pointer(index), key, parent)
+
+    def _string(
+        self, value: str, base: str, key: str | None, parent: Mapping[str, Any] | None
+    ) -> Iterator[TextSegment]:
+        if not value:
+            return
+        if self.decode_arguments and key == _ARGUMENTS:
+            yield from self._arguments(value, base)
+            return
+        decoded: tuple[SegmentKind, str] | None = SegmentKind.TEXT, value
+        if key == _BLOB or (key == _DATA and parent is not None and "mimeType" in parent):
+            decoded = decode_blob(value)
+        elif (url := _DATA_URL.match(value)) is not None:
+            is_base64 = url[1].lower().endswith(";base64")
+            decoded = decode_blob(value[url.end() :], is_base64=is_base64)
+            if decoded is not None and decoded[0] is SegmentKind.TEXT:
+                decoded = SegmentKind.TEXT, value  # scanned as written: offsets into the URL
+        if decoded is not None and decoded[1]:
+            yield TextSegment(base, decoded[1], key, kind=decoded[0])
+
+    def _arguments(self, value: str, base: str) -> Iterator[TextSegment]:
+        try:
+            document: object = json.loads(value)
+        except ValueError:
+            kind = SegmentKind.UNSCANNABLE if "\\" in value else SegmentKind.TEXT
+            yield TextSegment(base, value, _ARGUMENTS, kind=kind)
+            return
+        inner = _LeafWalker(numbers=True, decode_arguments=False)
+        for leaf in inner.walk(document, "", _ARGUMENTS, None):
+            yield replace(leaf, pointer=base, embedded=leaf.pointer)
+
+
+_LLM: Final = _LeafWalker(numbers=False, decode_arguments=True)  # numbers there are parameters
+_MCP: Final = _LeafWalker(numbers=True, decode_arguments=False)
+
+
 class TextExtractor:
-    """Yields the scannable strings of an interaction at one stage (see the module table)."""
+    """Yields the scannable values of an interaction at one stage (see the module docstring)."""
 
     def segments(self, interaction: Interaction, stage: Stage) -> list[TextSegment]:
-        """The strings controls scan, each with its pointer into `document`."""
+        """The values controls scan, each with its pointer into `document`, in document order."""
         document = self.document(interaction, stage)
         match interaction.channel, stage:
-            case Channel.LLM, Stage.PRE:
-                return list(self._chat_request(document))
-            case Channel.LLM, Stage.POST:
-                return list(self._chat_completion(document))
+            case Channel.LLM, _:
+                if _as_mapping(document) is None:
+                    return []
+                return list(_LLM.walk(document, "", None, None))
             case Channel.MCP, Stage.PRE:
-                return list(self._tool_arguments(document))
+                arguments = (_as_mapping(document) or {}).get(_ARGUMENTS)
+                return list(_MCP.walk(arguments, pointer(_ARGUMENTS), None, None))
             case Channel.MCP, Stage.POST:
-                return list(self._tool_result(document))
+                if _as_mapping(document) is None:
+                    return []
+                return list(_MCP.walk(document, "", None, None))
             case _:
                 return []
 
@@ -85,64 +260,3 @@ class TextExtractor:
     def document(interaction: Interaction, stage: Stage) -> object:
         """The value spans address: the payload before the upstream, its result after."""
         return interaction.payload if stage is Stage.PRE else interaction.result
-
-    # -------------------------------------------------------------------- llm
-
-    def _chat_request(self, request: object) -> Iterator[TextSegment]:
-        body = _as_mapping(request) or {}
-        for index, message in enumerate(_as_list(body.get("messages"))):
-            yield from self._message(message, pointer("messages", index))
-
-    def _chat_completion(self, completion: object) -> Iterator[TextSegment]:
-        body = _as_mapping(completion) or {}
-        for index, choice in enumerate(_as_list(body.get("choices"))):
-            fields = _as_mapping(choice) or {}
-            yield from self._message(fields.get("message"), pointer("choices", index, "message"))
-
-    def _message(self, message: object, base: str) -> Iterator[TextSegment]:
-        fields = _as_mapping(message) or {}
-        for key, value in fields.items():
-            if key in _MESSAGE_METADATA:
-                continue
-            here = base + pointer(key)
-            if key == "content":
-                yield from self._content(value, here)
-            elif key == "tool_calls":
-                yield from self._tool_calls(value, here)
-            elif isinstance(value, str) and value:  # reasoning, refusal, ...
-                yield TextSegment(here, value)
-
-    @staticmethod
-    def _content(content: object, base: str) -> Iterator[TextSegment]:
-        if isinstance(content, str):
-            if content:
-                yield TextSegment(base, content)
-            return
-        for index, part in enumerate(_as_list(content)):
-            text = (_as_mapping(part) or {}).get("text")
-            if isinstance(text, str) and text:
-                yield TextSegment(base + pointer(index, "text"), text)
-
-    @staticmethod
-    def _tool_calls(calls: object, base: str) -> Iterator[TextSegment]:
-        for index, call in enumerate(_as_list(calls)):
-            function = _as_mapping((_as_mapping(call) or {}).get("function")) or {}
-            arguments = function.get("arguments")
-            if isinstance(arguments, str) and arguments:
-                yield TextSegment(base + pointer(index, "function", "arguments"), arguments)
-
-    # -------------------------------------------------------------------- mcp
-
-    @staticmethod
-    def _tool_arguments(payload: object) -> Iterator[TextSegment]:
-        body = _as_mapping(payload) or {}
-        yield from string_leaves(body.get("arguments"), pointer("arguments"))
-
-    @staticmethod
-    def _tool_result(result: object) -> Iterator[TextSegment]:
-        body = _as_mapping(result) or {}
-        for index, item in enumerate(_as_list(body.get("content"))):
-            text = (_as_mapping(item) or {}).get("text")
-            if isinstance(text, str) and text:
-                yield TextSegment(pointer("content", index, "text"), text)
-        yield from string_leaves(body.get("structuredContent"), pointer("structuredContent"))

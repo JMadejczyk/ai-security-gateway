@@ -134,3 +134,11 @@ def test_mcp_postgres_applies_the_signed_statement_timeout(live_stack: LiveStack
     result = json.loads(output)
     assert result["isError"] is True, result
     assert text_of(result).endswith("statement canceled: execution limit exceeded")
+
+
+def test_pii_redaction_cannot_make_a_priced_false_predicate_true(live_stack: LiveStack):
+    """Codex P1 live: sql_guard prices the redacted statement, the one that would execute."""
+    exploit = HEAVY + " WHERE 'alice@example.com' = '[REDACTED:EMAIL_ADDRESS]'"
+    result = call_tool(live_stack, ANNA, "query", sql=exploit)
+    assert result["isError"] is True, result
+    assert text_of(result) == "sql_cost_exceeded"

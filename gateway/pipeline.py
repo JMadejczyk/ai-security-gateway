@@ -3,7 +3,8 @@
 1. Authentication: verify the JWT, then lock and load session state (one call per session).
 2. Adapter: normalize the request into one or more `Interaction`s.
 3. Base authorization plus session restrictions on every interaction; any deny stops here.
-4. ``pre`` controls, deterministic first.
+4. ``pre`` controls, deterministic first; sealing controls (`Control.seal`, e.g. ``sql_guard``)
+   last, on the final payload with every rewrite and redaction applied.
 5. Merge verdicts into allow / redact / block / require_approval plus obligations.
 6. Execute on the upstream once, with the final (rewritten, redacted) payload.
 7. ``post`` controls on the complete result.
@@ -20,7 +21,7 @@ import logging
 import time
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from http import HTTPStatus
 from typing import Any, Final, Literal, cast
@@ -29,7 +30,7 @@ from pydantic import Field
 
 from gateway.budget.ledger import BudgetLedger
 from gateway.budget.metering import charged_tokens
-from gateway.budget.model import BudgetedCall, BudgetExceededError, BudgetStoreUnavailableError
+from gateway.budget.model import BudgetedCall, BudgetRefusalError
 from gateway.clock import Clock, utc_now
 from gateway.controls.registry import ControlRegistry
 from gateway.controls.scope import CallScope, call_scope
@@ -46,6 +47,7 @@ from gateway.core.interfaces import Adapter
 from gateway.core.types import Channel, ControlMode, Decision, Stage
 from gateway.core.verdicts import MergedVerdict, merge_verdicts
 from gateway.errors import InvalidRequestError, RejectionError, RequestTooLargeError
+from gateway.feed.schema import EMPTY_FEED, SignatureFeed
 from gateway.identity import TokenClaims, TokenVerifier
 from gateway.policy.evaluator import AccessDecision, PolicyEvaluator, PrincipalContext
 from gateway.policy.loader import PolicySnapshot
@@ -70,7 +72,7 @@ from gateway.telemetry import (
     record_verdicts,
 )
 from gateway.throttle import ThrottledError, Throttler
-from gateway.upstream import Upstream, UpstreamError, UpstreamResult
+from gateway.upstream import DeadlineUpstream, Upstream, UpstreamError, UpstreamResult
 
 logger = logging.getLogger(__name__)
 alert_logger = logging.getLogger("gateway.alerts")
@@ -158,16 +160,16 @@ class DecisionRecorder:
         audit: AuditLogger,
         hmac_key: bytes,
         known_users: frozenset[str],
-        feed_version: Callable[[], str | None] = lambda: None,
+        feed: Callable[[], SignatureFeed] = lambda: EMPTY_FEED,
     ) -> None:
         self._audit = audit
         self._key = hmac_key
         self._known_users = known_users
-        self._feed_version = feed_version
+        self._feed = feed
 
-    def feed_version(self) -> str | None:
-        """Signature feed version in effect now, recorded with every audit entry."""
-        return self._feed_version()
+    def current_feed(self) -> SignatureFeed:
+        """The signature feed in effect now: pinned per call, its version in every audit entry."""
+        return self._feed()
 
     def digest(self, payload: object) -> str:
         return payload_hmac(self._key, payload)
@@ -217,7 +219,9 @@ class _Trace:
     call: CallRequest
     snapshot: PolicySnapshot
     started: float
-    feed_version: str | None = None  # signature feed in effect when the call was admitted
+    # The signature feed pinned when the call was admitted: every control of the call sees
+    # this one instance (via CallScope) and the audit entry names its version.
+    feed: SignatureFeed = EMPTY_FEED
     claims: TokenClaims | None = None
     context: SessionContext | None = None
     steps: list[_Step] = field(default_factory=list[_Step])
@@ -226,9 +230,19 @@ class _Trace:
     # The upstream failed after untrusted content may have reached the gateway (an error text,
     # a malformed or oversized body, a timeout after the request was sent): it taints.
     untrusted_failure: bool = False
+    seal: "_Seal | None" = None  # set when a sealing control allowed the final payload
 
     def verdicts(self) -> list[Verdict]:
         return [v for step in self.steps for _, v in step.verdicts]
+
+
+@dataclass(frozen=True, slots=True)
+class _Seal:
+    """The payload sealing controls allowed: the only payload that may be dispatched."""
+
+    control_id: str
+    reason_code: str  # refusal when the dispatched payload differs
+    payload: object
 
 
 def _parse_json_object(body: bytes) -> dict[str, Any]:
@@ -333,7 +347,7 @@ class Pipeline:
             call=call,
             snapshot=snapshot,
             started=time.perf_counter(),
-            feed_version=self._recorder.feed_version(),
+            feed=self._recorder.current_feed(),
         )
         try:
             claims = trace.claims = self._gate.authenticate(call.token, snapshot)
@@ -358,7 +372,7 @@ class Pipeline:
             call=call,
             snapshot=snapshot,
             started=time.perf_counter(),
-            feed_version=self._recorder.feed_version(),
+            feed=self._recorder.current_feed(),
         )
         try:
             trace.claims = self._gate.authenticate(call.token, snapshot)
@@ -385,7 +399,8 @@ class Pipeline:
             route=route,
             now=self._clock(),
         )
-        with call_scope(CallScope(snapshot=trace.snapshot, principal=call.principal)):
+        scope = CallScope(snapshot=trace.snapshot, principal=call.principal, feed=trace.feed)
+        with call_scope(scope):
             prepared = await self._prepare(trace, call, interactions)
             if isinstance(prepared, PipelineOutcome):
                 return prepared
@@ -436,6 +451,10 @@ class Pipeline:
         if merged.requires_approval:
             return self._hold_for_approval(trace, merged)
         payload = _final(original, [s.interaction.payload for s in trace.steps], merged)
+        sealed = await self._seal(trace, payload)
+        if isinstance(sealed, PipelineOutcome):
+            return sealed
+        payload, merged = sealed, merge_verdicts(trace.verdicts())
         trace.executed = [step.interaction for step in trace.steps]
         if payload != original:  # what runs upstream is authorized too, not just what was asked
             refused = self._authorize_rewrite(trace, call, payload)
@@ -478,10 +497,13 @@ class Pipeline:
         started = time.perf_counter()
         try:
             reservation = await self._budgets.reserve(metered, snapshot)
-        except (BudgetExceededError, BudgetStoreUnavailableError) as exc:
+        except BudgetRefusalError as exc:
             self._add_budget_verdict(trace, started, Decision.BLOCK, exc.reason_code, exc.message)
             raise
         self._add_budget_verdict(trace, started, Decision.ALLOW, "within_budget")
+        if reservation.gpu_allowance_s is not None:  # the GPU time held is all it may use
+            bounded = DeadlineUpstream(call.route.upstream, reservation.gpu_allowance_s)
+            call = replace(call, route=replace(call.route, upstream=bounded))
         try:
             return await self._execute(trace, call, reservation.payload, merged)
         finally:
@@ -506,6 +528,15 @@ class Pipeline:
     ) -> PipelineOutcome:
         """Steps 6-7: run once upstream, then post controls on the complete result."""
         snapshot = trace.snapshot
+        if trace.seal is not None and payload != trace.seal.payload:
+            changed = Verdict(
+                decision=Decision.BLOCK,
+                control_id=trace.seal.control_id,
+                reason_code=trace.seal.reason_code,
+            )
+            for step in trace.steps:
+                step.add(Stage.PRE, [changed])
+            return self._outcome(trace, merge_verdicts(trace.verdicts()))
         try:
             trace.upstream = await call.route.upstream.execute(payload, snapshot)
         except UpstreamError as exc:
@@ -619,14 +650,46 @@ class Pipeline:
                 )
             )
 
+    async def _seal(self, trace: _Trace, payload: object) -> object | PipelineOutcome:
+        """Sealing pre controls on the final payload, after every other control's rewrites and
+        redactions: what they price and allow is exactly what `_execute` may dispatch."""
+        channel = trace.call.channel
+        sealing = [c for c in self._controls.for_stage(Stage.PRE, channel) if c.seal is not None]
+        if not sealing:
+            return payload
+        candidates: list[object] = []
+        for step in trace.steps:
+            final = step.interaction.model_copy(update={"payload": payload})
+            step.interaction, verdicts = await self._run_controls(
+                trace.snapshot, final, Stage.PRE, sealing=True
+            )
+            step.add(Stage.PRE, verdicts)
+            candidates.append(step.interaction.payload)
+        merged = merge_verdicts(trace.verdicts())
+        if merged.decision is Decision.BLOCK:
+            return self._outcome(trace, merged)
+        if merged.requires_approval:
+            return self._hold_for_approval(trace, merged)
+        sealed = _final(payload, candidates, MergedVerdict(decision=Decision.ALLOW))  # no spans
+        last = sealing[-1]
+        trace.seal = _Seal(control_id=last.id, reason_code=str(last.seal), payload=sealed)
+        return sealed
+
     async def _run_controls(
-        self, snapshot: PolicySnapshot, interaction: Interaction, stage: Stage
+        self,
+        snapshot: PolicySnapshot,
+        interaction: Interaction,
+        stage: Stage,
+        *,
+        sealing: bool = False,
     ) -> tuple[Interaction, list[Verdict]]:
-        """Run the stage's controls in order; an enforced rewrite feeds the next control."""
+        """Run the stage's ordinary (or, with ``sealing``, sealing) controls in order; an
+        enforced rewrite feeds the next control."""
         policy = snapshot.policy
         current, verdicts = interaction, list[Verdict]()
         target: Literal["payload", "result"] = "payload" if stage is Stage.PRE else "result"
-        for control in self._controls.for_stage(stage, interaction.channel):
+        controls = self._controls.for_stage(stage, interaction.channel)
+        for control in (c for c in controls if (c.seal is not None) == sealing):
             mode = policy.resolved_control_mode(control.id)
             cfg = policy.control_config(control.id).model_copy(
                 update={"mode": mode, "risk_delta": policy.control_risk_delta(control.id)}
@@ -799,7 +862,7 @@ class Pipeline:
             "reason_code": outcome.reason_code,
             "status": outcome.status_code,
             "policy_revision": snapshot.revision,
-            "feed_version": trace.feed_version,
+            "feed_version": trace.feed.version,
             "latency_ms": latency,
             **identity,
         }

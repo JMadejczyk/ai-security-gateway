@@ -7,12 +7,16 @@ execution limits of both, and that a refused statement never executes.
 """
 
 import json
+from typing import ClassVar
 
 import jwt
 import pytest
 from gateway_testkit import INTERNAL_KEY, bearer
 from mcp_harness import MCPStack, connect, error_text
 
+from gateway.core.envelope import Span, Verdict
+from gateway.core.interfaces import Control
+from gateway.core.types import ControlKind, Decision, Stage
 from gateway.proxies.mcp.explain import EXPLAIN_TOOL
 
 ANNA, BARTEK = "anna@demo", "bartek@demo"
@@ -139,3 +143,117 @@ async def test_each_principal_prices_and_runs_as_itself(stack: MCPStack, princip
     sales = await connect(stack, principal, "sales_db")
     await sales.call("query", sql="SELECT COUNT(*) FROM sales.customers")
     assert [assertion(c.headers)["sub"] for c in stack.log.calls] == [principal, principal]
+
+
+# ------------------------------------------------- sql_guard prices the final statement
+
+EXPLOIT = HEAVY + " WHERE 'alice@example.com' = '[REDACTED:EMAIL_ADDRESS]'"
+
+
+def planner_cost(sql: str) -> float:
+    """Like Postgres: a constant-false WHERE costs next to nothing; true, the full cross join."""
+    if "'alice@example.com' = '[REDACTED:EMAIL_ADDRESS]'" in sql:
+        return 0.02  # One-Time Filter: false
+    return 70_495.2
+
+
+async def test_pii_redaction_cannot_turn_a_cheap_plan_into_a_heavy_query(stack: MCPStack):
+    """Codex P1: priced as constant-false, then made true by the pii redaction."""
+    stack.log.plan_cost_for = planner_cost
+    sales = await connect(stack, ANNA, "sales_db")
+    assert error_text(await sales.call("query", sql=EXPLOIT)) == "sql_cost_exceeded"
+    assert stack.log.of("query") == []
+    priced = {c.arguments["sql"] for c in stack.log.of("explain")}
+    assert len(priced) == 1  # every table interaction priced the one final statement...
+    [statement] = priced
+    assert "alice@example.com" not in statement  # ...the redacted one, as it would execute
+    assert statement.count("[REDACTED:EMAIL_ADDRESS]") == 2
+
+
+async def test_the_priced_statement_is_the_executed_statement(stack: MCPStack):
+    stack.log.plan_cost = 12.5  # cheap whatever the statement: it executes
+    sales = await connect(stack, ANNA, "sales_db")
+    sql = "SELECT COUNT(*) FROM sales.customers WHERE email = 'alice@example.com'"
+    assert (await sales.call("query", sql=sql))["isError"] is False
+    [explain] = stack.log.of("explain")
+    [query] = stack.log.of("query")
+    assert explain.arguments == query.arguments
+    assert query.arguments["sql"] == (
+        "SELECT COUNT(*) FROM sales.customers WHERE email = '[REDACTED:EMAIL_ADDRESS]' LIMIT 500"
+    )
+
+
+class RedactSqlKeyword(Control):
+    """A pre control whose redaction breaks the statement (it masks the ``FROM`` keyword)."""
+
+    id: ClassVar[str] = "egress"  # any catalog id the default container leaves free
+    stages: ClassVar[frozenset[Stage]] = frozenset({Stage.PRE})
+    kind: ClassVar[ControlKind] = ControlKind.DETERMINISTIC
+
+    async def evaluate(self, interaction, stage, cfg):
+        sql = interaction.payload["arguments"]["sql"]
+        start = sql.index("FROM")
+        span = Span(path="/arguments/sql", start=start, end=start + 4, label="X")
+        return Verdict(
+            decision=Decision.REDACT, control_id=self.id, reason_code="x", redactions=(span,)
+        )
+
+
+async def test_redaction_that_breaks_the_statement_fails_closed(stack: MCPStack):
+    stack.gateway.container.pipeline.controls.register(RedactSqlKeyword())
+    sales = await connect(stack, ANNA, "sales_db")
+    result = await sales.call("query", sql="SELECT COUNT(*) FROM sales.customers")
+    assert error_text(result) == "unsupported_sql"
+    assert stack.log.calls == []
+
+
+async def test_a_statement_changed_after_sql_guard_is_never_dispatched(stack, monkeypatch):
+    """Anything between sql_guard and dispatch (here the budget hold) must not alter the SQL."""
+    ledger = stack.gateway.container.pipeline._budgets
+    reserve = ledger.reserve
+
+    async def tampering(call, snapshot):
+        reservation = await reserve(call, snapshot)
+        payload = {**reservation.payload, "arguments": {"sql": HEAVY}}
+        return reservation.model_copy(update={"payload": payload})
+
+    monkeypatch.setattr(ledger, "reserve", tampering)
+    sales = await connect(stack, ANNA, "sales_db")
+    result = await sales.call("query", sql="SELECT COUNT(*) FROM sales.customers")
+    assert error_text(result) == "sql_changed_after_guard"
+    assert stack.log.of("query") == []
+
+
+# ----------------------------------------------- the plan uses the admitted snapshot
+
+
+class ReloadMidCall(Control):
+    """A pre control that swaps in a new policy while the call is between admission and
+    sql_guard: another sales_db endpoint and other execution limits."""
+
+    id: ClassVar[str] = "egress"
+    stages: ClassVar[frozenset[Stage]] = frozenset({Stage.PRE})
+    kind: ClassVar[ControlKind] = ControlKind.DETERMINISTIC
+
+    def __init__(self, stack: MCPStack) -> None:
+        self.stack = stack
+
+    async def evaluate(self, interaction, stage, cfg):
+        policy = self.stack.gateway.policy_path
+        text = policy.read_text().replace("mcp-postgres:8000", "mcp-gone:8000")
+        policy.write_text(text.replace("timeout_ms: 3000", "timeout_ms: 999"))
+        assert self.stack.gateway.container.policy_store.reload().result == "ok"
+        return Verdict(decision=Decision.ALLOW, control_id=self.id, reason_code="ok")
+
+
+async def test_explain_runs_under_the_admitted_snapshot_across_a_reload(stack: MCPStack):
+    """Codex P2: the plan goes to the endpoint, with the limits, the statement runs under."""
+    sales = await connect(stack, ANNA, "sales_db")
+    await sales.tools()
+    stack.gateway.container.pipeline.controls.register(ReloadMidCall(stack))
+    assert (await sales.call("query", sql=ALL_ORDERS))["isError"] is False
+    [explain] = stack.log.of("explain")
+    [query] = stack.log.of("query")
+    assert assertion(explain.headers)["limits"] == POLICY_LIMITS  # not timeout 999
+    assert assertion(query.headers)["limits"] == POLICY_LIMITS
+    assert stack.transport.sent("mcp-gone") == []

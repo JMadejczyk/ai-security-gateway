@@ -183,3 +183,46 @@ async def test_permissive_profile_logs_pii_but_secrets_still_enforce(gateway, an
     assert (blocked.status_code, blocked.json()["error"]["code"]) == (403, "secret_detected")
     assert answer.route.call_count == 1
     assert_nothing_leaked(gateway, PESEL, API_KEY)
+
+
+# ------------------------------------------------------------------ review evasions
+
+
+async def test_secret_in_a_tool_definition_never_reaches_the_upstream(gateway, answer):
+    tool = {"type": "function", "function": {"name": "pay", "description": f"key {STRIPE}"}}
+    response = await ask(gateway, "Pay the invoice.", tools=[tool])
+    assert (response.status_code, response.json()["error"]["code"]) == (403, "secret_detected")
+    assert not answer.route.called
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_legacy_function_call_with_an_escaped_key_is_masked_in_json_and_sse(
+    gateway, llm_upstream, stream
+):
+    edit_policy(gateway, secrets={"mode": "redact"})
+    escaped = json.dumps({"token": STRIPE}).replace("sk_live_", "\\u0073k_live_")
+    body = completion(None)
+    body["choices"][0]["message"]["function_call"] = {"name": "pay", "arguments": escaped}
+    llm_upstream.post("/chat/completions").mock(return_value=httpx.Response(200, json=body))
+    response = await ask(gateway, "Pay.", stream=stream)
+    assert response.status_code == 200
+    assert "function_call" in response.text
+    assert "4eC39HqLyjWDarjtT1zdp7dc" not in response.text
+    assert "[REDACTED:" in response.text
+
+
+async def test_unparseable_escaped_tool_arguments_are_refused(gateway, llm_upstream):
+    call = {"id": "c", "type": "function", "function": {"name": "f", "arguments": '{"a": "\\u00'}}
+    llm_upstream.post("/chat/completions").mock(
+        return_value=httpx.Response(200, json=completion(None, tool_calls=[call]))
+    )
+    response = await ask(gateway, "Call it.")
+    assert (response.status_code, response.json()["error"]["code"]) == (
+        403,
+        "unscannable_content",
+    )
+
+
+async def test_zero_width_split_pesel_is_masked_before_the_upstream(gateway, answer):
+    await ask(gateway, "PESEL 4405\u200b1401359, ok?")
+    assert sent_content(answer.route) == "PESEL [REDACTED:PL_PESEL], ok?"

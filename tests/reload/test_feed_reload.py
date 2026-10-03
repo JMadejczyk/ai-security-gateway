@@ -5,6 +5,7 @@ import json
 
 from gateway_testkit import bearer, chat, echo_completion
 
+from gateway.feed.schema import parse_feed
 from gateway.telemetry import FeedReloadResult
 
 CHAT = "/v1/chat/completions"
@@ -75,3 +76,26 @@ async def test_a_broken_feed_edit_keeps_the_last_valid_feed(gateway, llm_upstrea
 async def test_the_gateway_refreshes_the_feed_in_the_background(gateway):
     assert gateway.container._feed_refresher is not None
     assert not gateway.container._feed_refresher.done()
+
+
+async def test_a_refresh_mid_call_does_not_change_the_feed_judging_it(gateway, llm_upstream):
+    """Pre and post use the feed pinned at admission, the one the audit entry names."""
+    store = gateway.container.feed_store
+    pinned = store.version
+    answer_signature = {**PURGE, "id": "judge.answer", "pattern": "(?i)40 customers"}
+
+    def answer_after_a_refresh(request):
+        feed = json.loads((gateway.policy_path.parent / "feeds" / "signatures.json").read_text())
+        feed["version"] = "judge.mid"
+        feed["signatures"].append(answer_signature)
+        store._swap(parse_feed(json.dumps(feed).encode()))  # a refresh landing mid-call
+        return echo_completion(request)
+
+    llm_upstream.post("/chat/completions").mock(side_effect=answer_after_a_refresh)
+    token = await gateway.token("anna@demo")
+    response = await gateway.agent.post(CHAT, json=chat(), headers=bearer(token))
+    assert response.status_code == 200  # the post stage still used the pinned feed
+    assert gateway.audit_entries()[-1]["feed_version"] == pinned
+    blocked = await gateway.agent.post(CHAT, json=chat(), headers=bearer(token))
+    assert blocked.json()["error"]["code"] == "signature_match"  # the next call sees judge.mid
+    assert gateway.audit_entries()[-1]["feed_version"] == "judge.mid"

@@ -1,10 +1,14 @@
 """Applying merged redaction spans to a payload or result (SPEC "Pipeline and interfaces").
 
-Spans address strings by JSON pointer and code-point offsets. A span that does not land on
-a string is a control bug; the call fails closed rather than releasing unredacted data.
+Spans address strings by JSON pointer and code-point offsets. A span with ``embedded`` lands
+in a JSON document serialized into the string at its path: that string is parsed, redacted
+and serialized again. A span on a number replaces the whole number with the mask (digits have
+no partial redaction). A span that lands anywhere else is a control bug; the call fails closed
+rather than releasing unredacted data.
 """
 
 import copy
+import json
 from collections import defaultdict
 from collections.abc import Sequence
 from typing import Any, cast
@@ -36,7 +40,7 @@ def _child(container: object, token: str) -> object:
     raise KeyError(token)
 
 
-def _replace(container: object, token: str, value: str) -> None:
+def _replace(container: object, token: str, value: object) -> None:
     if isinstance(container, dict):
         cast("dict[str, Any]", container)[token] = value
     else:
@@ -49,6 +53,31 @@ def _masked(text: str, spans: list[Span]) -> str:
             raise RedactionError
         text = text[: span.start] + mask(span.label) + text[span.end :]
     return text
+
+
+def _labels(spans: Sequence[Span]) -> str:
+    return "+".join(sorted({label for span in spans for label in span.label.split("+")}))
+
+
+def _redacted(target: object, spans: list[Span]) -> object:
+    """``target`` (the value at one path) with every span applied."""
+    embedded = [span for span in spans if span.embedded is not None]
+    if embedded:
+        if len(embedded) != len(spans) or not isinstance(target, str):
+            raise RedactionError  # one string is either text or JSON text, never both
+        try:
+            document: object = json.loads(target)
+        except ValueError:
+            raise RedactionError from None
+        inner = [
+            span.model_copy(update={"path": span.embedded, "embedded": None}) for span in spans
+        ]
+        return json.dumps(apply_redactions(document, inner), ensure_ascii=False)
+    if isinstance(target, str):
+        return _masked(target, spans)
+    if isinstance(target, int | float) and not isinstance(target, bool):
+        return mask(_labels(spans))
+    raise RedactionError
 
 
 def apply_redactions(document: object, spans: Sequence[Span]) -> object:
@@ -68,9 +97,7 @@ def apply_redactions(document: object, spans: Sequence[Span]) -> object:
             target = _child(container, last) if path else result
         except (KeyError, IndexError):
             raise RedactionError from None
-        if not isinstance(target, str):
-            raise RedactionError
-        masked = _masked(target, group)
+        masked = _redacted(target, group)
         if path:
             _replace(container, last, masked)
         else:

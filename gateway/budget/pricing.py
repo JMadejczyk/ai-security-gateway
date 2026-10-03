@@ -38,6 +38,17 @@ class CostModel:
     def gpu_cost(self, model: str | None, *, gpu_ms: int) -> int:
         return _nano(gpu_ms * _exact(self.price(model).gpu_second) / MS_PER_SECOND)
 
+    def affordable_gpu_ms(self, model: str | None, *, budget_nano_usd: int) -> int | None:
+        """The most GPU milliseconds ``budget_nano_usd`` pays for; None when GPU time is free."""
+        price = self.price(model).gpu_second
+        if price <= 0:
+            return None
+        if budget_nano_usd <= 0:
+            return 0
+        per_ms = _exact(price) * NANO_USD_PER_USD / MS_PER_SECOND
+        gpu_ms = int(Decimal(budget_nano_usd) / per_ms)  # floor: rounding up could overspend
+        return gpu_ms if self.gpu_cost(model, gpu_ms=gpu_ms) <= budget_nano_usd else gpu_ms - 1
+
 
 def _exact(price: float) -> Decimal:
     return Decimal(repr(price))  # the shortest decimal that round-trips: the value as written

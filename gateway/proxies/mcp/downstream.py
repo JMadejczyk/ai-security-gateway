@@ -18,7 +18,7 @@ reason code; a held call also carries its ``approval_id``.
 
 import json
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Any, Final
@@ -48,8 +48,9 @@ logger = logging.getLogger(__name__)
 SERVER_VERSION: Final = "0.1.0"
 _JSON_MEDIA: Final = frozenset({"application/json", "application/*", "*/*"})
 
-type ToolScreen = Callable[[Mapping[str, str | None], PolicySnapshot], set[str]]
-"""Given advertised tools (name -> description), the names to hide from ``tools/list``."""
+type ToolScreen = Callable[[Sequence[tuple[str, str | None]], PolicySnapshot], Awaitable[set[str]]]
+"""Given the advertised tools as listed ((name, description) per entry, duplicates kept), the
+names to hide from ``tools/list``."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,7 +227,7 @@ class MCPProxy:
             usable = frozenset(agent.max_actions) - removed if agent else frozenset[Action]()
             if evaluator.tools_frozen(snapshot, ctx, now):  # every tool call would be refused
                 usable = frozenset[Action]()
-            hidden = self._screened(tools, snapshot)
+            hidden = await self._screened(tools, snapshot)
             listed = [
                 tool.as_wire()
                 for tool in tools
@@ -282,14 +283,16 @@ class MCPProxy:
             )
         return MCPReply(HTTPStatus.OK, wire.result(message.id, _tool_result(outcome)))
 
-    def _screened(self, tools: list[wire.ToolDefinition], snapshot: PolicySnapshot) -> set[str]:
+    async def _screened(
+        self, tools: list[wire.ToolDefinition], snapshot: PolicySnapshot
+    ) -> set[str]:
         if self._tool_screen is None:
             return set()
-        advertised: dict[str, str | None] = {}
-        for tool in tools:
+        advertised: list[tuple[str, str | None]] = []
+        for tool in tools:  # every entry, in order: a duplicate name must not hide the first
             description = (tool.model_extra or {}).get("description")
-            advertised[tool.name] = description if isinstance(description, str) else None
-        return self._tool_screen(advertised, snapshot)
+            advertised.append((tool.name, description if isinstance(description, str) else None))
+        return await self._tool_screen(advertised, snapshot)
 
     # -------------------------------------------------------------------- admission
 

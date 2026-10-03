@@ -2,14 +2,15 @@
 
 Amounts are integers in base units so a limit check is exact and atomic in Redis: tokens,
 nano-USD, tool calls and GPU milliseconds. Policy values (USD, seconds) are converted once,
-when a scope is built.
+when a scope is built. Every amount and counter stays at or below ``MAX_COUNTER`` (2^53 - 1):
+exact as a Lua number, far inside Redis's 64-bit integers, so no write can overflow.
 """
 
 import math
 from collections.abc import Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Final, Self
+from typing import Annotated, Any, Final, Self
 
 from pydantic import Field, NonNegativeInt
 
@@ -23,6 +24,7 @@ NANO_USD_PER_USD: Final = 1_000_000_000
 MS_PER_SECOND: Final = 1_000
 KEY_PREFIX: Final = "acl:budget"
 SESSION_WINDOW: Final = "session"
+MAX_COUNTER: Final = 2**53 - 1  # the largest value any counter or amount may take
 
 
 class Meter(StrEnum):
@@ -50,13 +52,16 @@ _UNIT: Final[Mapping[Meter, int]] = {
 }
 
 
-class Spend(FrozenModel):
-    """Non-negative amounts per meter, in base units."""
+type Amount = Annotated[int, Field(ge=0, le=MAX_COUNTER)]
 
-    tokens: NonNegativeInt = 0
-    cost_nano_usd: NonNegativeInt = 0
-    tool_calls: NonNegativeInt = 0
-    gpu_ms: NonNegativeInt = 0
+
+class Spend(FrozenModel):
+    """Non-negative amounts per meter, in base units, bounded by ``MAX_COUNTER``."""
+
+    tokens: Amount = 0
+    cost_nano_usd: Amount = 0
+    tool_calls: Amount = 0
+    gpu_ms: Amount = 0
 
     def __getitem__(self, meter: Meter) -> int:
         amount: int = getattr(self, meter.value)
@@ -72,6 +77,11 @@ class Spend(FrozenModel):
     @classmethod
     def of(cls, amounts: Mapping[Meter, int]) -> Self:
         return cls.model_validate({meter.value: amount for meter, amount in amounts.items()})
+
+    @classmethod
+    def bounded(cls, **amounts: int) -> Self:
+        """Amounts clamped to ``[0, MAX_COUNTER]``: an absurd estimate holds the maximum."""
+        return cls.model_validate({k: min(max(v, 0), MAX_COUNTER) for k, v in amounts.items()})
 
     @property
     def cost_usd(self) -> float:
@@ -97,7 +107,7 @@ class SpendLimits(FrozenModel):
         for meter, name in _POLICY_FIELD.items():
             value: float | None = getattr(budget, prefix + name)
             if value is not None:
-                limits[meter.value] = math.floor(value * _UNIT[meter])
+                limits[meter.value] = min(math.floor(value * _UNIT[meter]), MAX_COUNTER)
         return cls.model_validate(limits)
 
     def limited(self) -> frozenset[Meter]:
@@ -141,10 +151,16 @@ def daily_window(now: datetime) -> str:
     return now.astimezone(UTC).date().isoformat()
 
 
+def op_key(op_id: str) -> str:
+    """The record of one reservation: its hold until settled, then a tombstone."""
+    return f"{KEY_PREFIX}:op:{op_id}"
+
+
 class ReserveOutcome(FrozenModel):
     """What a store answered to a reservation. Usage is per scope, after the reservation."""
 
     granted: bool
+    duplicate: bool = False  # the operation id was already reserved or settled: nothing held
     usage: tuple[Spend, ...] = ()
     exceeded_scope: int | None = None  # index into the scopes, when refused
     exceeded_meter: Meter | None = None
@@ -173,10 +189,13 @@ class BudgetedCall(FrozenModel):
 class Reservation(FrozenModel):
     """Budget held for one dispatched call until it is settled."""
 
+    op_id: str = Field(min_length=1)  # makes settlement and release idempotent in the store
     call: BudgetedCall
     payload: Any = Field(repr=False)  # what to dispatch (the LLM request carries a token cap)
     scopes: tuple[BudgetScope, ...]  # empty when no limit applies: nothing was held
     held: Spend
+    held_token_cost: NonNegativeInt = 0  # the token part of ``held.cost_nano_usd``
+    gpu_allowance_s: float | None = None  # LLM: the upstream call must finish within this
     usage: tuple[Spend, ...] = ()  # per scope, right after the reservation
     started_s: float  # monotonic time of the reservation, for wall time on failure
     pricing: FrozenDict[str, ModelPrice]  # the snapshot's prices: settled at reservation terms
@@ -184,7 +203,11 @@ class Reservation(FrozenModel):
     soft_limit_pct: float
 
 
-class BudgetExceededError(RejectionError):
+class BudgetRefusalError(RejectionError):
+    """The budget layer refused the call; the pipeline records it as a ``budget`` verdict."""
+
+
+class BudgetExceededError(BudgetRefusalError):
     """Dispatching the call would cross a hard limit. Names the limit, never anyone's usage."""
 
     status_code = 403
@@ -194,10 +217,21 @@ class BudgetExceededError(RejectionError):
         self.limit_name = limit_name
 
 
-class BudgetStoreUnavailableError(RejectionError):
+class BudgetStoreUnavailableError(BudgetRefusalError):
     """The budget store cannot be reached: a budget-limited call fails closed."""
 
     status_code = 503
 
     def __init__(self) -> None:
         super().__init__("budget_store_unavailable", "budget store unavailable; try again later")
+
+
+class BudgetSettlementPendingError(BudgetRefusalError):
+    """An earlier call's charge on one of these scopes has not reached the store yet."""
+
+    status_code = 503
+
+    def __init__(self) -> None:
+        super().__init__(
+            "budget_settlement_pending", "an earlier charge is still being recorded; try again"
+        )

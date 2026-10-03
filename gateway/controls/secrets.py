@@ -11,11 +11,22 @@ that is the secret itself, and an optional validator that rejects look-alikes:
 - JWTs, whose header must decode to a JSON object with ``alg``;
 - PEM private key blocks, including a truncated one (no ``END`` line);
 - the password of a connection string (``postgres://user:pass@host``);
-- ``password=`` / ``api_key:`` / ``secret=`` style assignments with a non-trivial value.
+- ``password=`` / ``api_key:`` / ``secret=`` style assignments with a non-trivial value
+  (a quoted value is taken whole, up to its closing quote, escapes respected);
+- any value whose JSON key names a credential (``{"password": "..."}``, ``"api_key"``,
+  ``"authorization"``...), in tool arguments, tool results and decoded tool-call arguments.
+
+Every segment is scanned through `gateway.controls.scanning.scan`: normalized (full-width
+and zero-width disguises) and across segment boundaries (a key split over two content
+parts), with each fragment masked. A segment the extractor could not decode reliably
+(`SegmentKind.UNSCANNABLE`) is refused outright: this control is mandatory and cannot vouch
+for content it could not read.
 
 False positives are kept low on purpose: provider tokens must mix character classes
-(``sk-learn`` and ``sk-some-long-lowercase-words`` are prose), placeholders (``<password>``,
-``${DB_PASSWORD}``, ``changeme``-style words, ``****``) are not secrets, and AWS's documented
+(``sk-learn`` and ``sk-some-long-lowercase-words`` are prose), placeholders are not secrets
+when the whole value is one (``<password>``, ``${DB_PASSWORD}``, ``os.environ``, ``changeme``,
+``****``; a password merely starting with ``%`` or containing ``getenv`` is still a secret, and
+a connection string's password is percent-decoded first), and AWS's documented
 example credentials (key IDs ending in ``EXAMPLE``, the secret key ending in ``EXAMPLEKEY``)
 are allowed: they are published in AWS documentation, can never authenticate, and appear in
 every tutorial a user might paste. A real key ID ends that way with probability 32^-7.
@@ -28,19 +39,22 @@ import base64
 import binascii
 import json
 import re
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import ClassVar, Final
+from urllib.parse import unquote
 
 from gateway.controls.detection import detection_verdict
-from gateway.controls.text import TextExtractor
-from gateway.core.envelope import Interaction, Span, Verdict
+from gateway.controls.scanning import Hit, scan
+from gateway.controls.text import SegmentKind, TextExtractor, TextSegment
+from gateway.core.envelope import Interaction, Verdict
 from gateway.core.interfaces import Control, ControlConfig
-from gateway.core.types import ControlKind, Stage
+from gateway.core.types import ControlKind, Decision, Stage
 
 DETECTED = "secret_detected"  # reason codes
 CLEAN = "no_secrets"
+UNSCANNABLE = "unscannable_content"
 
 
 class SecretKind(StrEnum):
@@ -68,7 +82,8 @@ class SecretFinding:
 
 @dataclass(frozen=True, slots=True)
 class SecretRule:
-    """One credential family: ``pattern``'s group ``group`` is the secret.
+    """One credential family: ``pattern``'s group ``group`` is the secret (the first of the
+    groups that took part in the match, when ``group`` names alternatives).
 
     ``validate`` rejects look-alikes by the secret's text; ``classify`` picks the label from
     the whole match when it depends on context (``db_password=`` vs ``api_key=``). ``hints``
@@ -79,17 +94,19 @@ class SecretRule:
     id: str
     kind: SecretKind
     pattern: re.Pattern[str]
-    group: int = 0
+    group: int | tuple[int, ...] = 0
     validate: Validator | None = None
     classify: Classifier | None = None
     hints: tuple[str, ...] = ()
 
     def find(self, text: str) -> Iterator[SecretFinding]:
+        groups = (self.group,) if isinstance(self.group, int) else self.group
         for match in self.pattern.finditer(text):
-            start, end = match.span(self.group)
+            group = next((g for g in groups if match.start(g) >= 0), groups[0])
+            start, end = match.span(group)
             if end <= start:
                 continue
-            if self.validate is not None and not self.validate(match[self.group]):
+            if self.validate is not None and not self.validate(match[group]):
                 continue
             kind = self.classify(match) if self.classify is not None else self.kind
             yield SecretFinding(self.id, kind, start, end)
@@ -102,13 +119,22 @@ _LONG_ASSIGNED_SECRET: Final = 16
 _MIN_CHARACTER_CLASSES: Final = 2
 _PLACEHOLDER_WORDS: Final = frozenset(
     {
-        "password", "passwd", "pass", "pwd", "secret", "token", "apikey", "api_key",
-        "changeme", "example", "redacted", "placeholder", "username", "user", "none", "null",
-        "your_password", "yourpassword", "mypassword", "your_api_key", "your_token",
-        "your_secret", "xxxxxxxx",
+        "password", "passwd", "secret", "token", "apikey", "api_key", "changeme", "example",
+        "redacted", "placeholder", "username", "none", "null", "undefined", "xxxxxxxx",
     }
 )  # fmt: skip
-_TEMPLATE: Final = re.compile(r"^(?:\$|%|\{|<|\[)|(?:\}|>|\])$|environ|getenv|process\.env")
+# Complete placeholder expressions: a value is a placeholder only when it is one of these whole.
+_PLACEHOLDER: Final = re.compile(
+    r"\$\{[A-Za-z_][A-Za-z0-9_]{0,63}\}"  # ${DB_PASSWORD}
+    r"|\$[A-Z_][A-Z0-9_]{0,63}"  # $DB_PASSWORD
+    r"|%[A-Za-z_][A-Za-z0-9_]{0,63}%"  # %DB_PASSWORD%
+    r"|%\([A-Za-z_][A-Za-z0-9_]{0,63}\)s"  # %(password)s
+    r"|\{\{ {0,4}[A-Za-z_][\w.]{0,63} {0,4}\}\}"  # {{ password }}
+    r"|\{[A-Za-z_][A-Za-z0-9_]{0,63}\}"  # {password}
+    r"|<[A-Za-z][\w .-]{0,63}>"  # <your-password>
+    r"|(?:os\.)?(?:environ|getenv)(?:\.get)?|process\.env(?:\.[A-Za-z_]\w{0,63})?"  # references
+    r"|(?:your|my)[_-]?(?:db[_-]?)?(?:password|passwd|secret|token|api[_-]?key|key)"
+)
 
 
 def _character_classes(value: str) -> int:
@@ -136,12 +162,12 @@ def _has_digit(value: str) -> bool:
 
 
 def _is_placeholder(value: str) -> bool:
-    lowered = value.lower().strip("'\"")
+    """The whole value is a placeholder word, expression, or one repeated character."""
+    stripped = value.strip("'\"")
     return (
-        lowered in _PLACEHOLDER_WORDS
-        or len(set(lowered)) == 1  # ****, xxxxxxxx
-        or _TEMPLATE.search(lowered) is not None
-        or lowered.startswith(("your", "<", "example"))
+        stripped.lower() in _PLACEHOLDER_WORDS
+        or len(set(stripped)) <= 1  # ****, xxxxxxxx
+        or _PLACEHOLDER.fullmatch(stripped) is not None
     )
 
 
@@ -154,8 +180,9 @@ def _real_password(value: str) -> bool:
     )
 
 
-def _not_placeholder(value: str) -> bool:
-    return not _is_placeholder(value)
+def _real_uri_password(value: str) -> bool:
+    """A connection string's password, judged after percent-decoding (``%24%7BX%7D``)."""
+    return not _is_placeholder(unquote(value))
 
 
 def _not_aws_example(suffix: str) -> Validator:
@@ -299,19 +326,21 @@ RULES: Final[tuple[SecretRule, ...]] = (
         SecretKind.CONNECTION_STRING,
         re.compile(rf"(?i:{_SCHEMES})://[^\s:/@'\"]{{0,128}}:([^\s/@'\"]{{1,256}})@"),
         group=1,
-        validate=_not_placeholder,
+        validate=_real_uri_password,
         hints=("://",),
     ),
     SecretRule(
         "assigned_secret",
         SecretKind.SECRET,
         re.compile(
-            rf"(?i:{_ASSIGNED_NAME})(?![A-Za-z0-9])[\"']?\s{{0,4}}[:=]{{1,2}}\s{{0,4}}[\"']?"
-            # The value runs to a quote, space or separator. `&` is kept: masking the rest
-            # of a query string is safer than leaving part of a password behind.
-            r"([^\s\"'`,;<>(){}\[\]]{8,256})"
+            rf"(?i:{_ASSIGNED_NAME})(?![A-Za-z0-9])[\"']?\s{{0,4}}[:=]{{1,2}}\s{{0,4}}"
+            # A quoted value runs to its closing quote (escapes skipped), or 256 characters.
+            r"(?:\"((?:[^\"\\\n]|\\.){1,256})|'((?:[^'\\\n]|\\.){1,256})"
+            # An unquoted one to a space or separator. `&` is kept: masking the rest of a
+            # query string is safer than leaving part of a password behind.
+            r"|([^\s\"'`,;<>(){}\[\]]{8,256}))"
         ),
-        group=2,
+        group=(2, 3, 4),
         validate=_real_password,
         classify=_assigned_kind,
         hints=("pass", "pwd", "key", "secret", "token"),
@@ -341,6 +370,40 @@ class SecretScanner:
         return kept
 
 
+# A JSON key whose (lower-cased, alphanumeric) name ends with one of these names a credential.
+_SENSITIVE_KEYS: Final = (
+    (("password", "passwd", "pwd", "passphrase"), SecretKind.PASSWORD),
+    (("privatekey",), SecretKind.PRIVATE_KEY),
+    (("apikey", "accesskey"), SecretKind.API_KEY),
+    (("token", "authorization"), SecretKind.ACCESS_TOKEN),
+    (("secret", "secretkey", "credential", "credentials"), SecretKind.SECRET),
+)
+_MIN_KEYED_SECRET: Final = 6
+
+
+def sensitive_key(key: str | None) -> SecretKind | None:
+    """The credential a JSON key names (``db_password``, ``X-Api-Key``), or None."""
+    if not key:
+        return None
+    name = re.sub(r"[^a-z0-9]", "", key.lower())
+    for suffixes, kind in _SENSITIVE_KEYS:
+        if name.endswith(suffixes):
+            return kind
+    return None
+
+
+def keyed_secrets(segments: Iterable[TextSegment]) -> list[Hit]:
+    """Whole values stored under a credential's key, unless they are placeholders."""
+    hits: list[Hit] = []
+    for segment in segments:
+        kind = sensitive_key(segment.key)
+        value = segment.text.strip()
+        if kind is None or len(value) < _MIN_KEYED_SECRET or _is_placeholder(value):
+            continue
+        hits.append(Hit(segment, 0, len(segment.text), kind.value))
+    return hits
+
+
 class SecretsControl(Control):
     id: ClassVar[str] = "secrets"
     stages: ClassVar[frozenset[Stage]] = frozenset({Stage.PRE, Stage.POST})
@@ -354,9 +417,16 @@ class SecretsControl(Control):
         self._extractor = extractor if extractor is not None else TextExtractor()
 
     async def evaluate(self, interaction: Interaction, stage: Stage, cfg: ControlConfig) -> Verdict:
-        spans = [
-            Span(path=segment.pointer, start=f.start, end=f.end, label=f.kind.value)
-            for segment in self._extractor.segments(interaction, stage)
-            for f in self._scanner.find(segment.text)
-        ]
-        return detection_verdict(self.id, cfg, spans, detected=DETECTED, clean=CLEAN)
+        segments = self._extractor.segments(interaction, stage)
+        if any(segment.kind is SegmentKind.UNSCANNABLE for segment in segments):
+            return Verdict(
+                decision=Decision.BLOCK,
+                control_id=self.id,
+                reason_code=UNSCANNABLE,
+                reason="content could not be decoded for scanning",
+            )
+        hits = scan(segments, self._detect) + keyed_secrets(segments)
+        return detection_verdict(self.id, cfg, hits, detected=DETECTED, clean=CLEAN)
+
+    def _detect(self, text: str) -> list[tuple[int, int, str]]:
+        return [(f.start, f.end, f.kind.value) for f in self._scanner.find(text)]

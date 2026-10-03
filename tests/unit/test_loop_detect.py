@@ -155,3 +155,18 @@ async def test_counter_sweeps_expired_sessions(counter, clock):
     clock.now += timedelta(seconds=61)
     await counter.hit("s-new", "k", clock(), 60)  # the SWEEP_EVERY-th hit sweeps
     assert len(counter) == 1
+
+
+async def test_memory_is_bounded_by_the_window(counter, clock):
+    """A session making 2048 distinct calls, one a second, holds only the last window's."""
+    for i in range(2 * SWEEP_EVERY):
+        await counter.hit("s-busy", f"call-{i}", clock(), 60)
+        clock.advance(1)
+        fingerprints, queued = counter.held("s-busy")
+        assert fingerprints <= 61
+        assert queued <= 61
+    clock.advance(61)
+    await counter.hit("s-other", "k", clock(), 60)
+    for _ in range(SWEEP_EVERY):  # reach the next sweep without touching s-busy
+        await counter.hit("s-other", "k", clock(), 60)
+    assert counter.held("s-busy") == (0, 0)

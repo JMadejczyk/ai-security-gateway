@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Final
 
@@ -59,7 +60,7 @@ class FeedStore:
         policy: Callable[[], PolicySnapshot],
         *,
         max_bytes: int = MAX_FEED_BYTES,
-        transport: httpx.BaseTransport | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._policy = policy
         self._max_bytes = max_bytes
@@ -74,13 +75,18 @@ class FeedStore:
         policy: Callable[[], PolicySnapshot],
         *,
         max_bytes: int = MAX_FEED_BYTES,
-        transport: httpx.BaseTransport | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> "FeedStore":
-        """Load the configured feed. Raises `FeedError`: a configured feed must be valid."""
+        """Load the configured feed. Raises `FeedError`: a configured feed must be valid.
+
+        Synchronous, for the composition root; the fetch runs on its own event loop in a worker
+        thread, so this works whether or not the caller is inside a running loop.
+        """
         store = cls(policy, max_bytes=max_bytes, transport=transport)
         source = store._source(policy())
         if source is not None:
-            store._swap(store._load(source))
+            with ThreadPoolExecutor(max_workers=1) as worker:
+                store._swap(worker.submit(asyncio.run, store._load(source)).result())
             record_feed_reload(FeedReloadResult.OK)
         return store
 
@@ -98,9 +104,7 @@ class FeedStore:
             previous = self._current
             try:
                 source = self._source(self._policy())
-                candidate = (
-                    EMPTY_FEED if source is None else await asyncio.to_thread(self._load, source)
-                )
+                candidate = EMPTY_FEED if source is None else await self._load(source)
             except FeedError as exc:
                 result = (
                     FeedReloadResult.UNAVAILABLE
@@ -137,8 +141,9 @@ class FeedStore:
         base_dir = snapshot.source.parent if snapshot.source is not None else Path.cwd()
         return resolve_source(spec, base_dir=base_dir, transport=self._transport)
 
-    def _load(self, source: FeedSource) -> SignatureFeed:
-        return parse_feed(source.fetch(self._max_bytes), max_bytes=self._max_bytes)
+    async def _load(self, source: FeedSource) -> SignatureFeed:
+        data = await source.fetch(self._max_bytes)
+        return await asyncio.to_thread(parse_feed, data, max_bytes=self._max_bytes)
 
     def _swap(self, feed: SignatureFeed) -> None:
         self._current = feed

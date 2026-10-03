@@ -8,10 +8,12 @@ from gateway.budget.metering import actual, charged_tokens, estimate_prompt_toke
 from gateway.budget.model import BudgetedCall, Meter, ScopeKind, Spend, SpendLimits
 from gateway.budget.pricing import CostModel
 from gateway.core.types import Channel
+from gateway.errors import InvalidRequestError
 from gateway.policy.loader import PolicyLoadError
 from gateway.policy.schema import DailyBudget, ModelPrice, SessionBudget
 from gateway.upstream import TokenUsage
 
+CAPS = {"default_max_tokens": 4096, "max_completion_tokens": 32768}
 PRICED = CostModel(
     {"qwen3:8b": ModelPrice(prompt_per_1k=0.5, completion_per_1k=1.5, gpu_second=0.0005)}
 )
@@ -84,7 +86,7 @@ def test_tool_definitions_count_towards_the_prompt():
 
 
 def test_a_request_without_a_cap_gets_the_default_injected_and_held():
-    planned = plan(call(request()), PRICED, default_max_tokens=4096)
+    planned = plan(call(request()), PRICED, **CAPS)
     assert planned.payload == request(max_tokens=4096)
     assert planned.estimate.tokens == 10 + 4096
     assert planned.estimate.cost_nano_usd == PRICED.token_cost(
@@ -99,29 +101,44 @@ def test_a_request_without_a_cap_gets_the_default_injected_and_held():
         ({"max_tokens": 64}, 64),
         ({"max_completion_tokens": 32}, 32),
         ({"max_tokens": 64, "max_completion_tokens": 32}, 32),
-        (
-            {"max_completion_tokens": -1},
-            4096,
-        ),  # not a cap: the upstream refuses it, we hold the default
+        ({"max_tokens": 10, "max_completion_tokens": 5000}, 10),
+        ({"max_completion_tokens": -1}, 4096),  # not a cap: overwritten with the one held
         ({"max_completion_tokens": True}, 4096),
+        ({"max_tokens": 10**18}, 32768),  # lowered to limits.max_completion_tokens
     ],
 )
-def test_the_smallest_cap_is_held_and_sent_as_max_tokens(caps, held):
-    planned = plan(call(request(**caps)), PRICED, default_max_tokens=4096)
+def test_the_smallest_cap_is_held_and_sent_in_every_cap_field(caps, held):
+    planned = plan(call(request(**caps)), PRICED, **CAPS)
     assert planned.estimate.tokens == 10 + held
-    assert planned.payload["max_tokens"] == held  # type: ignore[index]
+    sent = planned.payload
+    assert isinstance(sent, dict)
+    assert sent["max_tokens"] == held
+    assert sent.get("max_completion_tokens", held) == held
+
+
+@pytest.mark.parametrize("extra", [{"n": 2}, {"n": 0}, {"n": "1"}, {"n": [1]}, {"best_of": 2}])
+def test_more_than_one_completion_is_refused(extra):
+    with pytest.raises(InvalidRequestError) as refused:
+        plan(call(request(**extra)), PRICED, **CAPS)
+    assert (refused.value.status_code, refused.value.reason_code) == (400, "unsupported_parameter")
+
+
+@pytest.mark.parametrize("extra", [{}, {"n": 1}, {"n": None}, {"best_of": 1}])
+def test_one_completion_is_fine(extra):
+    assert plan(call(request(**extra)), PRICED, **CAPS).estimate.tokens == 10 + 4096
 
 
 def test_an_mcp_call_holds_one_tool_call_and_is_forwarded_unchanged():
     payload = {"name": "query", "arguments": {"sql": "SELECT 1"}}
-    planned = plan(call(payload, Channel.MCP, None), PRICED, default_max_tokens=4096)
+    planned = plan(call(payload, Channel.MCP, None), PRICED, **CAPS)
     assert planned.payload is payload
     assert (planned.estimate, planned.meters) == (Spend(tool_calls=1), {Meter.TOOL_CALLS})
 
 
 def test_actual_spend_charges_reported_usage_and_wall_time():
     usage = TokenUsage(model="qwen3:8b", prompt_tokens=12, completion_tokens=7, total_tokens=19)
-    spent = actual(call(request()), Spend(tokens=500), PRICED, usage=usage, wall_s=1.5)
+    held = Spend(tokens=500, gpu_ms=120_000)
+    spent = actual(call(request()), held, 9, PRICED, answered=True, usage=usage, wall_s=1.5)
     assert spent == Spend(
         tokens=19,
         gpu_ms=1500,
@@ -130,14 +147,32 @@ def test_actual_spend_charges_reported_usage_and_wall_time():
     )
 
 
+def test_an_answer_without_usage_keeps_the_held_tokens_and_their_cost():
+    held = Spend(tokens=500, cost_nano_usd=123 + 60_000_000, gpu_ms=120_000)
+    spent = actual(call(request()), held, 123, PRICED, answered=True, usage=None, wall_s=1)
+    assert spent == Spend(
+        tokens=500, gpu_ms=1000, cost_nano_usd=123 + PRICED.gpu_cost("qwen3:8b", gpu_ms=1000)
+    )
+
+
+def test_gpu_time_is_never_charged_past_the_allowance():
+    held = Spend(gpu_ms=500)
+    spent = actual(call(request()), held, 0, PRICED, answered=False, usage=None, wall_s=0.75)
+    assert spent.gpu_ms == 500
+
+
 def test_a_failed_call_is_charged_its_wall_time_only():
-    spent = actual(call(request()), Spend(tokens=500), PRICED, usage=None, wall_s=0.25)
+    held = Spend(tokens=500, gpu_ms=120_000)
+    spent = actual(call(request()), held, 9, PRICED, answered=False, usage=None, wall_s=0.25)
     assert spent == Spend(gpu_ms=250, cost_nano_usd=PRICED.gpu_cost("qwen3:8b", gpu_ms=250))
 
 
 def test_a_dispatched_tool_call_keeps_its_hold():
     held = Spend(tool_calls=1)
-    assert actual(call({}, Channel.MCP, None), held, PRICED, usage=None, wall_s=3) == held
+    spent = actual(
+        call({}, Channel.MCP, None), held, 0, PRICED, answered=False, usage=None, wall_s=3
+    )
+    assert spent == held
 
 
 def test_charged_tokens_never_trust_a_low_total():

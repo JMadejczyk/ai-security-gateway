@@ -36,13 +36,13 @@ class MergedVerdict(FrozenModel):
 
 def union_spans(spans: Iterable[Span]) -> tuple[Span, ...]:
     """Merge overlapping spans on the same path; the merged label lists every source label."""
-    by_path: defaultdict[str, list[Span]] = defaultdict(list)
-    for span in spans:
-        by_path[span.path].append(span)
+    by_path: defaultdict[tuple[str, bool, str], list[Span]] = defaultdict(list)
+    for span in spans:  # one string = one (path, embedded) pair; "" embedded is the root
+        by_path[span.path, span.embedded is not None, span.embedded or ""].append(span)
     merged: list[Span] = []
-    for path in sorted(by_path):
+    for location in sorted(by_path):
         current: Span | None = None
-        for span in sorted(by_path[path], key=lambda s: (s.start, s.end)):
+        for span in sorted(by_path[location], key=lambda s: (s.start, s.end)):
             if current is not None and span.start < current.end:
                 labels = sorted({*current.label.split("+"), *span.label.split("+")})
                 current = current.model_copy(

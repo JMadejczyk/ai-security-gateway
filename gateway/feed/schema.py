@@ -14,8 +14,13 @@ Pattern types:
   ``tools/list`` (flagged tools are hidden from the listing).
 - ``path_glob``: matched against the whole of every string argument of an MCP ``tools/call``
   (a leading ``file://`` is dropped). ``*`` matches within one path segment, ``**`` across
-  segments; every other character is literal (no ``?``, ``[...]`` or ``{a,b}``) and matching
-  is case-sensitive, so ``**/.env`` matches ``/app/.env`` and ``config/.env``.
+  segments, and ``**/`` also matches no segment at all; every other character is literal (no
+  ``?``, ``[...]`` or ``{a,b}``) and matching is case-sensitive, so ``**/.env`` matches
+  ``.env``, ``config/.env`` and ``/app/.env``.
+
+Compile-time cost: every pattern passes static bounds (`gateway.feed.complexity`) before it
+is compiled, per pattern and for the feed as a whole, because ``regex`` expands counted
+repeats while compiling, where no timeout applies.
 
 ReDoS: every match runs with a per-pattern timeout (``regex``'s ``timeout=``) and every scan
 has an overall time budget. A scan that hits either is *incomplete*, and the control fails
@@ -43,6 +48,7 @@ from pydantic import (
 
 from gateway.core.envelope import FrozenModel
 from gateway.core.types import Channel
+from gateway.feed.complexity import FeedBudget, PatternTooComplexError, pattern_weight
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +60,7 @@ PATTERN_TIMEOUT_S: Final = 0.05  # one pattern against one string
 SCAN_BUDGET_S: Final = 0.25  # every pattern against every string of one interaction
 FILE_SCHEME: Final = "file://"
 
-_GLOB_TOKEN: Final = regex.compile(r"\*\*|\*|[^*]+")
+_GLOB_TOKEN: Final = regex.compile(r"\*\*/|\*\*|\*|[^*]+")
 
 type SignatureId = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")]
 type FeedVersion = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}$")]
@@ -88,11 +94,15 @@ class Severity(StrEnum):
 
 
 def glob_to_regex(glob: str) -> str:
-    """Translate a path glob (``*`` within a segment, ``**`` across) into a regex body."""
+    """Translate a path glob into a regex body: ``*`` stays within a segment, ``**/`` is zero
+    or more whole segments (``**/.env`` matches ``.env`` and ``a/b/.env``), any other ``**``
+    is any run of characters."""
     parts: list[str] = []
     wildcards = 0
     for piece in _GLOB_TOKEN.findall(glob):
-        if piece == "**":
+        if piece == "**/":
+            parts.append("(?:.*/)?")
+        elif piece == "**":
             parts.append(".*")
         elif piece == "*":
             parts.append("[^/]*")
@@ -107,7 +117,8 @@ def glob_to_regex(glob: str) -> str:
 
 
 class Signature(FrozenModel):
-    """One feed entry, compiled when validated."""
+    """One feed entry. Its pattern is bounded when validated and compiled by the feed, once
+    the whole feed is within its weight budget."""
 
     id: SignatureId
     source: str = Field(min_length=1, max_length=200)
@@ -116,21 +127,34 @@ class Signature(FrozenModel):
     severity: Severity
     channels: frozenset[Channel] = Field(min_length=1)
 
-    _compiled: regex.Pattern[str] = PrivateAttr()
+    _source: str = PrivateAttr()
+    _weight: int = PrivateAttr()
+    _compiled: regex.Pattern[str] | None = PrivateAttr(default=None)
 
     @model_validator(mode="after")
-    def _compile(self) -> Self:
-        source = (
+    def _bounded(self) -> Self:
+        self._source = (
             glob_to_regex(self.pattern)
             if self.pattern_type is PatternType.PATH_GLOB
             else self.pattern
         )
         try:
-            self._compiled = regex.compile(source)
+            self._weight = pattern_weight(self._source)
+        except PatternTooComplexError as exc:
+            msg = f"signature {self.id!r}: {exc}"
+            raise ValueError(msg) from None
+        return self
+
+    @property
+    def weight(self) -> int:
+        return self._weight
+
+    def compile(self) -> None:
+        try:
+            self._compiled = regex.compile(self._source)
         except regex.error as exc:
             msg = f"signature {self.id!r}: invalid pattern ({exc})"
             raise ValueError(msg) from None
-        return self
 
     def applies(self, pattern_type: PatternType, channel: Channel) -> bool:
         return self.pattern_type is pattern_type and channel in self.channels
@@ -140,6 +164,9 @@ class Signature(FrozenModel):
 
         Raises `TimeoutError` when the match takes longer than ``timeout_s``.
         """
+        if self._compiled is None:
+            msg = f"signature {self.id!r} was never compiled (only a FeedDocument compiles)"
+            raise RuntimeError(msg)
         if self.pattern_type is PatternType.PATH_GLOB:
             return self._compiled.fullmatch(text, timeout=timeout_s) is not None
         return self._compiled.search(text, timeout=timeout_s) is not None
@@ -162,6 +189,19 @@ class FeedDocument(FrozenModel):
             seen.add(signature.id)
         return value
 
+    @model_validator(mode="after")
+    def _compile_within_budget(self) -> Self:
+        """Every pattern is compiled only once the feed's total weight is known to fit."""
+        budget = FeedBudget()
+        try:
+            for signature in self.signatures:
+                budget.spend(signature.weight)
+        except PatternTooComplexError as exc:
+            raise ValueError(str(exc)) from None
+        for signature in self.signatures:
+            signature.compile()
+        return self
+
 
 @dataclass(frozen=True, slots=True)
 class ScanResult:
@@ -182,12 +222,13 @@ class Scan:
         channel: Channel,
         *,
         budget_s: float = SCAN_BUDGET_S,
+        deadline: float | None = None,  # absolute `timer()` value, shared by several scans
         timer: Callable[[], float] = time.monotonic,
     ) -> None:
         self._feed = feed
         self._channel = channel
         self._timer = timer
-        self._deadline = timer() + budget_s
+        self._deadline = timer() + budget_s if deadline is None else deadline
         self._hits: dict[str, Signature] = {}
         self._incomplete = False
 
@@ -259,8 +300,10 @@ class SignatureFeed:
             return ()
         return tuple(s for s in self._document.signatures if s.applies(pattern_type, channel))
 
-    def scan(self, channel: Channel, *, budget_s: float = SCAN_BUDGET_S) -> Scan:
-        return Scan(self, channel, budget_s=budget_s)
+    def scan(
+        self, channel: Channel, *, budget_s: float = SCAN_BUDGET_S, deadline: float | None = None
+    ) -> Scan:
+        return Scan(self, channel, budget_s=budget_s, deadline=deadline)
 
 
 EMPTY_FEED: Final = SignatureFeed()

@@ -152,23 +152,24 @@ async def test_tokens_metric_matches_the_settled_usage(tmp_path):
 
 async def test_gpu_seconds_are_charged_from_upstream_wall_time(tmp_path):
     llm = ScriptedLLM(delay_s=0.15)
-    async with llm_gateway(tmp_path, llm, {"per_session": {"gpu_seconds": 0.1}}) as gateway:
+    async with llm_gateway(tmp_path, llm, {"per_session": {"gpu_seconds": 0.5}}) as gateway:
         token = await gateway.token("anna@demo")
         labels = {"user": "anna@demo", "agent": "databot", "model": "qwen3:8b"}
         before = metric("acl_cost_usd_total", **labels)
-        assert (await ask(gateway, token)).status_code == 200  # admitted: headroom left
+        assert (await ask(gateway, token)).status_code == 200  # holds 500 ms, uses ~150
+        assert (await ask(gateway, token)).status_code == 200  # holds the ~350 ms left
         session = await usage(gateway, ScopeKind.SESSION, session_of(token))
-        assert 150 <= session.gpu_ms < 1500
-        second = await ask(gateway, token)
-        assert refusal(second) == (
+        assert 300 <= session.gpu_ms < 500  # wall time charged, the rest of each hold refunded
+        third = await ask(gateway, token)  # under 250 ms left: too little to answer anything
+        assert refusal(third) == (
             403,
             "budget_exceeded",
             "budget exceeded: per_session.gpu_seconds",
         )
-        assert llm.calls == 1
+        assert llm.calls == 2
         # qwen3:8b costs $0.0005 per GPU second in policy.yaml
         cost = metric("acl_cost_usd_total", **labels) - before
-        assert cost == pytest.approx(session.gpu_ms / 1000 * 0.0005)
+        assert cost == pytest.approx(session.gpu_ms / 1000 * 0.0005, rel=0.01)
 
 
 def session_of(token: str) -> str:

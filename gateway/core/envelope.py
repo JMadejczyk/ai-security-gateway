@@ -26,16 +26,23 @@ def cooldown_key(action: Action, resource: str) -> str:
 
 
 class Span(FrozenModel):
-    """A region of a string inside the payload or result, addressed by JSON pointer."""
+    """A region of a string inside the payload or result, addressed by JSON pointer.
+
+    ``embedded`` addresses a string inside JSON text: the value at ``path`` is a JSON document
+    serialized into a string (an OpenAI tool call's ``arguments``), ``embedded`` is a pointer
+    into that document, and the offsets are in its decoded string. A span on a number (at
+    ``path``, or ``embedded`` in one) replaces the whole number.
+    """
 
     path: str
     start: int = Field(ge=0)
     end: int
     label: str = Field(min_length=1)
+    embedded: str | None = None
 
-    @field_validator("path")
+    @field_validator("path", "embedded")
     @classmethod
-    def _json_pointer(cls, value: str) -> str:
+    def _json_pointer(cls, value: str | None) -> str | None:
         if value and not value.startswith("/"):
             msg = f"span path must be a JSON pointer ('' or '/...'), got {value!r}"
             raise ValueError(msg)

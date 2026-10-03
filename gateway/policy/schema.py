@@ -292,6 +292,15 @@ class Limits(FrozenModel):
     # Completion cap the gateway puts on an LLM request that names none, so the budget
     # reservation (prompt estimate + completion cap) is an upper bound on what the call uses.
     default_max_tokens: PositiveInt = 4096
+    # The largest completion cap any LLM request may hold; larger requested caps are lowered.
+    max_completion_tokens: PositiveInt = 32_768
+
+    @model_validator(mode="after")
+    def _default_within_max(self) -> Self:
+        if self.default_max_tokens > self.max_completion_tokens:
+            msg = "limits.default_max_tokens cannot exceed limits.max_completion_tokens"
+            raise ValueError(msg)
+        return self
 
 
 # ------------------------------------------------------------------------------ budgets

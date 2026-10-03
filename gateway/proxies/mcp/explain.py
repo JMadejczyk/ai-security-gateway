@@ -11,18 +11,20 @@ and past the downstream mapping on purpose, in a short-lived upstream session of
 the caller's principal: the request carries the same ``X-ACL-Principal`` assertion, execution
 limits included, that the ``query`` call will carry.
 
-Wired at the composition root with `functools.partial` (connector and policy snapshots bound),
-which makes it a `gateway.controls.sql_guard.SqlPlanner`.
+The endpoint, trust and execution limits come from ``request.snapshot``, the admitted call's own
+policy snapshot, never the store's current one: a reload mid-call cannot move the plan to
+another endpoint or sign it with other limits than the statement will run under.
+
+Wired at the composition root with `functools.partial` (connector bound), which makes it a
+`gateway.controls.sql_guard.SqlPlanner`.
 """
 
-from collections.abc import Callable
 from typing import Final
 
 from pydantic import Field, ValidationError
 
 from gateway.controls.sql_guard import PlanRequest, PlanUnavailableError
 from gateway.core.envelope import FrozenModel
-from gateway.policy.loader import PolicySnapshot
 from gateway.proxies.mcp import wire
 from gateway.proxies.mcp.upstream import MCPConnector
 from gateway.upstream import UpstreamError
@@ -36,15 +38,13 @@ class ExplainResult(FrozenModel):
     total_cost: float = Field(ge=0.0)
 
 
-async def explain_cost(
-    connector: MCPConnector, snapshots: Callable[[], PolicySnapshot], request: PlanRequest
-) -> float:
+async def explain_cost(connector: MCPConnector, request: PlanRequest) -> float:
     """The planner cost of ``request.sql`` on ``request.server``, as ``request.principal``.
 
-    Raises `PlanUnavailableError` unless the server is a trusted sql upstream in the current
-    policy and answers with a well-formed cost.
+    Raises `PlanUnavailableError` unless the server is a trusted sql upstream in the call's
+    policy snapshot and answers with a well-formed cost.
     """
-    snapshot = snapshots()
+    snapshot = request.snapshot
     config = snapshot.policy.upstreams.mcp.get(request.server)
     if config is None or config.adapter != "sql" or config.trust != "internal":
         raise PlanUnavailableError

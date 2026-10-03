@@ -52,6 +52,7 @@ class UpstreamLog:
 
     calls: list[ToolCall] = field(default_factory=list)
     plan_cost: float = 12.5  # what `explain` answers
+    plan_cost_for: Callable[[str], float] | None = None  # per statement, when set
     explain_fails: bool = False  # `explain` answers with a tool error instead
     fetch_page: str = INJECTION_PAGE  # what `fetch` answers
 
@@ -119,7 +120,8 @@ def sales_db_server(log: UpstreamLog) -> MCPServer:
         verified_principal(headers)
         if log.explain_fails:
             raise ToolError("planner unavailable")
-        return PlanCost(total_cost=log.plan_cost)
+        cost = log.plan_cost if log.plan_cost_for is None else log.plan_cost_for(sql)
+        return PlanCost(total_cost=cost)
 
     server.tool(name="query", annotations=ToolAnnotations(read_only_hint=True))(query)
     server.tool(name="explain", annotations=ToolAnnotations(read_only_hint=True))(explain)

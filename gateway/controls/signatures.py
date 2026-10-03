@@ -7,7 +7,10 @@ Runs pre and post on every channel. What each pattern type is matched against
   (messages and tool-call arguments for the LLM, arguments and tool results for MCP);
 - ``mcp_tool``: tool names and descriptions: the tool a ``tools/call`` names and the tools an
   LLM request declares (pre), and every tool an MCP server advertises (`screen_listing`, which
-  the MCP proxy calls on ``tools/list``: ``tools/list`` does not run through the pipeline);
+  the MCP proxy calls on ``tools/list``: ``tools/list`` does not run through the pipeline).
+  A listing is screened off the event loop under one deadline; a tool that could not be
+  scanned in time, one past `MAX_LISTED_TOOLS`, or one whose name appears twice (a second,
+  benign entry must not stand in for a poisoned one) is hidden like a matching one;
 - ``path_glob``: every string argument of an MCP ``tools/call`` (pre).
 
 A match yields ``signature_match`` carrying the matched signature ids (ids only, never the
@@ -17,25 +20,41 @@ model one number per control, like every other control. A scan that times out fa
 (``signature_scan_timeout``) and adds no risk, since nothing was detected.
 """
 
+import asyncio
 import logging
-from collections.abc import Callable, Iterator, Mapping
+import time
+from collections import Counter
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any, ClassVar, Final, cast, override
 
+from gateway.controls.scope import current_scope
 from gateway.controls.text import TextExtractor, string_leaves
 from gateway.core.catalog import control_spec
 from gateway.core.envelope import Interaction, Verdict
 from gateway.core.interfaces import Control, ControlConfig
 from gateway.core.types import Channel, ControlKind, ControlMode, Decision, Stage
-from gateway.feed.schema import FILE_SCHEME, PatternType, ScanResult, SignatureFeed
+from gateway.feed.schema import (
+    FILE_SCHEME,
+    SCAN_BUDGET_S,
+    PatternType,
+    ScanResult,
+    SignatureFeed,
+)
 from gateway.policy.loader import PolicySnapshot
-from gateway.telemetry import record_signature_hits
+from gateway.telemetry import record_signature_hits, record_verdicts
 
 logger = logging.getLogger(__name__)
 
 SIGNATURE_MATCH: Final = "signature_match"
 SCAN_TIMEOUT: Final = "signature_scan_timeout"
 NO_MATCH: Final = "no_signature_match"
+DUPLICATE_TOOL: Final = "duplicate_tool_name"
+LISTING_TOO_LARGE: Final = "tool_listing_too_large"
 MAX_REASON_IDS: Final = 10
+MAX_LISTED_TOOLS: Final = 256  # tools screened per listing; any beyond are hidden
+LISTING_BUDGET_S: Final = SCAN_BUDGET_S  # one deadline for the whole listing
+
+type AdvertisedTools = Sequence[tuple[str, str | None]]  # (name, description), as listed
 
 
 def _mapping(value: object) -> Mapping[str, Any]:
@@ -70,6 +89,32 @@ def path_arguments(payload: object) -> Iterator[str]:
         yield text[len(FILE_SCHEME) :] if text.lower().startswith(FILE_SCHEME) else text
 
 
+def flag_listing(
+    feed: SignatureFeed, tools: AdvertisedTools, *, budget_s: float = LISTING_BUDGET_S
+) -> dict[str, tuple[str, tuple[str, ...]]]:
+    """Tools to hide: name -> (reason code, matched signature ids). Blocking; run off-loop.
+
+    Every entry is scanned (duplicates included) under one deadline for the whole listing.
+    """
+    deadline = time.monotonic() + budget_s
+    occurrences = Counter(name for name, _ in tools)
+    flagged: dict[str, tuple[str, tuple[str, ...]]] = {
+        name: (DUPLICATE_TOOL, ()) for name, seen in occurrences.items() if seen > 1
+    }
+    for index, (name, description) in enumerate(tools):
+        if index >= MAX_LISTED_TOOLS:
+            flagged.setdefault(name, (LISTING_TOO_LARGE, ()))
+            continue
+        scan = feed.scan(Channel.MCP, deadline=deadline)
+        scan.check(PatternType.MCP_TOOL, (name, description or ""))
+        result = scan.result()
+        if result.matched:
+            flagged[name] = (SIGNATURE_MATCH, result.ids)
+        elif result.incomplete:
+            flagged.setdefault(name, (SCAN_TIMEOUT, ()))
+    return flagged
+
+
 class SignaturesControl(Control):
     id: ClassVar[str] = "signatures"
     stages: ClassVar[frozenset[Stage]] = frozenset({Stage.PRE, Stage.POST})
@@ -83,7 +128,9 @@ class SignaturesControl(Control):
 
     @override
     async def evaluate(self, interaction: Interaction, stage: Stage, cfg: ControlConfig) -> Verdict:
-        scan = self._feed().scan(interaction.channel)
+        scope = current_scope()  # the call's pinned feed: pre and post see the same instance
+        feed = scope.feed if scope is not None and scope.feed is not None else self._feed()
+        scan = feed.scan(interaction.channel)
         segments = self._extractor.segments(interaction, stage)
         scan.check(PatternType.REGEX, (segment.text for segment in segments))
         if stage is Stage.PRE:
@@ -92,28 +139,26 @@ class SignaturesControl(Control):
                 scan.check(PatternType.PATH_GLOB, path_arguments(interaction.payload))
         return self._verdict(scan.result(), cfg)
 
-    def screen_listing(self, tools: Mapping[str, str | None], snapshot: PolicySnapshot) -> set[str]:
-        """Names of advertised MCP tools to hide from ``tools/list``.
+    async def screen_listing(self, tools: AdvertisedTools, snapshot: PolicySnapshot) -> set[str]:
+        """Names of advertised MCP tools to hide from ``tools/list`` (see the module docstring).
 
-        Every flagged tool is logged and counted; under ``log_only`` nothing is hidden. A tool
-        whose scan times out is hidden too (fail closed).
+        Every flagged tool is logged and counted; under ``log_only`` nothing is hidden.
         """
-        feed, hidden = self._feed(), set[str]()
-        for name, description in tools.items():
-            scan = feed.scan(Channel.MCP)
-            scan.check(PatternType.MCP_TOOL, (name, description or ""))
-            result = scan.result()
-            if result.matched or result.incomplete:
-                hidden.add(name)
-                record_signature_hits(result.ids)
-                logger.warning(
-                    "tools/list: an advertised tool (%r) is flagged by signatures %s",
-                    name[:64],
-                    ",".join(result.ids) or SCAN_TIMEOUT,
-                )
+        flagged = await asyncio.to_thread(flag_listing, self._feed(), list(tools))
+        for name, (reason_code, ids) in flagged.items():
+            record_signature_hits(ids)
+            record_verdicts(
+                [Verdict(decision=Decision.BLOCK, control_id=self.id, reason_code=reason_code)]
+            )
+            logger.warning(
+                "tools/list: an advertised tool (%r) is flagged: %s %s",
+                name[:64],
+                reason_code,
+                ",".join(ids),
+            )
         if snapshot.policy.resolved_control_mode(self.id) is ControlMode.LOG_ONLY:
             return set()
-        return hidden
+        return set(flagged)
 
     def _verdict(self, result: ScanResult, cfg: ControlConfig) -> Verdict:
         enforced = cfg.mode is not ControlMode.LOG_ONLY

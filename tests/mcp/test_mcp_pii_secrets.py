@@ -80,3 +80,21 @@ async def test_clean_and_dirty_results_side_by_side(stack: MCPStack, page, expec
     stack.log.fetch_page = page
     (web,) = await connect_all(stack, ANNA, "web")
     assert text_of(await web.call("fetch", url="https://example.com/")) == expected
+
+
+async def test_a_quoted_password_with_spaces_is_blocked_whole(stack: MCPStack):
+    reports = await connect(stack, ANNA, "reports")
+    content = 'config: password="Abc12345 secret-tail"'
+    result = await reports.call("write_report", name="cfg.txt", content=content)
+    assert error_text(result) == "secret_detected"
+    assert stack.log.of("write_report") == []
+    assert_nothing_leaked(stack, "secret-tail")
+
+
+async def test_full_width_pesel_in_a_fetched_page_is_masked(stack: MCPStack):
+    disguised = "".join(chr(ord(c) + 0xFEE0) for c in PESEL)
+    stack.log.fetch_page = f"PESEL: {disguised}."
+    web = await connect(stack, ANNA, "web")
+    result = await web.call("fetch", url="https://example.com/kontakt")
+    assert text_of(result) == "PESEL: [REDACTED:PL_PESEL]."
+    assert disguised not in str(result)

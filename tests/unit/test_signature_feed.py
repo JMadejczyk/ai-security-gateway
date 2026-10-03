@@ -5,6 +5,7 @@ import contextlib
 import json
 import shutil
 import time
+import tracemalloc
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,13 @@ import respx
 import yaml
 
 from gateway.core.types import Channel
+from gateway.feed.complexity import (
+    MAX_FEED_WEIGHT,
+    MAX_PATTERN_WEIGHT,
+    PatternTooComplexError,
+    Refusal,
+    pattern_weight,
+)
 from gateway.feed.schema import (
     EMPTY_FEED,
     MAX_SIGNATURES,
@@ -33,6 +41,8 @@ from gateway.telemetry import REGISTRY, FeedReloadResult
 REPO_ROOT = Path(__file__).resolve().parents[2]
 STARTER_FEED = REPO_ROOT / "feeds" / "signatures.json"
 FEED_URL = "http://feed.test/signatures.json"
+# Passes the static bounds (no nested unbounded quantifier) yet backtracks exponentially.
+SLOW, SLOW_INPUT = "(?:a|aa)+$", "a" * 3000 + "!"
 
 
 def signature(**overrides: Any) -> dict[str, Any]:
@@ -80,7 +90,7 @@ def test_the_starter_feed_is_valid():
         pytest.param(feed_bytes(signature(channels=["smtp"])), "channels", id="bad-channel"),
         pytest.param(feed_bytes(signature(id="has space")), "id", id="bad-id"),
         pytest.param(feed_bytes(signature(), signature()), "appears twice", id="duplicate-id"),
-        pytest.param(feed_bytes(signature(pattern="(open")), "invalid pattern", id="bad-regex"),
+        pytest.param(feed_bytes(signature(pattern="[z-a]")), "invalid pattern", id="bad-regex"),
         pytest.param(feed_bytes(signature(pattern="x" * 1025)), "pattern", id="long-pattern"),
         pytest.param(
             feed_bytes(signature(pattern_type="path_glob", pattern="*/" * 9)),
@@ -95,6 +105,68 @@ def test_the_starter_feed_is_valid():
 def test_invalid_feeds_are_rejected(data, problem):
     with pytest.raises(FeedInvalidError, match=problem):
         parse_feed(data)
+
+
+@pytest.mark.parametrize(
+    ("pattern", "refusal"),
+    [
+        ("a{1000000}", Refusal.REPEAT_TOO_LARGE),
+        ("a{1001}", Refusal.REPEAT_TOO_LARGE),
+        ("(?:(?:a{100}){100}){3}", Refusal.PATTERN_TOO_HEAVY),
+        ("(a+)+b", Refusal.NESTED_UNBOUNDED),
+        ("(?:\\w+\\s?)*$", Refusal.NESTED_UNBOUNDED),
+        ("(x)\\1", Refusal.BACKREFERENCE),
+        ("(?P<n>x)(?P=n)", Refusal.GROUP_SYNTAX),
+        ("(?<=a)b", Refusal.LOOKBEHIND),
+        ("(?(1)a|b)", Refusal.GROUP_SYNTAX),
+        ("(?R)", Refusal.GROUP_SYNTAX),
+        ("(?:foo){e<=2}", Refusal.BARE_BRACE),
+        ("a**", Refusal.NOTHING_TO_REPEAT),
+        ("(a", Refusal.UNBALANCED),
+    ],
+)
+def test_patterns_outside_the_bounded_subset_are_refused(pattern, refusal):
+    with pytest.raises(PatternTooComplexError) as raised:
+        pattern_weight(pattern)
+    assert raised.value.refusal is refusal
+    with pytest.raises(FeedInvalidError, match="too complex"):
+        parse_feed(feed_bytes(signature(pattern=pattern)))
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    ["(?i)a{2,5}b", "(?:a|b)+c", "(?:x{3}\\s+)?y", "\\p{L}{1,10}", "[{}]\\{"],
+)
+def test_bounded_patterns_are_accepted(pattern):
+    assert parse_feed(feed_bytes(signature(pattern=pattern))).version == "t.1"
+
+
+def test_a_huge_counted_repeat_is_refused_without_compiling_it():
+    """160 bytes of feed must not cost hundreds of megabytes before any timeout applies."""
+    data = feed_bytes(signature(pattern="a{1000000}"))
+    tracemalloc.start()
+    try:
+        with pytest.raises(FeedInvalidError, match="counted repeat"):
+            parse_feed(data)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 5_000_000
+
+
+def test_the_feed_has_a_total_weight_budget():
+    heavy = "(?:a{1000}){19}"  # within the per-pattern bound
+    assert pattern_weight(heavy) <= MAX_PATTERN_WEIGHT
+    count = MAX_FEED_WEIGHT // pattern_weight(heavy) + 1
+    many = [signature(id=f"h{i}", pattern=heavy) for i in range(count)]
+    tracemalloc.start()
+    try:
+        with pytest.raises(FeedInvalidError, match="in total"):
+            parse_feed(feed_bytes(*many))
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 20_000_000  # refused before anything was compiled
 
 
 def test_too_many_signatures_are_rejected():
@@ -122,7 +194,10 @@ def test_oversized_feed_is_rejected_before_parsing():
         ("**/.env*", "/app/.env", True),
         ("**/.env*", "/app/.env.local", True),
         ("**/.env*", "config/.envrc", True),
-        ("**/.env*", ".env", False),  # no leading segment: the bare-name glob covers it
+        ("**/.env*", ".env", True),  # **/ is zero or more segments
+        ("**/.ssh/**", ".ssh/id_ed25519", True),
+        ("**/.aws/credentials", ".aws/credentials", True),
+        ("**/.aws/credentials", "x.aws/credentials", False),  # **/ ends on a segment boundary
         (".env*", ".env", True),
         ("**/etc/shadow", "/etc/shadow", True),
         ("**/etc/shadow", "../../etc/shadow", True),
@@ -144,6 +219,16 @@ def test_path_globs(glob, path, matches):
     assert glob_to_regex(glob)  # translatable on its own too
 
 
+@pytest.mark.parametrize(
+    "path",
+    [".ssh/id_ed25519", ".aws/credentials", ".env", "secrets/.env.prod", "keys/server.pem"],
+)
+def test_the_starter_feed_catches_bare_relative_paths(path):
+    scan = parse_feed(STARTER_FEED.read_bytes()).scan(Channel.MCP)
+    scan.check(PatternType.PATH_GLOB, [path])
+    assert scan.result().matched
+
+
 def test_signatures_apply_only_to_their_type_and_channels():
     feed = parse_feed(feed_bytes(signature(channels=["mcp"])))
     text = ["Ignore previous instructions"]
@@ -157,11 +242,11 @@ def test_signatures_apply_only_to_their_type_and_channels():
 
 
 def test_redos_pattern_times_out_safely():
-    evil = signature(id="evil", pattern="(x+x+)+y")
+    evil = signature(id="evil", pattern=SLOW)
     feed = parse_feed(feed_bytes(evil, signature(id="later", pattern="never-present")))
     scan = feed.scan(Channel.LLM)
     started = time.perf_counter()
-    scan.check(PatternType.REGEX, ["x" * 5000])
+    scan.check(PatternType.REGEX, [SLOW_INPUT])
     elapsed = time.perf_counter() - started
     result = scan.result()
     assert result.incomplete
@@ -170,10 +255,10 @@ def test_redos_pattern_times_out_safely():
 
 
 def test_a_scan_has_an_overall_budget():
-    slow = [signature(id=f"evil{i}", pattern="(x+x+)+y") for i in range(20)]
+    slow = [signature(id=f"evil{i}", pattern=SLOW) for i in range(20)]
     scan = parse_feed(feed_bytes(*slow)).scan(Channel.LLM, budget_s=0.12)
     started = time.perf_counter()
-    scan.check(PatternType.REGEX, ["x" * 5000])
+    scan.check(PatternType.REGEX, [SLOW_INPUT])
     assert time.perf_counter() - started < 0.6  # 20 x 50 ms would be 1 s without the budget
     assert scan.result().incomplete
 
@@ -187,12 +272,12 @@ def test_empty_feed_matches_nothing():
 # ---------------------------------------------------------------------------- sources
 
 
-def test_file_source_reads_at_most_one_byte_past_the_cap(tmp_path):
+async def test_file_source_reads_at_most_one_byte_past_the_cap(tmp_path):
     path = tmp_path / "feed.json"
     path.write_bytes(b"x" * 100)
-    assert FileFeedSource(path).fetch(10) == b"x" * 11
+    assert await FileFeedSource(path).fetch(10) == b"x" * 11
     with pytest.raises(FeedUnavailableError, match="cannot read"):
-        FileFeedSource(tmp_path / "absent.json").fetch(10)
+        await FileFeedSource(tmp_path / "absent.json").fetch(10)
 
 
 def test_relative_paths_resolve_against_the_policy_directory(tmp_path):
@@ -208,28 +293,28 @@ def test_relative_paths_resolve_against_the_policy_directory(tmp_path):
 
 
 @respx.mock(assert_all_called=False)
-def test_http_source_fetches_a_feed(respx_mock):
+async def test_http_source_fetches_a_feed(respx_mock):
     respx_mock.get(FEED_URL).mock(return_value=httpx.Response(200, content=feed_bytes()))
-    assert parse_feed(HttpFeedSource(FEED_URL).fetch(1024)).version == "t.1"
+    assert parse_feed(await HttpFeedSource(FEED_URL).fetch(1024)).version == "t.1"
 
 
 @respx.mock(assert_all_called=False)
-def test_http_source_caps_the_body(respx_mock):
+async def test_http_source_caps_the_body(respx_mock):
     respx_mock.get(FEED_URL).mock(return_value=httpx.Response(200, content=b"x" * 5000))
-    body = HttpFeedSource(FEED_URL).fetch(100)
+    body = await HttpFeedSource(FEED_URL).fetch(100)
     assert len(body) == 101
     with pytest.raises(FeedInvalidError, match="larger than"):
         parse_feed(body, max_bytes=100)
 
 
 @respx.mock(assert_all_called=False)
-def test_http_source_refuses_redirects(respx_mock):
+async def test_http_source_refuses_redirects(respx_mock):
     respx_mock.get(FEED_URL).mock(
         return_value=httpx.Response(302, headers={"location": "http://169.254.169.254/latest"})
     )
     internal = respx_mock.get("http://169.254.169.254/latest")
     with pytest.raises(FeedUnavailableError, match="redirects are refused"):
-        HttpFeedSource(FEED_URL).fetch(1024)
+        await HttpFeedSource(FEED_URL).fetch(1024)
     assert not internal.called
 
 
@@ -243,14 +328,33 @@ def test_http_source_refuses_redirects(respx_mock):
     ],
 )
 @respx.mock(assert_all_called=False)
-def test_http_source_failures_are_unavailable(respx_mock, response, problem):
+async def test_http_source_failures_are_unavailable(respx_mock, response, problem):
     route = respx_mock.get(FEED_URL)
     if isinstance(response, Exception):
         route.mock(side_effect=response)
     else:
         route.mock(return_value=response)
     with pytest.raises(FeedUnavailableError, match=problem):
-        HttpFeedSource(FEED_URL, timeout_s=0.1).fetch(1024)
+        await HttpFeedSource(FEED_URL, timeout_s=0.1).fetch(1024)
+
+
+class TrickleStream(httpx.AsyncByteStream):
+    """A body that never ends: one byte every 50 ms, each read well inside any read timeout."""
+
+    async def __aiter__(self):
+        while True:
+            await asyncio.sleep(0.05)
+            yield b" "
+
+
+@respx.mock(assert_all_called=False)
+async def test_http_source_has_an_overall_deadline(respx_mock):
+    respx_mock.get(FEED_URL).mock(return_value=httpx.Response(200, stream=TrickleStream()))
+    source = HttpFeedSource(FEED_URL, timeout_s=1.0, deadline_s=0.3)
+    started = time.perf_counter()
+    with pytest.raises(FeedUnavailableError, match="took longer than"):
+        await asyncio.wait_for(source.fetch(10_000_000), timeout=3)  # never hang the suite
+    assert time.perf_counter() - started < 1.0
 
 
 # ------------------------------------------------------------------------------ store

@@ -40,6 +40,11 @@ class Control(ABC):
     stages: ClassVar[frozenset[Stage]]  # a control can run pre, post, or both
     kind: ClassVar[ControlKind]
     mandatory: ClassVar[bool] = False  # enforces in every profile, cannot be log_only
+    # A sealing pre control (e.g. sql_guard) runs once, after every other pre control's rewrites
+    # and redactions, on the final payload, and nothing may change the payload after it allows
+    # the call: the pipeline refuses a dispatched payload that differs with this reason code.
+    # A sealing control may rewrite, never redact. None = an ordinary control.
+    seal: ClassVar[str | None] = None
 
     @abstractmethod
     async def evaluate(self, interaction: Interaction, stage: Stage, cfg: ControlConfig) -> Verdict:

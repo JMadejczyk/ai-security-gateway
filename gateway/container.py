@@ -96,13 +96,11 @@ class GatewayContainer:
             audit,
             settings.internal_key_bytes,
             identities.subjects() if identities is not None else frozenset(),
-            feed_version=lambda: feed_store.version,
+            feed=lambda: feed_store.current,
         )
         mcp_connector = MCPConnector(settings.internal_key_bytes, clock=clock, transport=transport)
         # sql_guard prices statements through the SQL server's gateway-only `explain` tool.
-        sql_guard = SqlGuardControl(
-            functools.partial(explain_cost, mcp_connector, lambda: policy_store.current)
-        )
+        sql_guard = SqlGuardControl(functools.partial(explain_cost, mcp_connector))
         budgets = BudgetLedger(budget_store_from_settings(settings, clock=clock), clock=clock)
         # MCP has no static route: each tools/call binds its server's adapter and the caller's
         # own upstream session (MCPProxy passes the route to Pipeline.handle).
@@ -111,7 +109,7 @@ class GatewayContainer:
             {Channel.LLM: ChannelRoute(adapter=LLMAdapter(), upstream=llm)},
             ControlRegistry(  # stage 5-10 controls register here
                 [
-                    sql_guard,  # first: later controls see (and redact) the SQL that executes
+                    sql_guard,  # sealing: runs last, on the final (redacted) SQL that executes
                     SecretsControl(),
                     PiiControl(),  # builds the shared Presidio analyzer once per process
                     signatures,

@@ -6,11 +6,13 @@ from dataclasses import dataclass, field
 import pytest
 
 from gateway.controls.registry import ControlRegistry
+from gateway.controls.scope import CallScope, call_scope
 from gateway.controls.sql_guard import PlanRequest, PlanUnavailableError, SqlGuardControl
 from gateway.core.catalog import control_spec
 from gateway.core.envelope import Interaction
 from gateway.core.interfaces import ControlConfig
-from gateway.core.types import Action, Channel, ControlMode, Decision, Stage
+from gateway.core.types import Action, Channel, ControlMode, Decision, SessionMode, Stage
+from gateway.policy.evaluator import PrincipalContext
 from gateway.policy.schema import SqlGuardConfig
 
 CFG = SqlGuardConfig(mode=ControlMode.BLOCK, max_cost=10_000, force_limit=500, timeout_ms=100)
@@ -33,6 +35,16 @@ class FakePlanner:
         return self.cost
 
 
+@pytest.fixture(autouse=True)
+def scope(snapshot):
+    """The admitted call's scope, as the pipeline sets it around every control."""
+    principal = PrincipalContext(
+        principal="anna@demo", agent="databot", mode=SessionMode.INTERACTIVE
+    )
+    with call_scope(CallScope(snapshot=snapshot, principal=principal)) as current:
+        yield current
+
+
 @pytest.fixture
 def interaction(make_ctx):
     def build(sql: object = COUNT, *, channel=Channel.MCP, server="sales_db", **arguments):
@@ -53,14 +65,25 @@ def interaction(make_ctx):
     return build
 
 
-async def test_cheap_query_is_allowed_with_the_limited_rewrite(interaction):
+async def test_cheap_query_is_allowed_with_the_limited_rewrite(interaction, scope):
     planner = FakePlanner(cost=12.5)
     verdict = await SqlGuardControl(planner).evaluate(interaction(), Stage.PRE, CFG)
     assert (verdict.decision, verdict.reason_code) == (Decision.ALLOW, "sql_allowed")
     limited = f"{COUNT} LIMIT 500"
     assert verdict.rewrite == {"name": "query", "arguments": {"sql": limited}}
-    # The planner prices exactly the statement that will execute, as the caller.
-    assert planner.requests == [PlanRequest(server="sales_db", principal="anna@demo", sql=limited)]
+    # The planner prices exactly the statement that will execute, as the caller, under the
+    # admitted call's own policy snapshot.
+    assert planner.requests == [
+        PlanRequest(server="sales_db", principal="anna@demo", sql=limited, snapshot=scope.snapshot)
+    ]
+
+
+async def test_outside_a_call_scope_nothing_is_priced(interaction, scope):
+    planner = FakePlanner()
+    with call_scope(None):  # type: ignore[arg-type] -- no admitted call
+        verdict = await SqlGuardControl(planner).evaluate(interaction(), Stage.PRE, CFG)
+    assert (verdict.decision, verdict.reason_code) == (Decision.BLOCK, "sql_plan_unavailable")
+    assert planner.requests == []
 
 
 async def test_rewrite_keeps_the_other_arguments(interaction):
@@ -179,6 +202,7 @@ def test_mandatory_pre_mcp_control_that_matches_its_catalog_entry():
     spec = control_spec("sql_guard")
     assert control.mandatory
     assert spec.mandatory
+    assert control.seal == "sql_changed_after_guard"  # runs last, on the final payload
     assert spec.modes == (ControlMode.BLOCK,)
     assert control.stages == frozenset({Stage.PRE})
     registry = ControlRegistry([control])

@@ -330,3 +330,14 @@ def test_observability_image_versions_are_recorded_in_licenses(
     for service in OBSERVABILITY:
         image = str(compose_config.service(service)["image"])
         assert image in licenses, f"{image} is not recorded in LICENSES.md"
+
+
+def test_ollama_keeps_a_cache_slot_for_the_agent_and_one_for_the_judge(
+    compose_config: ComposeConfig,
+) -> None:
+    """Agent and judge share one model: with one slot each call evicts the other's cached
+    prompt and every judge call re-reads its whole prompt on CPU (12-20 s instead of ~6 s)."""
+    environment = compose_config.environment_of("ollama")
+    assert environment["OLLAMA_NUM_PARALLEL"] == "2"
+    assert environment["OLLAMA_MAX_LOADED_MODELS"] == "1"  # bounded memory: one model, 2 slots
+    assert int(environment["OLLAMA_CONTEXT_LENGTH"] or "0") in range(1024, 8193)

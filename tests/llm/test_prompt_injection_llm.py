@@ -8,7 +8,7 @@ import httpx
 import pytest
 import yaml
 from gateway_testkit import Harness, bearer, chat, completion, echo_completion, running_gateway
-from injection_kit import DOUBT_MARKER, INJECT_MARKER
+from injection_kit import DOUBT_MARKER, INJECT_MARKER, MarkerClassifier
 
 from gateway.judges.client import JudgeClient
 
@@ -157,3 +157,38 @@ async def test_a_garbled_judge_answer_fails_the_band_closed(real_judge, llm_upst
     await post(real_judge, ask(f"Please read this {DOUBT_MARKER}"))
     (entry,) = real_judge.audit_entries()
     assert pi_verdicts(entry)[0]["reason_code"] == "judge_unavailable"
+
+
+async def test_what_reaches_the_classifier_for_a_one_message_chat(tmp_path, llm_upstream):
+    """Live finding (2026-10-04): "What is a primary key?" was blocked at pre. The classifier
+    sees exactly the user's question, nothing glued to it: no model name, no role, no
+    window over other fields. The block is the model's own score (see test_real_model)."""
+    classifier = MarkerClassifier()
+    llm_upstream.post("/chat/completions").mock(
+        return_value=httpx.Response(200, json=completion("A primary key identifies a row."))
+    )
+    async with running_gateway(tmp_path, classifier=classifier) as harness:
+        await post(harness, ask("What is a primary key?"))
+    pre, post_stage = classifier.calls
+    assert pre == ["What is a primary key?"]
+    assert post_stage == ["A primary key identifies a row."]
+
+
+async def test_a_system_prompt_is_classified_apart_and_joined_only_in_a_window(
+    tmp_path, llm_upstream
+):
+    classifier = MarkerClassifier()
+    llm_upstream.post("/chat/completions").mock(side_effect=echo_completion)
+    body = chat(
+        messages=[
+            {"role": "system", "content": "You are DataBot, a careful analytics assistant."},
+            {"role": "user", "content": "What is a primary key?"},
+        ]
+    )
+    async with running_gateway(tmp_path, classifier=classifier) as harness:
+        await post(harness, body)
+    assert classifier.calls[0] == [
+        "You are DataBot, a careful analytics assistant.",
+        "What is a primary key?",
+        "You are DataBot, a careful analytics assistant.What is a primary key?",
+    ]

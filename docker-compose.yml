@@ -176,6 +176,15 @@ services:
     image: ollama/ollama:0.35.1
     environment:
       OLLAMA_HOST: 0.0.0.0:11434
+      # Two slots, each with its own KV cache: the agent's prompt and the LLM judge's prompt
+      # (same model) no longer evict each other's cached prefix, so a judge call re-reads only
+      # the answer it judges (~6 s on CPU) instead of its whole ~700-token prompt (12-20 s).
+      # Memory: 2 x 4096-token KV cache (~0.6 GiB each for qwen3:8b) on top of the ~5 GiB
+      # weights; one model loaded at a time, kept loaded so the caches survive idle gaps.
+      OLLAMA_NUM_PARALLEL: "2"
+      OLLAMA_CONTEXT_LENGTH: "4096"  # per slot; judge prompts are < 1k tokens
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_KEEP_ALIVE: 30m
     volumes:
       - ollama_models:/root/.ollama
     networks: [llm_backend]

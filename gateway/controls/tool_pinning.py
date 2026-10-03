@@ -10,9 +10,12 @@ annotations, with its baseline:
   (a rug pull) — hidden from ``tools/list`` and blocked on ``tools/call``;
 - advertised but not in the baseline: ``tool_not_pinned``, hidden and blocked.
 
-A tool stays blocked for as long as it differs from the baseline, i.e. until an operator
-reviews the change and re-pins (``acl pin <server> --write``). Pinning does not prove what the
-server's implementation does; it proves the agent only ever sees and calls the approved surface.
+The first drift of a pinned tool also quarantines it (`gateway.controls.tool_quarantine`),
+for every session and gateway: it stays blocked (``tool_quarantined``) even if the server
+restores its metadata, until an operator re-approves a new baseline (``acl pin <server>
+--write``) or clears the quarantine (``acl pin <server> --clear-quarantine <tool>``).
+Pinning does not prove what the server's implementation does; it proves the agent only ever
+sees and calls the approved surface.
 
 Servers without a pin file: ``upstreams.mcp.<server>.require_pin`` (default true) blocks
 every tool as ``tool_not_pinned``; ``require_pin: false`` opts a server out explicitly, and its
@@ -36,6 +39,8 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, ClassVar, Final, cast, override
 
+from gateway.clock import Clock, utc_now
+from gateway.controls.tool_quarantine import QuarantineEntry, ToolQuarantine
 from gateway.core.envelope import Interaction, Verdict
 from gateway.core.interfaces import Control, ControlConfig
 from gateway.core.types import ControlKind, Decision, Stage
@@ -56,6 +61,7 @@ class PinStatus(StrEnum):
     UNPINNED_ALLOWED = "tool_unpinned_allowed"  # no pin file, `require_pin: false`
     MISMATCH = "tool_pin_mismatch"
     NOT_PINNED = "tool_not_pinned"
+    QUARANTINED = "tool_quarantined"  # drifted once; blocked until an operator acts
 
     @property
     def usable(self) -> bool:
@@ -72,6 +78,7 @@ class PinnedListing:
     unknown: PinStatus  # status of a name neither advertised nor pinned
     definitions: tuple[wire.ToolDefinition, ...]  # usable tools as listed, advertised order
     schemas: wire.ToolSchemas  # argument schemas for the adapter
+    drifted: Mapping[str, str] = MappingProxyType({})  # pinned tool -> advertised digest
 
     def status(self, name: str) -> PinStatus:
         return self.statuses.get(name, self.unknown)
@@ -114,8 +121,12 @@ class ToolPinningControl(Control):
     stages: ClassVar[frozenset[Stage]] = frozenset({Stage.PRE})
     kind: ClassVar[ControlKind] = ControlKind.DETERMINISTIC
 
-    def __init__(self, pins: PinStore) -> None:
+    def __init__(
+        self, pins: PinStore, quarantine: ToolQuarantine, *, clock: Clock = utc_now
+    ) -> None:
         self._pins = pins
+        self._quarantine = quarantine
+        self._clock = clock
 
     # ------------------------------------------------------------------ verification
 
@@ -136,12 +147,15 @@ class ToolPinningControl(Control):
             )
         counts = Counter(tool.name for tool in tools)
         statuses: dict[str, PinStatus] = {}
+        drifted: dict[str, str] = {}
         for tool in tools:
             baseline = pin.tool(tool.name)
+            digest = advertised_digest(tool)
             if baseline is None:
                 status = PinStatus.NOT_PINNED
-            elif counts[tool.name] > 1 or advertised_digest(tool) != baseline.digest:
+            elif counts[tool.name] > 1 or digest != baseline.digest:
                 status = PinStatus.MISMATCH  # a second entry must not stand in for the first
+                drifted[tool.name] = digest if counts[tool.name] == 1 else ""
             else:
                 status = PinStatus.PINNED
             if (seen := statuses.get(tool.name)) is None or seen.usable:
@@ -163,13 +177,55 @@ class ToolPinningControl(Control):
             unknown=PinStatus.NOT_PINNED,
             definitions=definitions,
             schemas=MappingProxyType(schemas),
+            drifted=MappingProxyType(drifted),
         )
 
-    def screen_listing(
+    async def quarantined(self, listing: PinnedListing) -> PinnedListing:
+        """``listing`` with the server's quarantine applied: this listing's drifted tools are
+        quarantined (the first detection is kept), stale records of a re-approved baseline are
+        dropped, and every quarantined tool is refused. Raises
+        `ToolQuarantineUnavailableError`."""
+        pin = listing.pin
+        if pin is None:
+            return listing
+        now = self._clock()
+        for name, digest in listing.drifted.items():
+            baseline = pin.tool(name)
+            if baseline is not None:
+                entry = QuarantineEntry(
+                    tool=name,
+                    pin_digest=baseline.digest,
+                    advertised_digest=digest,
+                    reason=PinStatus.MISMATCH.value,
+                    detected_at=now,
+                )
+                await self._quarantine.add(listing.server, entry)
+                logger.error("MCP server %s tool %r quarantined", listing.server, name[:64])
+        blocked: set[str] = set()
+        for name, entry in (await self._quarantine.entries(listing.server)).items():
+            baseline = pin.tool(name)
+            if baseline is None or baseline.digest != entry.pin_digest:
+                await self._quarantine.clear(listing.server, name)  # re-approved since
+            else:
+                blocked.add(name)
+        if not blocked:
+            return listing
+        statuses = dict(listing.statuses)
+        for name in blocked:
+            if statuses.get(name) is not PinStatus.MISMATCH:  # the drift itself says mismatch
+                statuses[name] = PinStatus.QUARANTINED
+        return replace(
+            listing,
+            statuses=MappingProxyType(statuses),
+            definitions=tuple(t for t in listing.definitions if t.name not in blocked),
+        )
+
+    async def screen_listing(
         self, server: str, config: McpServer, tools: Sequence[wire.ToolDefinition]
     ) -> PinnedListing:
-        """`verify` for ``tools/list``: every hidden tool is logged and counted."""
-        listing = self.verify(server, config, tools)
+        """`verify` plus the quarantine for ``tools/list``: every hidden tool is logged and
+        counted. Raises `PinFileError` or `ToolQuarantineUnavailableError`."""
+        listing = await self.quarantined(self.verify(server, config, tools))
         for name, status in listing.hidden.items():
             record_verdicts(
                 [Verdict(decision=Decision.BLOCK, control_id=self.id, reason_code=status.value)]
@@ -183,8 +239,11 @@ class ToolPinningControl(Control):
         self, server: str, config: McpServer, upstream: MCPUpstream, snapshot: PolicySnapshot
     ) -> PinnedListing:
         """The verified latest listing of the caller's upstream session, listing it first if
-        the agent never did. Raises `PinFileError` or `UpstreamError`."""
-        listing = self.verify(server, config, await upstream.latest_listing(snapshot))
+        the agent never did, with the server's quarantine applied: an approved listing an
+        older session cached does not outlive a drift another session saw. Raises
+        `PinFileError`, `UpstreamError` or `ToolQuarantineUnavailableError`."""
+        tools = await upstream.latest_listing(snapshot)
+        listing = await self.quarantined(self.verify(server, config, tools))
         if listing.pin is None and listing.unknown.usable:  # opted out: the first listing's
             listing = replace(listing, schemas=await upstream.advertised_schemas(snapshot))
         return listing

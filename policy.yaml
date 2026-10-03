@@ -94,6 +94,8 @@ controls:
   sql_guard:        { mode: block, max_cost: 10000, force_limit: 500, timeout_ms: 3000 }
   signatures:       { mode: block, feed: feeds/signatures.json, refresh_s: 30 }  # relative to this file, or an http(s) URL
   loop_detect:      { mode: block, max_repeats: 5, window_s: 60 }
+  intent_judge:     { mode: require_approval, risk_delta: 0.2 }   # advisory: flags the MCP call
+  output_policy:    { mode: redact, risk_delta: 0.2 }             # judge quotes -> masked spans
 
 pricing:                   # USD; local models are priced by GPU wall-time estimate
   "qwen3:8b": { prompt_per_1k: 0.0, completion_per_1k: 0.0, gpu_second: 0.0005 }
@@ -106,7 +108,11 @@ budgets:
   soft_limit_pct: 80
 
 # LLM judges (intent_judge, output_policy, the prompt_injection judge band) call
-# upstreams.llm directly, uncharged and unaudited. Without this section intent_judge and
-# output_policy stay off (judge_not_configured); with it, a judge that cannot answer within
-# timeout_s fails its control closed. Enable once the judge model is pulled and fast enough:
-# judges: { model: "qwen3:8b", timeout_s: 10, max_content_chars: 16000, max_output_tokens: 1024 }
+# upstreams.llm directly with this model: not audited as agent requests, not charged to
+# budgets. A judge that cannot answer within timeout_s fails its control closed. Without
+# this section the judge controls are off, and configuring one of them is an error.
+judges:
+  model: "qwen3:8b"
+  timeout_s: 20              # total deadline per judge call (CPU inference is slow)
+  max_content_chars: 16000   # longer content is not judged: fail closed
+  max_output_tokens: 1024

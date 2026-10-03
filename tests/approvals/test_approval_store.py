@@ -17,6 +17,7 @@ from gateway.approvals.model import (
     ApprovalState,
     Transition,
 )
+from gateway.approvals.service import ApprovalService
 from gateway.core.types import Action, Channel
 
 S = ApprovalState
@@ -25,18 +26,21 @@ TIMEOUT = timedelta(seconds=600)
 RETENTION_S = 7 * 24 * 3600
 
 
-def draft(sut: StoreUnderTest, operation: str = OPERATION) -> ApprovalDraft:
+def draft(
+    sut: StoreUnderTest, operation: str = OPERATION, agent: str = "nightly_etl"
+) -> ApprovalDraft:
     return ApprovalDraft(
         operation=operation,
         binding=ApprovalBinding(
             session_id="s-1",
-            principal="svc:nightly_etl",
-            agent="nightly_etl",
+            principal=f"svc:{agent}",
+            agent=agent,
             channel=Channel.MCP,
             server="reports",
             tool="write_report",
             args_digest="cd" * 32,
         ),
+        operation_digest="ef" * 32,
         policy_revision="a1c9e2f04b7d",
         actions=(Action.WRITE,),
         resources=("fs:reports/nightly.md",),
@@ -46,9 +50,11 @@ def draft(sut: StoreUnderTest, operation: str = OPERATION) -> ApprovalDraft:
     )
 
 
-async def create(sut: StoreUnderTest, operation: str = OPERATION) -> tuple[Approval, bool]:
+async def create(
+    sut: StoreUnderTest, operation: str = OPERATION, agent: str = "nightly_etl"
+) -> tuple[Approval, bool]:
     return await sut.store.create_or_get(
-        draft(sut, operation), expires_at=sut.clock() + TIMEOUT, retention_s=RETENTION_S
+        draft(sut, operation, agent), expires_at=sut.clock() + TIMEOUT, retention_s=RETENTION_S
     )
 
 
@@ -237,3 +243,115 @@ async def test_listing_is_newest_first_and_filters_by_state(store_under_test: St
     pending = await store_under_test.store.records(frozenset({S.PENDING}))
     assert [r.id for r in pending] == [new.id]
     assert [r.id for r in await store_under_test.store.records(limit=1)] == [new.id]
+
+
+# -------------------------------------------------------------------- revocation
+
+
+REVOKED_COUNT = 600  # more than any listing limit (LIST_LIMIT is 500)
+
+
+async def test_revocation_reaches_every_approval_of_the_agent(store_under_test: StoreUnderTest):
+    """A kill revokes all of an agent's unused approvals, however many: none can be
+    approved or consumed afterwards, while another agent's are untouched."""
+    sut = store_under_test
+    ids = []
+    for n in range(REVOKED_COUNT):
+        record, _ = await create(sut, f"{n:024x}" + "0" * 40)
+        if n % 2:  # half approved, half still pending
+            await move(sut, record.id, S.APPROVED)
+        ids.append(record.id)
+    assert len(set(ids)) == REVOKED_COUNT
+    other, _ = await create(sut, "f" * 64, agent="databot")
+
+    assert await sut.store.revoke_agent("nightly_etl") == 1
+    for n, approval_id in enumerate(ids):
+        target = S.EXECUTING if n % 2 else S.APPROVED
+        with pytest.raises(ApprovalConflictError) as caught:
+            await move(sut, approval_id, target)
+        assert caught.value.current is not None
+        assert (caught.value.current.state, caught.value.current.outcome) == (
+            S.DENIED,
+            "agent_killed",
+        )
+    assert (await move(sut, other.id, S.APPROVED)).state is S.APPROVED
+    assert await sut.store.pending_count() == 0
+    assert await sut.store.open_ids() == [other.id]
+
+
+async def test_after_a_revocation_new_approvals_work(store_under_test: StoreUnderTest):
+    sut = store_under_test
+    old, _ = await create(sut)
+    await sut.store.revoke_agent("nightly_etl")
+    settled = await sut.store.settle(old.id, sut.clock())
+    assert settled is not None
+    assert settled.state is S.DENIED
+    fresh, created = await create(sut)  # the revoked record no longer holds the slot
+    assert created
+    assert fresh.generation == 1
+    assert (await move(sut, fresh.id, S.APPROVED)).state is S.APPROVED
+
+
+async def test_a_consumed_approval_is_not_revoked(store_under_test: StoreUnderTest):
+    """Revocation stops unused approvals; one already executing is the pipeline's to stop."""
+    sut = store_under_test
+    record, _ = await create(sut)
+    await move(sut, record.id, S.APPROVED)
+    await move(sut, record.id, S.EXECUTING)
+    await sut.store.revoke_agent("nightly_etl")
+    settled = await sut.store.settle(record.id, sut.clock())
+    assert settled is not None
+    assert settled.state is S.EXECUTING
+    stopped = await move(
+        sut, record.id, S.DENIED, outcome="agent_killed", only_from=frozenset({S.EXECUTING})
+    )
+    assert (stopped.state, stopped.outcome) == (S.DENIED, "agent_killed")
+
+
+async def test_only_from_narrows_the_legal_sources(store_under_test: StoreUnderTest):
+    sut = store_under_test
+    record, _ = await create(sut)
+    await move(sut, record.id, S.APPROVED)
+    await move(sut, record.id, S.EXECUTING)
+    with pytest.raises(ApprovalConflictError):  # an operator's deny never hits a running call
+        await move(sut, record.id, S.DENIED, only_from=frozenset({S.PENDING, S.APPROVED}))
+
+
+# ------------------------------------------------------------------- stuck outcome
+
+
+async def test_executing_records_are_found_once_stuck(store_under_test: StoreUnderTest):
+    sut = store_under_test
+    record, _ = await create(sut)
+    await move(sut, record.id, S.APPROVED)
+    await move(sut, record.id, S.EXECUTING)
+    started = sut.clock()
+    assert await sut.store.stuck(started - timedelta(seconds=1)) == []
+    assert await sut.store.stuck(started) == [record.id]
+    await move(sut, record.id, S.SUCCEEDED)
+    assert await sut.store.stuck(started) == []
+
+
+async def test_a_kill_revokes_more_approvals_than_any_listing_holds(
+    store_under_test: StoreUnderTest,
+):
+    """Through the service, as `/admin/kill` does: every approved record of the agent is
+    refused at consumption, not just the ones a listing page would return."""
+    sut = store_under_test
+    service = ApprovalService(sut.store, key=b"k" * 32, clock=sut.clock)
+    ids = []
+    for n in range(REVOKED_COUNT):
+        record, _ = await create(sut, f"{n:024x}" + "0" * 40)
+        await move(sut, record.id, S.APPROVED)
+        ids.append(record.id)
+    assert len(set(ids)) == REVOKED_COUNT
+    revoked = await service.revoke_agent("nightly_etl")
+    assert revoked == REVOKED_COUNT
+    consumed = 0
+    for approval_id in ids:
+        try:
+            await service.begin(approval_id)
+        except ApprovalConflictError:
+            continue
+        consumed += 1
+    assert consumed == 0

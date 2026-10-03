@@ -59,11 +59,19 @@ _ARGUMENTS: Final = "arguments"
 _BLOB: Final = "blob"  # an MCP resource's base64 payload
 _DATA: Final = "data"  # an MCP image/audio item's base64 payload, next to its mimeType
 _DATA_URL: Final = re.compile(r"data:([^,]{0,256}),", re.IGNORECASE)
-# Keys of protocol fields (identifiers and enums), not of text a person or model wrote. They
-# are scanned like any value, but left out when consecutive segments are joined into one text:
-# ``role: "user"`` between two messages would otherwise break a value split across them.
-_STRUCTURAL_KEYS: Final = frozenset(
-    {"role", "type", "id", "name", "model", "object", "finish_reason", "mimeType", "uri"}
+# Protocol fields (identifiers and enums at known places of the chat and MCP documents), not
+# text a person, model or tool wrote. They are scanned like any value, but left out when
+# consecutive segments are joined into one text: ``role: "user"`` between two messages would
+# otherwise break a value split across them. Matched by pointer, never by key alone: a ``name``
+# or ``type`` inside tool arguments, ``structuredContent`` or a resource link is data.
+_PROTOCOL_POINTER: Final = re.compile(
+    r"/(?:model|object|id|system_fingerprint|service_tier|reasoning_effort|tool_choice"
+    r"|response_format/type)"
+    r"|/(?:messages/\d+|choices/\d+/(?:message|delta))"
+    r"/(?:role|tool_call_id|content/\d+/type|tool_calls/\d+/(?:id|type))"
+    r"|/choices/\d+/finish_reason"
+    r"|/tools/\d+/type"
+    r"|/content/\d+/(?:type|mimeType|resource/mimeType|annotations/audience/\d+)"
 )
 
 
@@ -93,7 +101,7 @@ class TextSegment:
     @property
     def joinable(self) -> bool:
         """Part of the running text a split value is rebuilt from (not a protocol field)."""
-        return self.key not in _STRUCTURAL_KEYS
+        return self.embedded is not None or _PROTOCOL_POINTER.fullmatch(self.pointer) is None
 
     def span(self, start: int, end: int, label: str) -> Span:
         """A span over ``text[start:end]`` (a number is always replaced whole)."""

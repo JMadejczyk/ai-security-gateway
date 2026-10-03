@@ -8,30 +8,43 @@ holds an unreadable record refuses the call (fail closed).
 """
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from gateway_testkit import bearer, chat, claims, running_gateway, sign
+from gateway_testkit import bearer, chat, claims, echo_completion, running_gateway, sign
 from redis.asyncio import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 from gateway.core.envelope import FlaggedToolCall
 from gateway.core.types import SessionMode
-from gateway.policy.schema import Sessions
+from gateway.policy.schema import MAX_DURATION_S, Sessions
 from gateway.redis_sessions import (
     LOCK_TTL_S,
     RedisSessionLock,
     RedisSessionStore,
     SessionBusyError,
+    SessionLeaseLostError,
     SessionStoreUnavailableError,
-    _LocalLocks,
     tombstone_ttl_s,
 )
-from gateway.sessions import SessionBinding, SessionError, SessionUpdate
+from gateway.sessions import (
+    InMemorySessionStore,
+    SessionBinding,
+    SessionError,
+    SessionUpdate,
+)
 
 ANNA = SessionBinding(principal="anna@demo", actor="databot", mode=SessionMode.INTERACTIVE)
 LIMITS = Sessions(idle_ttl_s=3600, max_lifetime_s=86400)
 HALF_LIFE = 600.0
 DEAD_REDIS = "redis://127.0.0.1:1/0"  # nothing listens on port 1
+
+
+def lease(store, session_id: str = "s-1") -> RedisSessionLock:
+    lock = store.lock(session_id)
+    assert isinstance(lock, RedisSessionLock)
+    return lock
 
 
 @pytest.fixture
@@ -83,9 +96,7 @@ async def test_a_held_lock_is_renewed_past_its_ttl(shared):
 
 async def test_a_crashed_holder_s_lock_expires(shared):
     """A gateway that dies mid-call never releases; the TTL frees the session."""
-    lock = RedisSessionLock(
-        shared.client, "acl:session:s-1:lock", _LocalLocks(), wait_s=1, ttl_s=0.3
-    )
+    lock = lease(shared.store(lock_ttl_s=0.3))
     await lock.__aenter__()
     assert lock._renewer is not None
     lock._renewer.cancel()  # the process is gone: no renewal, no release
@@ -98,9 +109,7 @@ async def test_a_crashed_holder_s_lock_expires(shared):
 
 async def test_release_never_deletes_another_holder_s_lock(shared):
     """A holder whose lock expired must not free the lock its successor now holds."""
-    stale = RedisSessionLock(
-        shared.client, "acl:session:s-1:lock", _LocalLocks(), wait_s=1, ttl_s=0.2
-    )
+    stale = lease(shared.store(lock_ttl_s=0.2))
     await stale.__aenter__()
     assert stale._renewer is not None
     stale._renewer.cancel()
@@ -111,6 +120,92 @@ async def test_release_never_deletes_another_holder_s_lock(shared):
         with pytest.raises(SessionBusyError):
             async with shared.store(lock_wait_s=0.1).lock("s-1"):
                 pass
+
+
+# --------------------------------------------------------- lease loss (codex P1 repro)
+
+
+def failing_renewals(lock: RedisSessionLock, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every renewal of this holder fails (Redis unreachable from its process only)."""
+
+    async def unreachable(**_: object) -> object:
+        raise RedisConnectionError("injected")
+
+    scripts = lock._store.scripts
+    monkeypatch.setattr(lock._store, "scripts", replace(scripts, renew=unreachable))
+
+
+async def test_a_lost_lease_never_lets_a_second_call_run_while_the_first_is_in_flight(
+    shared, monkeypatch
+):
+    first_gateway = shared.store(lock_ttl_s=0.3)
+    first = lease(first_gateway)
+    failing_renewals(first, monkeypatch)
+    await first.__aenter__()
+    await first_gateway.open("s-1", ANNA, LIMITS)
+    await first_gateway.before_dispatch("s-1", upstream_timeout_s=5)  # the call goes upstream
+    await asyncio.sleep(1.0)  # > 3 lease TTLs without one renewal: the lease is gone
+    assert await shared.client.get("acl:session:s-1:lock") is None
+    second = shared.store(lock_wait_s=0.5)
+    with pytest.raises(SessionBusyError):  # the in-flight call fences the session
+        async with second.lock("s-1"):
+            pytest.fail("a second call ran while the first was in flight")
+    # The first call comes back with untrusted content: its taint lands, then it releases.
+    state = await first_gateway.apply("s-1", SessionUpdate(taint=True), half_life_s=HALF_LIFE)
+    assert state.taint
+    await first.__aexit__(None, None, None)
+    async with second.lock("s-1"):
+        assert (await second.open("s-1", ANNA, LIMITS)).taint  # sees the first call's taint
+
+
+async def test_a_call_whose_lease_is_lost_before_dispatch_does_not_dispatch(shared, monkeypatch):
+    gateway = shared.store(lock_ttl_s=0.3)
+    lock = lease(gateway)
+    failing_renewals(lock, monkeypatch)
+    async with lock:
+        await gateway.open("s-1", ANNA, LIMITS)
+        await asyncio.sleep(0.5)  # no renewal for longer than the TTL
+        with pytest.raises(SessionLeaseLostError) as caught:
+            await gateway.before_dispatch("s-1", upstream_timeout_s=5)
+    assert (caught.value.status_code, caught.value.reason_code) == (503, "session_lease_lost")
+    assert await shared.client.get("acl:session:s-1:inflight") is None
+
+
+async def test_a_lease_taken_over_before_dispatch_does_not_dispatch(shared):
+    gateway = shared.store()
+    async with gateway.lock("s-1"):
+        await gateway.open("s-1", ANNA, LIMITS)
+        await shared.client.set("acl:session:s-1:lock", "someone-else")
+        with pytest.raises(SessionLeaseLostError):
+            await gateway.before_dispatch("s-1", upstream_timeout_s=5)
+
+
+async def test_a_lapsed_fence_still_persists_taint_but_withholds_the_result(shared, monkeypatch):
+    """The marker expired under a holder cut off from Redis, and another call ran: the
+    late holder's taint is still merged in, and its call is refused rather than released."""
+    first_gateway = shared.store(lock_ttl_s=0.3)
+    first = lease(first_gateway)
+    failing_renewals(first, monkeypatch)
+    await first.__aenter__()
+    await first_gateway.open("s-1", ANNA, LIMITS)
+    monkeypatch.setattr("gateway.redis_sessions.DISPATCH_SLACK_S", 0.0)
+    await first_gateway.before_dispatch("s-1", upstream_timeout_s=0.3)
+    await asyncio.sleep(0.8)  # lease and marker both expired
+    second = shared.store()
+    async with second.lock("s-1"):
+        await second.open("s-1", ANNA, LIMITS)
+        await second.apply("s-1", SessionUpdate(risk_delta=0.2), half_life_s=HALF_LIFE)
+    with pytest.raises(SessionLeaseLostError):
+        await first_gateway.apply("s-1", SessionUpdate(taint=True), half_life_s=HALF_LIFE)
+    await first.__aexit__(None, None, None)
+    state = await second.get("s-1")
+    assert state is not None
+    assert (state.taint, state.risk) == (True, pytest.approx(0.2, abs=1e-3))
+
+
+async def test_dispatch_without_holding_the_session_is_refused(shared):
+    with pytest.raises(SessionLeaseLostError):
+        await shared.store().before_dispatch("s-1", upstream_timeout_s=5)
 
 
 async def test_taint_survives_a_gateway_restart(shared):
@@ -138,13 +233,18 @@ async def test_an_ended_session_never_revives_on_another_gateway(shared):
     assert await two.get("s-1") is None
 
 
-async def test_tombstones_outlive_every_session_and_token(shared):
+async def test_tombstones_outlive_every_token_that_could_name_the_id(shared):
+    """Codex P2: a token names a session only until ``sid_iat + max_lifetime_s``, and the
+    schema caps that lifetime at MAX_DURATION_S; a tombstone written at any time after the
+    id was minted must outlive it, even if the policy raises the lifetime later."""
     store = shared.store()
-    await store.open("s-1", ANNA, LIMITS)
+    short = Sessions(idle_ttl_s=60, max_lifetime_s=120)  # retired under a short lifetime...
+    await store.open("s-1", ANNA, short)
     await store.end("s-1")
     ttl_ms = await shared.client.pttl("acl:session:s-1:ended")
-    assert ttl_ms >= (LIMITS.max_lifetime_s + 3600) * 1000
-    assert tombstone_ttl_s(LIMITS) * 1000 >= ttl_ms > 0
+    longest = Sessions(idle_ttl_s=60, max_lifetime_s=MAX_DURATION_S)  # ...then raised
+    assert ttl_ms >= longest.max_lifetime_s * 1000
+    assert tombstone_ttl_s(short) * 1000 >= ttl_ms > 0
 
 
 async def test_concurrent_writes_never_lose_an_update(shared):
@@ -211,3 +311,20 @@ async def test_gateway_answers_503_when_the_session_store_is_down(tmp_path: Path
 
 def test_lock_ttl_is_long_enough_to_renew():
     assert LOCK_TTL_S >= 3  # renewed every TTL/3: a slow event loop must not lose it
+
+
+async def test_the_pipeline_never_dispatches_without_its_lease(gateway, llm_upstream):
+    """Whatever the store: a refused `before_dispatch` means no upstream call, a 503, and
+    the call's own verdicts still persisted."""
+
+    class LeaseLost(InMemorySessionStore):
+        async def before_dispatch(self, session_id: str, *, upstream_timeout_s: float) -> None:
+            raise SessionLeaseLostError
+
+    route = llm_upstream.post("/chat/completions").mock(side_effect=echo_completion)
+    gateway.container.gate._sessions = LeaseLost(clock=gateway.clock)
+    token = await gateway.token("anna@demo")
+    response = await gateway.agent.post("/v1/chat/completions", json=chat(), headers=bearer(token))
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "session_lease_lost"
+    assert not route.called

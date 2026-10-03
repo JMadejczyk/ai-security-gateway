@@ -12,13 +12,28 @@ lifetimes, sticky taint, decay, retirement), with three differences forced by sh
 - **Retirement.** Expiry is decided from the record (``last_seen`` + idle TTL, ``created_at``
   + lifetime) on the store's clock, lazily, and never while a call holds the session's lock.
   An ended or expired session leaves a tombstone (``acl:session:<id>:ended``); records and
-  tombstones carry a Redis TTL of at least ``max(max_lifetime_s, token lifetime) + 1 day``
-  past retirement, so a retired id is refused for at least that long (a record past its
-  logical expiry is itself proof of retirement until it is collected).
-- **Serialization across processes.** `RedisSessionLock`: a lock key set with ``NX PX`` and a
-  random token, renewed while held, released only by its owner (compare-and-delete), expiring
-  on its own if the holder dies. A call waits at most ``session_lock_wait_s`` and is then
-  refused with 429 ``session_busy`` instead of queueing without bound.
+  tombstones carry a Redis TTL of the schema's largest session lifetime (30 days) + 1 day
+  past retirement (a record past its logical expiry is itself proof of retirement until it
+  is collected). Tokens carry ``sid_iat`` and are refused once ``sessions.max_lifetime_s``
+  past it, so no token can name a retired id after its tombstone expires (`tombstone_ttl_s`).
+- **Serialization across processes.** `RedisSessionLock`: a lease (``acl:session:<id>:lock``)
+  set with ``NX PX`` and a random owner token, renewed while held, released only by its owner
+  (compare-and-delete), expiring on its own if the holder dies. A call waits at most
+  ``session_lock_wait_s`` and is then refused with 429 ``session_busy``.
+- **Fencing the lease.** A lease can be lost while its holder is still running (renewal fails
+  for longer than the TTL, a stalled process). So, right before a call goes upstream,
+  `before_dispatch` atomically checks that the lease still holds this call's token and sets
+  an in-flight marker (``acl:session:<id>:inflight`` = the token). A lost lease means no
+  dispatch (503 ``session_lease_lost``). While a marker of another token exists nobody can
+  acquire the lease, whatever happened to it: the session is *uncertain* until the in-flight
+  call has persisted its outcome and released the marker. The marker is renewed with the
+  lease and otherwise expires after ``upstream_timeout_s + DISPATCH_SLACK_S``: the upstream
+  call itself is bounded by that timeout, so a marker can only expire under a holder that
+  crashed or lost Redis. The holder's write is fenced too: it always lands (version
+  compare-and-set merges its deltas, so taint is never lost), but if its marker is no longer
+  its own another call may have run meanwhile, and the result is withheld (503).
+  Marking before dispatch rather than after a failure is deliberate: a lease is usually lost
+  because Redis is unreachable, and then no after-the-fact "uncertain" write could land.
 
 Any Redis or connection error fails closed: `SessionStoreUnavailableError` (503).
 """
@@ -42,8 +57,7 @@ from redis.exceptions import RedisError
 from gateway.clock import Clock, utc_now
 from gateway.core.envelope import FrozenModel, SessionContext
 from gateway.errors import RejectionError
-from gateway.identity import MAX_TOKEN_LIFETIME_S
-from gateway.policy.schema import Sessions
+from gateway.policy.schema import MAX_DURATION_S, Sessions
 from gateway.sessions import (
     SessionBinding,
     SessionError,
@@ -59,19 +73,24 @@ KEY_PREFIX: Final = "acl:session"
 TAINTED_KEY: Final = "acl:sessions:tainted"  # zset: tainted session id -> expiry (epoch ms)
 TOMBSTONE_SLACK_S: Final = 86_400
 LOCK_TTL_S: Final = 15.0
+# An in-flight marker outlives the upstream call's own deadline by this much: post controls
+# (judges, classifiers) and persisting the outcome happen after the upstream answers.
+DISPATCH_SLACK_S: Final = 120.0
 MAX_WRITE_ATTEMPTS: Final = 32  # conflicts are rare: the session lock serializes writers
 _BACKOFF_MIN_S: Final = 0.005
 _BACKOFF_MAX_S: Final = 0.2
 _ENDED: Final = -1
 _CONFLICT: Final = 0
 
-# KEYS: record, tombstone, tainted zset. ARGV: expected version, doc, record TTL (ms),
-# tainted (1/0), tainted score, session id. Returns the new version, 0 on a version conflict,
-# -1 when the session has a tombstone.
+# KEYS: record, tombstone, tainted zset, in-flight marker. ARGV: expected version, doc,
+# record TTL (ms), tainted (1/0), tainted score, session id, the writer's dispatch token ('' if
+# it never dispatched). Returns {status, fenced}: status is the new version, 0 on a version
+# conflict, -1 when the session has a tombstone; fenced is 0 when the writer dispatched and its
+# in-flight marker is no longer its own.
 _SAVE: Final = """
-if redis.call('EXISTS', KEYS[2]) == 1 then return -1 end
+if redis.call('EXISTS', KEYS[2]) == 1 then return {-1, 1} end
 local version = tonumber(redis.call('HGET', KEYS[1], 'v') or '0')
-if version ~= tonumber(ARGV[1]) then return 0 end
+if version ~= tonumber(ARGV[1]) then return {0, 1} end
 redis.call('HSET', KEYS[1], 'v', version + 1, 'doc', ARGV[2])
 redis.call('PEXPIRE', KEYS[1], ARGV[3])
 if ARGV[4] == '1' then
@@ -79,7 +98,9 @@ if ARGV[4] == '1' then
 else
   redis.call('ZREM', KEYS[3], ARGV[6])
 end
-return version + 1
+local fenced = 1
+if ARGV[7] ~= '' and redis.call('GET', KEYS[4]) ~= ARGV[7] then fenced = 0 end
+return {version + 1, fenced}
 """
 
 # KEYS: record, tombstone, tainted zset. ARGV: retired-at (ISO), tombstone TTL (ms), id.
@@ -94,16 +115,39 @@ end
 return 1
 """
 
-_RENEW: Final = """
-if redis.call('GET', KEYS[1]) == ARGV[1] then
-  return redis.call('PEXPIRE', KEYS[1], ARGV[2])
-end
+# Lease scripts. KEYS: lease, in-flight marker. ARGV[1]: the owner token.
+
+# ARGV[2]: lease TTL (ms). Refused while another token's call may still be in flight.
+_ACQUIRE: Final = """
+local inflight = redis.call('GET', KEYS[2])
+if inflight and inflight ~= ARGV[1] then return 0 end
+if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then return 1 end
 return 0
 """
 
+# ARGV[2]: lease TTL (ms), ARGV[3]: marker hold (ms). The marker is extended even when the
+# lease was lost: it is this (live) holder's call that is still in flight.
+_RENEW: Final = """
+local owned = 0
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  redis.call('PEXPIRE', KEYS[1], ARGV[2])
+  owned = 1
+end
+if redis.call('GET', KEYS[2]) == ARGV[1] then redis.call('PEXPIRE', KEYS[2], ARGV[3]) end
+return owned
+"""
+
+# ARGV[2]: marker hold (ms). Sets the marker only while the lease is still this token's.
+_DISPATCH: Final = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+redis.call('SET', KEYS[2], ARGV[1], 'PX', ARGV[2])
+return 1
+"""
+
 _RELEASE: Final = """
-if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
-return 0
+if redis.call('GET', KEYS[2]) == ARGV[1] then redis.call('DEL', KEYS[2]) end
+if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('DEL', KEYS[1]) end
+return 1
 """
 
 
@@ -125,6 +169,16 @@ class SessionBusyError(RejectionError):
         super().__init__("session_busy", "another call of this session is still running")
 
 
+class SessionLeaseLostError(RejectionError):
+    """This call no longer holds its session's lease: another call may be running in the same
+    session, so nothing is dispatched (or, after dispatch, nothing is released)."""
+
+    status_code = 503
+
+    def __init__(self) -> None:
+        super().__init__("session_lease_lost", "the session's lock was lost; retry")
+
+
 class StoredSession(FrozenModel):
     """What one session record holds: its state and the limits it was last admitted under."""
 
@@ -141,9 +195,16 @@ class StoredSession(FrozenModel):
 
 
 def tombstone_ttl_s(limits: Sessions) -> float:
-    """How long a retired id stays refused, at least: longer than any session or token that
-    could still name it, plus a day."""
-    return max(limits.max_lifetime_s, MAX_TOKEN_LIFETIME_S) + TOMBSTONE_SLACK_S
+    """How long a retired id stays refused, at least.
+
+    A token names a session only while ``now < sid_iat + sessions.max_lifetime_s`` (checked by
+    `TokenVerifier`, under the *current* policy), and the policy schema caps that lifetime at
+    ``MAX_DURATION_S``. A session is retired at some time ``R >= created_at >= sid_iat``, so
+    a tombstone kept ``MAX_DURATION_S`` (plus a day for clock skew) outlives every token that
+    could ever name the id, whatever the lifetime is raised to later. ``limits`` stays in the
+    signature for stores that bound it more tightly."""
+    del limits
+    return MAX_DURATION_S + TOMBSTONE_SLACK_S
 
 
 async def _conflict_backoff() -> None:
@@ -167,35 +228,34 @@ class _Local:
 
 
 class RedisSessionLock(AbstractAsyncContextManager[None]):
-    """A per-session lock shared by every gateway (one use: enter once, exit once).
+    """One call's lease on a session, shared by every gateway (enter once, exit once).
 
-    ``SET key token NX PX ttl`` acquires; a background task renews the TTL every third of it
-    while the lock is held; release deletes the key only if it still holds this token. A holder
-    that dies stops renewing, and the lock expires after ``ttl_s``. Should renewal ever fail
-    (Redis down for longer than the TTL), ``lost`` is set: the version check on every session
-    write still keeps a second holder from overwriting this one's state.
+    Acquire: ``SET lease token NX PX ttl``, refused while another token's in-flight marker
+    exists. A background task renews the lease (and this call's marker) every third of the
+    TTL. ``lost`` turns true once the lease is provably gone (renewal finds another owner) or
+    may be gone (no successful renewal for a whole TTL); `RedisSessionStore.before_dispatch`
+    then refuses to dispatch. Release deletes only what still holds this token.
     """
 
     def __init__(
         self,
-        client: Redis,
-        key: str,
-        local: "_LocalLocks",
+        store: "RedisSessionStore",
+        session_id: str,
         *,
         wait_s: float,
         ttl_s: float = LOCK_TTL_S,
     ) -> None:
-        self._client = client
-        self._renew_script: AsyncScript = client.register_script(_RENEW)
-        self._release_script: AsyncScript = client.register_script(_RELEASE)
-        self._key = key
-        self._local = local
+        self._store = store
+        self.session_id = session_id
+        self._keys = [store.key(session_id, "lock"), store.key(session_id, "inflight")]
         self._wait_s = wait_s
         self._ttl_ms = _ms(ttl_s)
-        self._token = secrets.token_hex(16)
+        self.token = secrets.token_hex(16)
+        self.hold_ms: int | None = None  # set once the call is dispatched (marker held)
+        self.lost = False
+        self._valid_until = 0.0
         self._renewer: asyncio.Task[None] | None = None
         self._local_held = False
-        self.lost = False
 
     @override
     async def __aenter__(self) -> None:
@@ -203,7 +263,7 @@ class RedisSessionLock(AbstractAsyncContextManager[None]):
         deadline = loop.time() + self._wait_s
         try:
             async with asyncio.timeout(self._wait_s):
-                await self._local.acquire(self._key)
+                await self._store.local.acquire(self.session_id)
         except TimeoutError:
             raise SessionBusyError from None
         self._local_held = True
@@ -212,6 +272,7 @@ class RedisSessionLock(AbstractAsyncContextManager[None]):
         except BaseException:
             self._release_local()
             raise
+        self._store.leases[self.session_id] = self
         self._renewer = asyncio.create_task(self._renew())
 
     @override
@@ -225,22 +286,42 @@ class RedisSessionLock(AbstractAsyncContextManager[None]):
             self._renewer.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._renewer
+        self._store.leases.pop(self.session_id, None)
         try:
-            await self._release_script(keys=[self._key], args=[self._token])
-        except (RedisError, OSError) as error:  # it expires on its own
+            await self._store.scripts.release(keys=self._keys, args=[self.token])
+        except (RedisError, OSError) as error:  # both expire on their own
             logger.warning("session lock release failed: %s", type(error).__name__)
         finally:
             self._release_local()
+
+    async def dispatch(self, hold_s: float) -> None:
+        """Fence the session for this call's dispatch; raises if the lease is gone."""
+        if self.lost or asyncio.get_running_loop().time() >= self._valid_until:
+            self.lost = True
+            raise SessionLeaseLostError
+        hold_ms = _ms(hold_s)
+        try:
+            owned = await self._store.scripts.dispatch(keys=self._keys, args=[self.token, hold_ms])
+        except (RedisError, OSError) as error:
+            raise SessionStoreUnavailableError from error
+        if not owned:
+            self.lost = True
+            raise SessionLeaseLostError
+        self.hold_ms = hold_ms
 
     async def _acquire(self, deadline: float) -> None:
         loop = asyncio.get_running_loop()
         backoff = _BACKOFF_MIN_S
         while True:
+            started = loop.time()
             try:
-                acquired = await self._client.set(self._key, self._token, nx=True, px=self._ttl_ms)
+                acquired = await self._store.scripts.acquire(
+                    keys=self._keys, args=[self.token, self._ttl_ms]
+                )
             except (RedisError, OSError) as error:
                 raise SessionStoreUnavailableError from error
             if acquired:
+                self._valid_until = started + self._ttl_ms / 1000
                 return
             remaining = deadline - loop.time()
             if remaining <= 0:
@@ -249,28 +330,58 @@ class RedisSessionLock(AbstractAsyncContextManager[None]):
             backoff = min(backoff * 2, _BACKOFF_MAX_S)
 
     async def _renew(self) -> None:
+        loop = asyncio.get_running_loop()
         interval = self._ttl_ms / 3000
         while True:
             await asyncio.sleep(interval)
+            started = loop.time()
             try:
-                renewed: object = await self._renew_script(
-                    keys=[self._key], args=[self._token, self._ttl_ms]
+                owned: object = await self._store.scripts.renew(
+                    keys=self._keys, args=[self.token, self._ttl_ms, self.hold_ms or 0]
                 )
             except (RedisError, OSError) as error:
                 logger.warning("session lock renewal failed: %s", type(error).__name__)
+                if loop.time() >= self._valid_until:
+                    self.lost = True  # it may have expired: assume it did
                 continue
-            if not renewed:
+            if not owned:
                 self.lost = True
-                logger.error("a session lock expired while held; writes stay version-checked")
-                return
+                logger.error("a session lease was lost while its call was running")
+                if self.hold_ms is None:
+                    return  # nothing in flight to keep fenced
+                continue  # keep renewing this call's in-flight marker until it finishes
+            self._valid_until = started + self._ttl_ms / 1000
 
     def _release_local(self) -> None:
         if self._local_held:
             self._local_held = False
-            self._local.release(self._key)
+            self._store.local.release(self.session_id)
+
+
+@dataclass(frozen=True, slots=True)
+class _Scripts:
+    acquire: AsyncScript
+    renew: AsyncScript
+    dispatch: AsyncScript
+    release: AsyncScript
+    save: AsyncScript
+    retire: AsyncScript
+
+    @classmethod
+    def register(cls, client: Redis) -> "_Scripts":
+        return cls(
+            acquire=client.register_script(_ACQUIRE),
+            renew=client.register_script(_RENEW),
+            dispatch=client.register_script(_DISPATCH),
+            release=client.register_script(_RELEASE),
+            save=client.register_script(_SAVE),
+            retire=client.register_script(_RETIRE),
+        )
 
 
 class _LocalLocks:
+    """In-process queues per session in front of the Redis lease."""
+
     def __init__(self) -> None:
         self._entries: dict[str, _Local] = {}
 
@@ -317,22 +428,23 @@ class RedisSessionStore(SessionStore):
         self._clock = clock
         self._lock_wait_s = lock_wait_s
         self._lock_ttl_s = lock_ttl_s
-        self._local = _LocalLocks()
+        self.local = _LocalLocks()  # one Redis contender per session per process
+        self.leases: dict[str, RedisSessionLock] = {}  # leases this process holds, by session
+        self.scripts = _Scripts.register(client)
         self._limits = Sessions()  # the latest admission's limits, for ids without a record
-        self._save = client.register_script(_SAVE)
-        self._retire = client.register_script(_RETIRE)
 
     # ------------------------------------------------------------------- SessionStore
 
     @override
     def lock(self, session_id: str) -> AbstractAsyncContextManager[None]:
-        return RedisSessionLock(
-            self._client,
-            self._key(session_id, "lock"),
-            self._local,
-            wait_s=self._lock_wait_s,
-            ttl_s=self._lock_ttl_s,
-        )
+        return RedisSessionLock(self, session_id, wait_s=self._lock_wait_s, ttl_s=self._lock_ttl_s)
+
+    @override
+    async def before_dispatch(self, session_id: str, *, upstream_timeout_s: float) -> None:
+        lease = self.leases.get(session_id)
+        if lease is None:  # dispatching without holding the session: never
+            raise SessionLeaseLostError
+        await lease.dispatch(upstream_timeout_s + DISPATCH_SLACK_S)
 
     @override
     async def open(
@@ -389,7 +501,7 @@ class RedisSessionStore(SessionStore):
                 raise SessionError(SessionReason.ENDED)
             ctx = apply_update(loaded.stored.context, update, now=now, half_life_s=half_life_s)
             record = loaded.stored.model_copy(update={"context": ctx})
-            if await self._write(session_id, record, loaded.version, now):
+            if await self._write(session_id, record, loaded.version, now, fence=True):
                 return ctx
             await _conflict_backoff()
         raise SessionStoreUnavailableError
@@ -429,16 +541,17 @@ class RedisSessionStore(SessionStore):
     # ------------------------------------------------------------------------ helpers
 
     @staticmethod
-    def _key(session_id: str, suffix: str | None = None) -> str:
+    def key(session_id: str, suffix: str | None = None) -> str:
         key = f"{KEY_PREFIX}:{session_id}"
         return f"{key}:{suffix}" if suffix else key
 
     async def _load(self, session_id: str) -> _Loaded:
         try:
             async with self._client.pipeline(transaction=False) as pipe:
-                pipe.hmget(self._key(session_id), ["v", "doc"])
-                pipe.exists(self._key(session_id, "ended"))
-                pipe.exists(self._key(session_id, "lock"))
+                pipe.hmget(self.key(session_id), ["v", "doc"])
+                pipe.exists(self.key(session_id, "ended"))
+                # In use: a lease, or a call still in flight under a lost lease.
+                pipe.exists(self.key(session_id, "lock"), self.key(session_id, "inflight"))
                 replies = cast("list[object]", await pipe.execute())
         except (RedisError, OSError) as error:
             raise SessionStoreUnavailableError from error
@@ -459,13 +572,27 @@ class RedisSessionStore(SessionStore):
         )
 
     async def _write(
-        self, session_id: str, record: StoredSession, version: int, now: datetime
+        self,
+        session_id: str,
+        record: StoredSession,
+        version: int,
+        now: datetime,
+        *,
+        fence: bool = False,
     ) -> bool:
         """Compare-and-set; False on a version conflict. Raises `SessionError` when the
-        session was ended meanwhile."""
+        session was ended meanwhile. With ``fence``, a writer that dispatched and no longer
+        owns its in-flight marker still writes, then raises `SessionLeaseLostError`."""
         expires_at = record.expires_at()
         ttl_s = max((expires_at - now).total_seconds(), 0.0) + tombstone_ttl_s(record.limits)
-        keys = [self._key(session_id), self._key(session_id, "ended"), TAINTED_KEY]
+        keys = [
+            self.key(session_id),
+            self.key(session_id, "ended"),
+            TAINTED_KEY,
+            self.key(session_id, "inflight"),
+        ]
+        lease = self.leases.get(session_id) if fence else None
+        dispatched = lease is not None and lease.hold_ms is not None
         args: list[str | int] = [
             version,
             record.model_dump_json(),
@@ -473,19 +600,26 @@ class RedisSessionStore(SessionStore):
             int(record.context.taint),
             _epoch_ms(expires_at),
             session_id,
+            lease.token if lease is not None and dispatched else "",
         ]
         try:
-            reply = int(cast("int", await self._save(keys=keys, args=args)))
+            reply = cast("list[int]", await self.scripts.save(keys=keys, args=args))
         except (RedisError, OSError) as error:
             raise SessionStoreUnavailableError from error
-        if reply == _ENDED:
+        status, fenced = int(reply[0]), int(reply[1])
+        if status == _ENDED:
             raise SessionError(SessionReason.ENDED)
-        return reply != _CONFLICT
+        if status == _CONFLICT:
+            return False
+        if not fenced:
+            logger.error("a call persisted after its session fence lapsed; result withheld")
+            raise SessionLeaseLostError
+        return True
 
     async def _retire_id(self, session_id: str, limits: Sessions, now: datetime) -> None:
-        keys = [self._key(session_id), self._key(session_id, "ended"), TAINTED_KEY]
+        keys = [self.key(session_id), self.key(session_id, "ended"), TAINTED_KEY]
         args = [now.isoformat(), _ms(tombstone_ttl_s(limits)), session_id]
         try:
-            await self._retire(keys=keys, args=args)
+            await self.scripts.retire(keys=keys, args=args)
         except (RedisError, OSError) as error:
             raise SessionStoreUnavailableError from error

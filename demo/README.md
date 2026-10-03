@@ -110,6 +110,12 @@ identities:
 | `root@demo` | admin | databot | 50 |
 | `svc:nightly_etl` | none (autonomous; grants come from the agent's `allow`) | nightly_etl | 50 |
 
+`olga@demo` and `root@demo` can also get an **operator token** (`{"sub": ..., "kind":
+"operator"}`): no agent, no session, accepted only by `/admin/*`. With it olga approves, say,
+a databot write held in anna's session; nobody can approve a call of their own session, and
+identities without `admin` or an approver role (anna, bartek, the service principal) get no
+operator token at all (`not_an_operator`).
+
 ## Database (`db/`)
 
 `00_init.sh` runs once, on an empty `pgdata` volume. It must stay executable (git mode 100755).

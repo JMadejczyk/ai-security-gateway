@@ -8,20 +8,25 @@ id in ``_meta`` and it executes once.
 """
 
 import importlib
+from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import httpx
 import jwt
 import pytest
 import yaml
-from approvals_kit import mcp_harness
-from gateway_testkit import bearer, chat, completion
+from approvals_kit import mcp_harness, pin_kit, upstreams
+from gateway_testkit import bearer, chat, completion, running_gateway
 
+from gateway.approvals.kill_switch import KillRecord
 from gateway.approvals.model import ApprovalState
+from gateway.approvals.sweeper import STUCK_SLACK_S, sweep_once
 from gateway.controls.registry import ControlRegistry
 from gateway.core.envelope import Verdict
 from gateway.core.interfaces import Control
 from gateway.core.types import ControlKind, Decision, Stage
+from gateway.judges.client import JudgeClient
 from gateway.sessions import SessionUpdate
 from gateway.telemetry import REGISTRY, ReloadResult
 
@@ -65,7 +70,7 @@ async def retry(reports: Any, approval_id: object, **arguments: Any) -> dict[str
 
 
 async def operator(stack: Any, sub: str) -> dict[str, str]:
-    return bearer(await stack.gateway.token(sub))
+    return bearer(await stack.gateway.operator_token(sub))
 
 
 async def decide(
@@ -192,21 +197,41 @@ async def test_approval_retries_do_not_trip_loop_detection(stack: Any):
 # ------------------------------------------------------------------- who decides
 
 
-async def test_an_agent_without_an_approver_role_cannot_see_or_decide(stack: Any):
+async def test_someone_without_an_approver_role_gets_no_operator_token(stack: Any):
     reports = await tainted_etl(stack)
     approval_id = await held(reports)
-    headers = await operator(stack, BARTEK)
-    listing = await stack.gateway.operator.get("/admin/approvals", headers=headers)
-    assert listing.status_code == 403
-    assert listing.json()["error"]["code"] == "operator_role_required"
-    refused = await decide(stack, BARTEK, approval_id)
-    assert (refused.status_code, refused.json()["error"]["code"]) == (
-        403,
-        "operator_role_required",
+    issued = await stack.gateway.operator.post(
+        "/auth/demo-token", json={"sub": BARTEK, "kind": "operator"}
     )
+    assert (issued.status_code, issued.json()["error"]["code"]) == (403, "not_an_operator")
     no_token = await stack.gateway.operator.get("/admin/approvals")
     assert no_token.status_code == 401
     assert await state_of(stack, approval_id) is ApprovalState.PENDING
+
+
+@pytest.mark.parametrize("sub", [BARTEK, OLGA, ROOT])
+async def test_agent_tokens_never_open_the_operator_api(stack: Any, sub: str):
+    reports = await tainted_etl(stack)
+    approval_id = await held(reports)
+    headers = bearer(await stack.gateway.token(sub))  # an agent token, even an admin's
+    listing = await stack.gateway.operator.get("/admin/approvals", headers=headers)
+    assert (listing.status_code, listing.json()["error"]["code"]) == (401, "wrong_audience")
+    path = f"/admin/approvals/{approval_id}/approve"
+    refused = await stack.gateway.operator.post(path, headers=headers)
+    assert refused.status_code == 401
+    assert await state_of(stack, approval_id) is ApprovalState.PENDING
+
+
+async def test_operator_tokens_never_open_the_agent_api(stack: Any):
+    token = await stack.gateway.operator_token(ROOT)
+    client = mcp_harness.MCPClient(stack.gateway.agent, token, "reports")
+    response = await client.initialize()
+    assert response.status_code == 401
+    assert response.json()["error"]["data"]["reason_code"] == "wrong_audience"
+    chat_reply = await stack.gateway.agent.post(
+        "/v1/chat/completions", json=chat(), headers=bearer(token)
+    )
+    assert (chat_reply.status_code, chat_reply.json()["error"]["code"]) == (401, "wrong_audience")
 
 
 async def test_admin_can_approve(stack: Any):
@@ -217,19 +242,38 @@ async def test_admin_can_approve(stack: Any):
     assert (await retry(reports, approval_id))["isError"] is False
 
 
-async def test_self_approval_is_refused(stack: Any):
-    """olga's operator token acts through databot: she may not decide databot's approvals."""
-    (reports,) = await connect_all(stack, ANNA, "reports")
+async def risky_databot_write(stack: Any, sub: str) -> tuple[Any, str]:
+    """``sub``'s databot session at risk > 0.5: an interactive write needs approval."""
+    (reports,) = await connect_all(stack, sub, "reports")
     await stack.gateway.container.sessions.apply(
         _session_of(reports.token), SessionUpdate(risk_delta=0.6), half_life_s=600
     )
-    approval_id = await held(reports)  # interactive risk > 0.5: write needs approval
-    refused = await decide(stack, OLGA, approval_id)
+    return reports, await held(reports)
+
+
+async def test_an_approver_decides_another_persons_databot_call(stack: Any):
+    """olga (ops-team) approves anna's databot write: operators are not agents."""
+    reports, approval_id = await risky_databot_write(stack, ANNA)
+    approved = await decide(stack, OLGA, approval_id)
+    assert (approved.status_code, approved.json()["decided_by"]) == (200, OLGA)
+    assert (await retry(reports, approval_id))["isError"] is False
+    assert len(stack.log.of("write_report")) == 1
+
+
+async def test_self_approval_is_refused(stack: Any):
+    """Nobody decides a call of their own session, not even an admin; anna cannot even get
+    an operator token to try."""
+    _reports, approval_id = await risky_databot_write(stack, ROOT)
+    refused = await decide(stack, ROOT, approval_id)
     assert (refused.status_code, refused.json()["error"]["code"]) == (
         403,
         "self_approval_forbidden",
     )
     assert await state_of(stack, approval_id) is ApprovalState.PENDING
+    issued = await stack.gateway.operator.post(
+        "/auth/demo-token", json={"sub": ANNA, "kind": "operator"}
+    )
+    assert (issued.status_code, issued.json()["error"]["code"]) == (403, "not_an_operator")
 
 
 async def test_a_decided_approval_cannot_be_decided_again(stack: Any):
@@ -388,7 +432,7 @@ async def test_llm_hold_answers_403_with_the_id_and_a_header_retry_runs_once(gat
     approval_id = error["approval_id"]
     assert not upstream.called
 
-    olga = bearer(await gateway.token(OLGA))
+    olga = bearer(await gateway.operator_token(OLGA))
     view = await gateway.operator.get(f"/admin/approvals/{approval_id}", headers=olga)
     assert (view.json()["channel"], view.json()["reasons"]) == ("llm", ["needs_review"])
     approve = await gateway.operator.post(f"/admin/approvals/{approval_id}/approve", headers=olga)
@@ -412,28 +456,124 @@ def _session_of(token: str) -> str:
 # ------------------------------------------------------------- intent_judge flags
 
 
-async def test_an_intent_flagged_mcp_call_goes_through_the_same_queue(stack: Any):
+@pytest.fixture
+async def judged_stack(tmp_path: Path) -> AsyncIterator[Any]:
+    """The MCP stack with the real `JudgeClient` (the testkit's default is a fake one)."""
+    async with upstreams.running_upstreams() as (transport, log):
+        pin_kit.write_pins(tmp_path / "pins", await pin_kit.capture_pins(transport))
+        async with running_gateway(tmp_path, transport=transport, judge_factory=JudgeClient) as gw:
+            yield mcp_harness.MCPStack(gw, transport, log)
+
+
+async def test_an_intent_flagged_mcp_call_goes_through_the_same_queue(judged_stack: Any):
     """The LLM answer is released; the flagged tool_call's MCP call is held (intent_flagged),
     approved, and the retry with the id runs it once."""
     judges = importlib.import_module("test_judges")  # tests/mcp: the scripted judge upstream
     llm = judges.ScriptedLLM()
-    judges.llm_route(stack, llm)
-    judges.enable_judges(stack.gateway, intent_judge={"risk_delta": 0.2})
+    judges.llm_route(judged_stack, llm)
+    judges.enable_judges(judged_stack.gateway, intent_judge={"risk_delta": 0.2})
     llm.aligned = lambda _call: False
     llm.agent_answer = completion(None, tool_calls=[judges.tool_call("query", {"sql": ORDERS})])
-    (db,) = await connect_all(stack, ETL, "sales_db")
-    assert (await judges.ask(stack.gateway, db.token)).status_code == 200
+    (db,) = await connect_all(judged_stack, ETL, "sales_db")
+    assert (await judges.ask(judged_stack.gateway, db.token)).status_code == 200
 
     first = await db.call("query", sql=ORDERS)
     assert error_text(first).startswith("approval_required"), first
     approval_id = first["_meta"][META]
-    olga = await operator(stack, OLGA)
-    view = await stack.gateway.operator.get(f"/admin/approvals/{approval_id}", headers=olga)
+    olga = await operator(judged_stack, OLGA)
+    view = await judged_stack.gateway.operator.get(f"/admin/approvals/{approval_id}", headers=olga)
     assert "intent_flagged" in view.json()["reasons"]
-    assert (await decide(stack, OLGA, approval_id)).status_code == 200
+    assert (await decide(judged_stack, OLGA, approval_id)).status_code == 200
 
     params = {"name": "query", "arguments": {"sql": ORDERS}, "_meta": {META: approval_id}}
     done = (await db.request("tools/call", params)).json()["result"]
     assert done["isError"] is False, done
-    assert len(stack.log.of("query")) == 1
+    assert len(judged_stack.log.of("query")) == 1
+    assert await state_of(judged_stack, approval_id) is ApprovalState.SUCCEEDED
+
+
+# ------------------------------------------------------------ review regressions
+
+
+async def test_a_changed_resource_mapping_needs_a_new_approval(stack: Any):
+    """Same arguments, but a reload maps them to another resource: the approval named the
+    old (action, resource) set, so it neither runs nor is consumed."""
+    reports = await tainted_etl(stack)
+    approval_id = await held(reports)
+    assert (await decide(stack, OLGA, approval_id)).status_code == 200
+
+    document = yaml.safe_load(stack.gateway.policy_path.read_text())
+    tool = document["upstreams"]["mcp"]["reports"]["tools"]["write_report"]
+    tool["resource"] = "fs:archive/{name}"
+    document["agents"]["nightly_etl"]["allow"].append("write:fs:archive/*")
+    stack.gateway.policy_path.write_text(yaml.safe_dump(document))
+    assert stack.gateway.container.policy_store.reload().result is ReloadResult.OK
+
+    assert error_text(await retry(reports, approval_id)) == "approval_mismatch"
+    assert stack.log.of("write_report") == []
+    assert await state_of(stack, approval_id) is ApprovalState.APPROVED
+    fresh = await held(reports)  # without the id: a new approval for the new resource
+    assert fresh != approval_id
+    view = await stack.gateway.operator.get(
+        f"/admin/approvals/{fresh}", headers=await operator(stack, OLGA)
+    )
+    assert view.json()["resources"] == ["fs:archive/nightly.md"]
+
+
+async def test_a_kill_landing_during_consumption_stops_the_dispatch(
+    stack: Any, monkeypatch: pytest.MonkeyPatch
+):
+    reports = await tainted_etl(stack)
+    approval_id = await held(reports)
+    assert (await decide(stack, OLGA, approval_id)).status_code == 200
+    oversight = stack.gateway.container.oversight
+    begin = oversight.approvals.begin
+
+    async def kill_while_consuming(consumed_id: str) -> Any:
+        record = await begin(consumed_id)
+        killed = KillRecord(agent="nightly_etl", killed_by=ROOT, killed_at=stack.gateway.clock())
+        await oversight.kill_switch.kill(killed)
+        return record
+
+    monkeypatch.setattr(oversight.approvals, "begin", kill_while_consuming)
+    assert error_text(await retry(reports, approval_id)) == "agent_killed"
+    assert stack.log.of("write_report") == []
+    assert stack.transport.tool_calls("mcp-files", "write_report") == []
+    record = await oversight.approvals.get(approval_id)
+    assert (record.state, record.outcome) == (ApprovalState.DENIED, "agent_killed")
+
+
+async def test_a_redacted_write_is_held_approved_and_runs_redacted(stack: Any):
+    """pii redacts the write (a rewrite), taint holds it: the approval binds the redacted
+    operation, and the approved retry is not refused as an unauthorized rewrite."""
+    reports = await tainted_etl(stack)
+    content = "Escalations go to ops.lead@example.com tonight."
+    approval_id = await held(reports, content=content)
+    assert (await decide(stack, OLGA, approval_id)).status_code == 200
+
+    done = await retry(reports, approval_id, content=content)
+    assert done["isError"] is False, done
+    (call,) = stack.log.of("write_report")
+    assert "ops.lead@example.com" not in call.arguments["content"]  # it ran redacted
     assert await state_of(stack, approval_id) is ApprovalState.SUCCEEDED
+
+
+async def test_an_approval_stuck_executing_becomes_uncertain(stack: Any):
+    """A gateway died between consuming an approval and recording the outcome: the sweep
+    marks it uncertain after upstream_timeout_s + slack, and it never runs again."""
+    reports = await tainted_etl(stack)
+    approval_id = await held(reports)
+    assert (await decide(stack, OLGA, approval_id)).status_code == 200
+    container = stack.gateway.container
+    await container.oversight.approvals.begin(approval_id)  # ... and then the crash
+
+    timeout_s = container.policy_store.current.policy.limits.upstream_timeout_s
+    stack.gateway.clock.advance(timeout_s)
+    await sweep_once(container.oversight, lambda: container.policy_store.current)
+    assert await state_of(stack, approval_id) is ApprovalState.EXECUTING  # could still be live
+    stack.gateway.clock.advance(STUCK_SLACK_S)
+    await sweep_once(container.oversight, lambda: container.policy_store.current)
+    record = await container.oversight.approvals.get(approval_id)
+    assert (record.state, record.outcome) == (ApprovalState.UNCERTAIN, "outcome_lost")
+    assert error_text(await retry(reports, approval_id)) == "approval_outcome_uncertain"
+    assert stack.log.of("write_report") == []

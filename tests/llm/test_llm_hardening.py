@@ -186,7 +186,7 @@ async def test_interactive_sessions_are_never_throttled(gateway, upstream):
 
 @pytest.mark.parametrize("how", ["deleted", "idle"])
 async def test_retired_tainted_session_never_comes_back_clean(gateway, upstream, how):
-    token = await gateway.token("anna@demo", session_id="s-tainted")
+    token = sign(claims(gateway.clock, session_id="s-tainted"))
     await gateway.agent.post(CHAT, json=chat(), headers=bearer(token))
     await gateway.container.sessions.apply(
         "s-tainted", SessionUpdate(risk_delta=0.4, taint=True), half_life_s=600
@@ -197,14 +197,16 @@ async def test_retired_tainted_session_never_comes_back_clean(gateway, upstream,
         gateway.clock.advance(3600)  # sessions.idle_ttl_s
     gateway.clock.advance(86400 + 3600 + 1)  # past max_lifetime_s and any token lifetime
 
-    late = sign(claims(gateway.clock, session_id="s-tainted"))  # valid, freshly issued
+    # Signed with the key but naming the old id with a new creation time: refused by the store.
+    late = sign(claims(gateway.clock, session_id="s-tainted"))
     response = await gateway.agent.post(CHAT, json=chat(), headers=bearer(late))
     assert (response.status_code, response.json()["error"]["code"]) == (401, "session_ended")
     assert await gateway.container.sessions.get("s-tainted") is None
+    # The demo issuer never lets a caller name a session at all.
     reissue = await gateway.operator.post(
         "/auth/demo-token", json={"sub": "anna@demo", "session_id": "s-tainted"}
     )
-    assert (reissue.status_code, reissue.json()["error"]["code"]) == (409, "session_ended")
+    assert reissue.status_code == 422
     assert upstream.call_count == 1
 
 

@@ -438,8 +438,9 @@ class Judges(FrozenModel):
     Judges call ``upstreams.llm`` directly with ``model``: they are not agent calls, so the
     model needs no grant and no ``pricing`` entry, and judge tokens are never charged to an
     agent's budget. Without this section the judge-backed controls are off (``intent_judge``
-    and ``output_policy`` allow with ``judge_not_configured``); with it, a judge that cannot
-    answer in time fails its control closed.
+    and ``output_policy`` allow with ``judge_not_configured``), and configuring any of them
+    explicitly (or ``prompt_injection.judge_band``) is a validation error. With it, a judge
+    that cannot answer in time fails its control closed.
     """
 
     model: ModelName
@@ -540,6 +541,31 @@ class Policy(FrozenModel):
             elif any(p.startswith(SERVICE_PRINCIPAL_PREFIX) for p in principals):
                 msg = f"interactive agent {agent_id!r} cannot list service principals"
                 raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _judge_controls_have_a_judge(self) -> Self:
+        """A judge-backed control configured explicitly needs ``judges:``: the operator asked
+        for it, and silently running it off (or failing closed on every call) would be a
+        misconfiguration either way. Left out of ``controls`` with no ``judges:``, the judge
+        controls are off (``judge_not_configured``)."""
+        if self.judges is not None:
+            return self
+        controls = self.controls
+        configured = [
+            name
+            for name, config in (
+                ("intent_judge", controls.intent_judge),
+                ("output_policy", controls.output_policy),
+            )
+            if config is not None
+        ]
+        injection = controls.prompt_injection
+        if injection is not None and "judge_band" in injection.model_fields_set:
+            configured.append("prompt_injection.judge_band")
+        if configured:
+            msg = f"{configured} need an LLM judge: add a `judges:` section (judges.model)"
+            raise ValueError(msg)
         return self
 
     @model_validator(mode="after")

@@ -18,9 +18,11 @@ from typing import Any
 import httpx
 import jwt
 from injection_kit import MarkerClassifier
+from judge_kit import FakeJudgeClient
 
 from gateway.container import GatewayContainer
 from gateway.injection.classifier import InjectionClassifier
+from gateway.judges.client import JudgeFactory
 from gateway.main import create_agent_app, create_operator_app
 from gateway.settings import Settings
 
@@ -75,6 +77,7 @@ def claims(clock: MutableClock, **overrides: Any) -> dict[str, Any]:
         "session_id": "s-test-1",
         "iat": now,
         "exp": now + 600,
+        "sid_iat": now,  # the session id was minted with this token
     }
     payload.update(overrides)
     return {k: v for k, v in payload.items() if v is not None}
@@ -152,6 +155,10 @@ class Harness:
         assert response.status_code == 200, response.text
         return response.json()["access_token"]
 
+    async def operator_token(self, sub: str) -> str:
+        """An operator token (``/admin/*``): no agent, no session."""
+        return await self.token(sub, kind="operator")
+
     def audit_entries(self) -> list[dict[str, Any]]:
         return [json.loads(line) for line in self.audit.getvalue().splitlines() if line]
 
@@ -162,10 +169,13 @@ async def running_gateway(
     *,
     transport: httpx.AsyncBaseTransport | None = None,
     classifier: InjectionClassifier | None = None,
+    judge_factory: JudgeFactory = FakeJudgeClient,
     **settings: Any,
 ) -> AsyncIterator[Harness]:
     """``transport`` carries every upstream call (LLM and MCP) when given. ``classifier`` is
-    the prompt-injection classifier (default: `MarkerClassifier`, never the real model)."""
+    the prompt-injection classifier (default: `MarkerClassifier`, never the real model).
+    ``judge_factory`` builds the LLM judge (default: the deterministic `FakeJudgeClient`;
+    ``JudgeClient`` for the real one over ``transport``)."""
     policy_path = tmp_path / "policy.yaml"
     shutil.copy(ROOT_POLICY, policy_path)
     shutil.copytree(FEEDS, tmp_path / FEEDS.name, dirs_exist_ok=True)
@@ -179,6 +189,7 @@ async def running_gateway(
         env={},
         transport=transport,
         classifier=classifier if classifier is not None else MarkerClassifier(),
+        judge_factory=judge_factory,
     )
     agent_app, operator_app = create_agent_app(container), create_operator_app(container)
     async with (

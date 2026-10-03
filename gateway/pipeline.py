@@ -31,7 +31,7 @@ from typing import Any, Final, Literal, cast
 from pydantic import Field
 
 from gateway.approvals.kill_switch import KillSwitchUnavailableError
-from gateway.approvals.model import Approval, ApprovalState
+from gateway.approvals.model import Approval
 from gateway.approvals.oversight import (
     AGENT_KILLED,
     APPROVAL,
@@ -94,6 +94,7 @@ AUTHZ: Final = "authz"
 BUDGET: Final = "budget"  # a pipeline seam, not a registered control: see _execute_metered
 INTENT_JUDGE: Final = "intent_judge"
 INTENT_FLAGGED: Final = "intent_flagged"  # an MCP call matching a flagged tool_call
+INTENT_FLAGS_OVERFLOW: Final = "intent_flags_overflow"  # more flags than a session keeps
 # Controls whose detections mean untrusted content reached the agent's context.
 TAINTING_CONTROLS: Final = frozenset({"prompt_injection"})
 REWRITE_UNAUTHORIZED: Final = "rewrite_unauthorized"
@@ -499,9 +500,9 @@ class Pipeline:
         merged = merge_verdicts(trace.verdicts())
         if merged.decision is Decision.BLOCK:
             return self._outcome(trace, merged)
-        if merged.requires_approval and not self._approval_covers(trace):
-            return await self._hold_for_approval(trace, merged)
         payload = _final(original, [s.interaction.payload for s in trace.steps], merged)
+        if merged.requires_approval and not self._approval_covers(trace, payload):
+            return await self._hold_for_approval(trace, merged, payload)
         sealed = await self._seal(trace, payload)
         if isinstance(sealed, PipelineOutcome):
             return sealed
@@ -592,6 +593,11 @@ class Pipeline:
                 for step in trace.steps:
                     step.add(Stage.PRE, [changed])
                 return self._outcome(trace, merge_verdicts(trace.verdicts()))
+        # The session lease must still be this call's, and the session stays fenced for other
+        # gateways until this call persists its outcome (raises 503 session_lease_lost).
+        await self._gate.sessions.before_dispatch(
+            call.claims.session_id, upstream_timeout_s=snapshot.policy.limits.upstream_timeout_s
+        )
         if (stopped := await self._before_dispatch(trace)) is not None:
             return stopped
         trace.dispatched = payload
@@ -669,6 +675,7 @@ class Pipeline:
             step
             for step in (self._authorize(snapshot, call, i) for i in rewritten)
             if step.access.decision is not Decision.ALLOW
+            and not self._approved_rewrite(trace, step)
         ]
         if rewritten and not refusals:
             trace.executed = rewritten
@@ -689,23 +696,42 @@ class Pipeline:
             trace, merge_verdicts(trace.verdicts()), reason_code=REWRITE_UNAUTHORIZED
         )
 
+    @staticmethod
+    def _approved_rewrite(trace: _Trace, step: _Step) -> bool:
+        """A rewritten interaction whose only obligation is the approval this call already
+        satisfies (same ``action:resource`` the approval names). Base-authorization denials
+        and session removals are never covered."""
+        approval = trace.approval
+        interaction = step.interaction
+        return (
+            trace.approval_covered
+            and approval is not None
+            and step.access.decision is Decision.REQUIRE_APPROVAL
+            and f"{interaction.action.value}:{interaction.resource}" in approval.binding.operations
+        )
+
     def _check_flags(self, trace: _Trace, call: _Admitted) -> None:
         """An MCP ``tools/call`` matching a ``tool_call`` the intent judge flagged in this
         session needs approval, through the normal MCP approval flow (SPEC "Intent vs
         enforcement"). Matched on the agent's own arguments and on the adapter's canonical
-        form, so neither spelling slips past. Honoured while ``intent_judge`` enforces."""
-        if trace.call.channel is not Channel.MCP or not call.ctx.flagged_tool_calls:
+        form, so neither spelling slips past. Once the session kept fewer flags than were raised
+        (``flags_overflowed``), every MCP call needs approval. Honoured while ``intent_judge``
+        enforces."""
+        if trace.call.channel is not Channel.MCP:
             return
-        candidates = mcp_flag_candidates(
+        if call.ctx.flags_overflowed:  # evicted flags could be this call's: hold every call
+            reason = INTENT_FLAGS_OVERFLOW
+        elif call.ctx.flagged_tool_calls and not mcp_flag_candidates(
             _parse_json_object(trace.call.body), *(step.original_payload for step in trace.steps)
-        )
-        if candidates.isdisjoint(call.ctx.flagged_tool_calls):
+        ).isdisjoint(call.ctx.flagged_tool_calls):
+            reason = INTENT_FLAGGED
+        else:
             return
         mode = trace.snapshot.policy.resolved_control_mode(INTENT_JUDGE)
         verdict = Verdict(
             decision=Decision.REQUIRE_APPROVAL,
             control_id=INTENT_JUDGE,
-            reason_code=INTENT_FLAGGED,
+            reason_code=reason,
             enforced=mode is not ControlMode.LOG_ONLY,
         )
         for step in trace.steps:
@@ -755,8 +781,8 @@ class Pipeline:
         merged = merge_verdicts(trace.verdicts())
         if merged.decision is Decision.BLOCK:
             return self._outcome(trace, merged)
-        if merged.requires_approval and not self._approval_covers(trace):
-            return await self._hold_for_approval(trace, merged)
+        if merged.requires_approval and not self._approval_covers(trace, payload):
+            return await self._hold_for_approval(trace, merged, payload)
         sealed = _final(payload, candidates, MergedVerdict(decision=Decision.ALLOW))  # no spans
         last = sealing[-1]
         canonical = _canonical_bytes(sealed)
@@ -825,7 +851,11 @@ class Pipeline:
         if approval_id is None:
             return
         binding = self._oversight.binding(
-            claims, trace.call.channel, trace.call.server, interactions[0].payload
+            claims,
+            trace.call.channel,
+            trace.call.server,
+            interactions[0].payload,
+            ((i.action, i.resource) for i in interactions),
         )
         presented = await self._oversight.presented(approval_id, binding)
         if isinstance(presented, ApprovalRefusal):
@@ -845,11 +875,12 @@ class Pipeline:
             return self._stop(trace, APPROVAL, trace.approval_refusal)
         return None
 
-    def _approval_covers(self, trace: _Trace) -> bool:
-        """An approved record bound to this call satisfies the approval obligation (only
-        that one: every other verdict still applies)."""
-        approval = trace.approval
-        trace.approval_covered = approval is not None and approval.state is ApprovalState.APPROVED
+    def _approval_covers(self, trace: _Trace, payload: object) -> bool:
+        """An approved record bound to this call and held for exactly this final payload
+        (after rewrites and redactions) satisfies the approval obligation (only that one:
+        every other verdict still applies)."""
+        digest = self._oversight.operation_digest(payload)
+        trace.approval_covered = self._oversight.covers(trace.approval, digest)
         return trace.approval_covered
 
     async def _kill_check(self, trace: _Trace) -> PipelineOutcome | None:
@@ -866,16 +897,26 @@ class Pipeline:
         return self._stop(trace, KILL_SWITCH, AGENT_KILLED)
 
     async def _before_dispatch(self, trace: _Trace) -> PipelineOutcome | None:
-        """Right before the upstream: the kill switch again, then consume a presented
-        approval (``approved → executing``, atomically: at most one dispatch per approval)."""
+        """Right before the upstream: the kill switch, then consume a presented approval
+        (``approved → executing``, atomically: at most one dispatch per approval), then the
+        kill switch once more, because consuming awaits the store and a kill may land
+        meanwhile. Nothing else awaits between that last check and the dispatch."""
         if (stopped := await self._kill_check(trace)) is not None:
             return stopped
         approval = trace.approval
-        if approval is None or approval.state is not ApprovalState.APPROVED:
+        if not trace.approval_covered or approval is None:
             return None
         consumed = await self._oversight.consume(approval)
         if isinstance(consumed, ApprovalRefusal):
             return self._stop(trace, APPROVAL, consumed)
+        try:
+            stopped = await self._kill_check(trace)
+        except KillSwitchUnavailableError as exc:
+            await self._oversight.abandon(consumed, exc.reason_code)
+            raise
+        if stopped is not None:  # consumed, never dispatched: closed for good
+            await self._oversight.abandon(consumed, AGENT_KILLED)
+            return stopped
         trace.consumed = consumed
         return None
 
@@ -909,20 +950,28 @@ class Pipeline:
             [v for v in merged.verdicts if v.decision is not Decision.REQUIRE_APPROVAL]
         )
 
-    async def _hold_for_approval(self, trace: _Trace, merged: MergedVerdict) -> PipelineOutcome:
+    async def _hold_for_approval(
+        self, trace: _Trace, merged: MergedVerdict, payload: object
+    ) -> PipelineOutcome:
         """The approval queue (SPEC "Human in the loop"): create or get the pending record of
-        this exact operation and answer with its id. A retry of the same pending operation
-        gets the same id; nothing executes until an operator approves and the agent retries
-        with the id."""
+        this exact operation and answer with its id. The record binds what the agent sent,
+        every normalized ``action:resource`` and the final ``payload`` (after rewrites and
+        redactions). A retry of the same pending operation gets the same id; nothing executes
+        until an operator approves and the agent retries with the id."""
         claims = trace.claims
         binding = (
             self._oversight.binding(
-                claims, trace.call.channel, trace.call.server, trace.steps[0].original_payload
+                claims,
+                trace.call.channel,
+                trace.call.server,
+                trace.steps[0].original_payload,
+                ((step.interaction.action, step.interaction.resource) for step in trace.steps),
             )
             if claims is not None and trace.steps
             else None
         )
-        if binding is None:  # no canonical form to bind an approval to: nothing to approve
+        operation_digest = self._oversight.operation_digest(payload)
+        if binding is None or operation_digest is None:  # nothing canonical to bind to
             return self._stop(trace, APPROVAL, ApprovalRefusal.UNBINDABLE)
         reasons = tuple(
             v.reason_code
@@ -932,6 +981,7 @@ class Pipeline:
         record = await self._oversight.hold(
             binding,
             trace.snapshot,
+            operation_digest=operation_digest,
             actions=tuple(step.interaction.action for step in trace.steps),
             resources=tuple(step.interaction.resource for step in trace.steps),
             reasons=reasons,

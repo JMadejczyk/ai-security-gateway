@@ -11,7 +11,7 @@ from datetime import timedelta
 
 import jwt
 import pytest
-from gateway_testkit import INTERNAL_KEY, bearer, running_gateway
+from gateway_testkit import INTERNAL_KEY, bearer, claims, running_gateway, sign
 from mcp_harness import PROTOCOL, MCPClient, MCPStack, connect, connect_all, error_text
 from upstreams import RoutingTransport, running_upstreams
 
@@ -424,7 +424,7 @@ async def test_unreachable_upstream_is_a_generic_error(stack: MCPStack, tmp_path
     policy.write_text(policy.read_text().replace("mcp-fetch:8000", "mcp-gone:8000"))
     assert (
         await stack.gateway.operator.post(
-            "/admin/reload", headers=bearer(await stack.gateway.token("root@demo"))
+            "/admin/reload", headers=bearer(await stack.gateway.operator_token("root@demo"))
         )
     ).status_code == 200
     web = await connect(stack, ANNA, "web")
@@ -468,7 +468,7 @@ async def test_fetch_receives_the_canonical_url_it_was_authorized_for(stack: MCP
 
 async def frozen_session(stack: MCPStack, update: SessionUpdate) -> MCPClient:
     """anna on sales_db in session ``s-frozen``, with ``update`` applied to that session."""
-    token = await stack.gateway.token(ANNA, session_id="s-frozen")
+    token = sign(claims(stack.gateway.clock, session_id="s-frozen"))
     sales = MCPClient(stack.gateway.agent, token, "sales_db")
     assert (await sales.initialize()).status_code == 200
     await stack.gateway.container.sessions.apply("s-frozen", update, half_life_s=600)

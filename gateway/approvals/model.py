@@ -11,12 +11,19 @@ States and the only allowed moves::
        │                    │
        ├──deny──▶ denied ◀──┤ (deny revokes an unused approval; a kill switch does the same)
        └─timeout▶ expired ◀─┘
+                    denied ◀── executing (a kill landed after consumption, before dispatch:
+                                          the call never ran)
 
 ``uncertain`` means the upstream outcome is unknown (timeout or lost connection after the
 request was sent): it is terminal and never retried automatically.
+
+A kill switch revokes an agent's unused approvals by bumping the agent's revocation
+generation: every record carries the generation it was created under, and a pending or
+approved record whose generation is stale lapses to ``denied`` (outcome ``agent_killed``)
+atomically wherever it is next read or moved, however many records there are.
 """
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
@@ -54,7 +61,12 @@ TRANSITIONS: Final[Mapping[ApprovalState, frozenset[ApprovalState]]] = MappingPr
             {ApprovalState.EXECUTING, ApprovalState.DENIED, ApprovalState.EXPIRED}
         ),
         ApprovalState.EXECUTING: frozenset(
-            {ApprovalState.SUCCEEDED, ApprovalState.FAILED, ApprovalState.UNCERTAIN}
+            {
+                ApprovalState.SUCCEEDED,
+                ApprovalState.FAILED,
+                ApprovalState.UNCERTAIN,
+                ApprovalState.DENIED,  # stopped between consumption and dispatch
+            }
         ),
         ApprovalState.DENIED: frozenset(),
         ApprovalState.EXPIRED: frozenset(),
@@ -73,6 +85,11 @@ OPEN_STATES: Final = frozenset(
 EXPIRING_STATES: Final = frozenset({ApprovalState.PENDING, ApprovalState.APPROVED})
 
 
+def operations_of(pairs: Iterable[tuple[Action, str]]) -> tuple[str, ...]:
+    """The sorted, unique ``action:resource`` set of a call's interactions."""
+    return tuple(sorted({f"{action.value}:{resource}" for action, resource in pairs}))
+
+
 def sources_of(target: ApprovalState) -> frozenset[ApprovalState]:
     """Every state from which ``target`` may be reached."""
     return frozenset(state for state, targets in TRANSITIONS.items() if target in targets)
@@ -87,7 +104,11 @@ class ApprovalBinding(FrozenModel):
     channel: Channel
     server: str | None = None  # MCP upstream; None on the LLM channel
     tool: str | None = None  # MCP tool name; None on the LLM channel
-    args_digest: str  # keyed HMAC of the canonical (sorted-key JSON) payload
+    args_digest: str  # keyed HMAC of the canonical (sorted-key JSON) payload the agent sent
+    # Every normalized `action:resource` of the call's interactions, sorted: the same
+    # arguments normalized under another policy (a changed resource template) are another
+    # operation.
+    operations: tuple[str, ...] = ()
 
 
 class ApprovalDraft(FrozenModel):
@@ -95,6 +116,9 @@ class ApprovalDraft(FrozenModel):
 
     operation: str  # keyed digest of the binding: one slot per exact operation
     binding: ApprovalBinding
+    # Keyed HMAC of the final payload after every rewrite and redaction (before sealing,
+    # which is deterministic and checked again at dispatch): what an approval lets run.
+    operation_digest: str
     policy_revision: str  # the revision the hold was decided under
     actions: tuple[Action, ...] = ()
     resources: tuple[str, ...] = ()
@@ -114,6 +138,7 @@ class Approval(ApprovalDraft):
     decided_at: AwareDatetime | None = None
     note: Note | None = None
     outcome: str | None = None  # reason code: why it ended (upstream_timeout, agent_killed...)
+    generation: int = 0  # the agent's revocation generation when the record was created
 
     def expired_at(self, now: datetime) -> bool:
         """True when the record has run out but has not been moved to ``expired`` yet."""
@@ -132,10 +157,13 @@ class Transition(FrozenModel):
     note: Note | None = None
     outcome: str | None = None
     expires_at: AwareDatetime | None = None  # a new deadline (set when approving)
+    # Narrows the legal sources (an operator's deny never touches a record being executed).
+    only_from: frozenset[ApprovalState] | None = None
 
     @property
     def sources(self) -> frozenset[ApprovalState]:
-        return sources_of(self.target)
+        legal = sources_of(self.target)
+        return legal if self.only_from is None else legal & self.only_from
 
 
 class ApprovalConflictError(Exception):

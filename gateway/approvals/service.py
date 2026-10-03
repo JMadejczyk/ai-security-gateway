@@ -32,7 +32,7 @@ from gateway.approvals.model import (
     Transition,
 )
 from gateway.approvals.operators import OperatorAccess
-from gateway.approvals.store import ApprovalStore, ApprovalStoreUnavailableError
+from gateway.approvals.store import AGENT_REVOKED, ApprovalStore, ApprovalStoreUnavailableError
 from gateway.canonical import canonical_digest
 from gateway.clock import Clock, utc_now
 from gateway.core.types import Action
@@ -93,11 +93,12 @@ class ApprovalService:
 
     # ------------------------------------------------------------------------ queue
 
-    async def hold(
+    async def hold(  # noqa: PLR0913 -- the facts of one held operation
         self,
         binding: ApprovalBinding,
         snapshot: PolicySnapshot,
         *,
+        operation_digest: str,
         actions: Sequence[Action],
         resources: Sequence[str],
         reasons: Sequence[str],
@@ -109,6 +110,7 @@ class ApprovalService:
         draft = ApprovalDraft(
             operation=self.operation_of(binding),
             binding=binding,
+            operation_digest=operation_digest,
             policy_revision=snapshot.revision,
             actions=tuple(dict.fromkeys(actions)),
             resources=tuple(dict.fromkeys(resources)),
@@ -128,10 +130,14 @@ class ApprovalService:
         return record
 
     async def get(self, approval_id: str) -> Approval | None:
-        """The record, expired first if its deadline has passed."""
-        record = await self._store.get(approval_id)
-        if record is not None and record.expired_at(self._clock()):
-            return await self._expire(record.id) or record
+        """The record, lapsed first (deadline passed: expired; agent revoked: denied)."""
+        before = await self._store.get(approval_id)
+        if before is None:
+            return None
+        record = await self._store.settle(approval_id, self._clock())
+        if record is not None and record.state is not before.state:
+            record_approval_state(record.state)
+            await self.refresh_pending_gauge()
         return record
 
     async def list_for(
@@ -164,8 +170,13 @@ class ApprovalService:
         record = await self.view(approval_id, operator)
         operator.require_decider(record)
         target = ApprovalState.APPROVED if approve else ApprovalState.DENIED
-        allowed = record.state is ApprovalState.PENDING if approve else record.can_become(target)
-        if not allowed:
+        # An operator approves a pending record, or denies (revokes) one not yet in use.
+        only_from = (
+            frozenset({ApprovalState.PENDING})
+            if approve
+            else frozenset({ApprovalState.PENDING, ApprovalState.APPROVED})
+        )
+        if record.state not in only_from:
             raise ApprovalStateError(record.state)
         now = self._clock()
         change = Transition(
@@ -177,6 +188,7 @@ class ApprovalService:
                 now + timedelta(seconds=snapshot.policy.approvals.timeout_s) if approve else None
             ),
             outcome=None if approve else "operator_denied",
+            only_from=only_from,
         )
         try:  # approving applies only from pending: two approvers cannot both succeed
             decided = await self._apply(record.id, change)
@@ -198,9 +210,30 @@ class ApprovalService:
 
     async def begin(self, approval_id: str) -> Approval:
         """Consume an approval: ``approved → executing``, atomically; raises
-        `ApprovalConflictError` when it is no longer approved (used, denied, expired)."""
+        `ApprovalConflictError` when it is no longer approved (used, denied, expired, revoked).
+
+        One store round trip and nothing else: the pipeline re-checks the kill switch right
+        after this and dispatches immediately, so no gauge refresh sits in that window (the
+        pending count does not change on this move anyway)."""
         change = Transition(target=ApprovalState.EXECUTING, at=self._clock())
-        return await self._apply(approval_id, change)
+        record = await self._store.transition(approval_id, change)
+        record_approval_state(ApprovalState.EXECUTING)
+        return record
+
+    async def abandon(self, approval_id: str, outcome: str) -> None:
+        """A consumed approval that was stopped before dispatch: ``executing → denied``.
+        The call never ran, and the approval can never run it."""
+        change = Transition(
+            target=ApprovalState.DENIED,
+            at=self._clock(),
+            outcome=outcome,
+            only_from=frozenset({ApprovalState.EXECUTING}),
+        )
+        try:
+            await self._apply(approval_id, change)
+        except (ApprovalConflictError, ApprovalStoreUnavailableError) as exc:
+            # Left `executing`: it never dispatches again and the stuck sweep closes it.
+            logger.warning("approval %s: not closed (%s)", approval_id, type(exc).__name__)
 
     async def finish(self, approval_id: str, state: ApprovalState, outcome: str) -> None:
         """Record the upstream outcome of a consumed approval (best effort: the call has
@@ -213,22 +246,49 @@ class ApprovalService:
                 "approval %s: outcome %s not recorded (%s)", approval_id, state, type(exc).__name__
             )
 
-    async def revoke_agent(self, agent: str, *, by: str) -> int:
-        """Deny every unused approval of a killed agent; returns how many."""
-        open_states = frozenset({ApprovalState.PENDING, ApprovalState.APPROVED})
+    async def revoke_agent(self, agent: str) -> int:
+        """Make every unused approval of a killed agent unusable; returns how many were
+        denied right away.
+
+        Correctness rests on the revocation generation alone (one atomic increment): every
+        pending or approved record of the agent, however many, lapses to ``denied`` the next
+        time it is read, decided or consumed. The pass over the open records that follows
+        only makes that visible now (listings, ``acl_approvals_pending``); it is unbounded,
+        and a record it misses is still refused."""
+        await self._store.revoke_agent(agent)
         revoked = 0
-        for record in await self._store.records(open_states):
-            if record.binding.agent != agent:
-                continue
+        now = self._clock()
+        for approval_id in await self._store.open_ids():
+            settled = await self._store.settle(approval_id, now)
+            if (
+                settled is not None
+                and settled.binding.agent == agent
+                and settled.state is ApprovalState.DENIED
+                and settled.outcome == AGENT_REVOKED
+            ):
+                record_approval_state(ApprovalState.DENIED)
+                revoked += 1
+        await self.refresh_pending_gauge()
+        return revoked
+
+    async def close_stuck(self, older_than_s: float) -> int:
+        """Approvals ``executing`` longer than any call can take lost their outcome (a
+        gateway that died mid-call): ``uncertain``, never run again."""
+        since = self._clock() - timedelta(seconds=older_than_s)
+        closed = 0
+        for approval_id in await self._store.stuck(since):
             change = Transition(
-                target=ApprovalState.DENIED, at=self._clock(), decided_by=by, outcome="agent_killed"
+                target=ApprovalState.UNCERTAIN,
+                at=self._clock(),
+                outcome="outcome_lost",
+                only_from=frozenset({ApprovalState.EXECUTING}),
             )
             try:
-                await self._apply(record.id, change)
+                await self._apply(approval_id, change)
             except ApprovalConflictError:
-                continue  # decided, consumed or expired meanwhile
-            revoked += 1
-        return revoked
+                continue  # its call finished meanwhile
+            closed += 1
+        return closed
 
     async def expire_due(self) -> int:
         """Move every pending or approved record past its deadline to ``expired``."""

@@ -263,13 +263,13 @@ async def test_deleted_session_cannot_be_reused(gateway, upstream_ok):
     assert ended.json()["ended"] is True
     again = await gateway.agent.post(CHAT, json=chat(), headers=bearer(token))
     assert (again.status_code, again.json()["error"]["code"]) == (401, "session_ended")
-    # The demo issuer will not name the ended session again, and a validly signed token
-    # naming it is refused too.
+    # The demo issuer never names a caller-chosen session, and a validly signed token naming
+    # the ended one is refused too.
     session_id = ended.json()["session_id"]
     reissue = await gateway.operator.post(
         "/auth/demo-token", json={"sub": "anna@demo", "session_id": session_id}
     )
-    assert (reissue.status_code, reissue.json()["error"]["code"]) == (409, "session_ended")
+    assert reissue.status_code == 422
     refreshed = sign(claims(gateway.clock, session_id=session_id))
     reuse = await gateway.agent.post(CHAT, json=chat(), headers=bearer(refreshed))
     assert reuse.json()["error"]["code"] == "session_ended"
@@ -277,8 +277,8 @@ async def test_deleted_session_cannot_be_reused(gateway, upstream_ok):
 
 
 async def test_session_reuse_by_another_principal_is_refused(gateway, upstream_ok):
-    anna = await gateway.token("anna@demo", session_id="s-shared")
-    bartek = await gateway.token("bartek@demo", session_id="s-shared")
+    anna = sign(claims(gateway.clock, session_id="s-shared"))
+    bartek = sign(claims(gateway.clock, sub="bartek@demo", roles=["intern"], session_id="s-shared"))
     assert (await gateway.agent.post(CHAT, json=chat(), headers=bearer(anna))).status_code == 200
     stolen = await gateway.agent.post(CHAT, json=chat(), headers=bearer(bartek))
     assert (stolen.status_code, stolen.json()["error"]["code"]) == (

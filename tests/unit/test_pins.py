@@ -4,11 +4,13 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+import fakeredis
 import pytest
 from pydantic import ValidationError
 
 from gateway.cli.pin import render
 from gateway.controls.tool_pinning import PinStatus, ToolPinningControl, listing_scope
+from gateway.controls.tool_quarantine import InMemoryToolQuarantine, RedisToolQuarantine
 from gateway.core.envelope import Interaction
 from gateway.core.interfaces import ControlConfig
 from gateway.core.types import Action, Channel, ControlMode, Decision, SessionMode, Stage
@@ -204,7 +206,7 @@ def test_rendered_diff_is_reviewable():
 @pytest.fixture
 def pinning(tmp_path: Path) -> ToolPinningControl:
     (tmp_path / "sales_db.json").write_text(pin(tool()).to_json())
-    return ToolPinningControl(PinStore(tmp_path))
+    return ToolPinningControl(PinStore(tmp_path), InMemoryToolQuarantine())
 
 
 def test_a_second_entry_cannot_stand_in_for_a_changed_one(pinning, snapshot):
@@ -243,3 +245,22 @@ async def test_a_call_without_a_verified_listing_is_blocked(pinning, make_ctx):
     with listing_scope(listing):  # another server's listing does not vouch for this call
         verdict = await pinning.evaluate(call, Stage.PRE, cfg)
     assert verdict.reason_code == "tool_pin_unverified"
+
+
+async def test_a_drift_seen_by_one_gateway_blocks_the_tool_on_another(tmp_path, snapshot):
+    (tmp_path / "sales_db.json").write_text(pin(tool()).to_json())
+    client = fakeredis.FakeAsyncRedis()
+    shared = RedisToolQuarantine(client)
+    one, two = (ToolPinningControl(PinStore(tmp_path), shared) for _ in range(2))
+    config = snapshot.policy.upstreams.mcp["sales_db"]
+    drifted = await one.quarantined(one.verify("sales_db", config, [tool(description="evil")]))
+    assert drifted.status("query") is PinStatus.MISMATCH
+    restored = await two.quarantined(two.verify("sales_db", config, [tool()]))
+    assert restored.status("query") is PinStatus.QUARANTINED
+    assert restored.definitions == ()
+    # Re-approving a new baseline makes the record stale: it is dropped, the tool is usable.
+    (tmp_path / "sales_db.json").write_text(pin(tool(description="v2")).to_json())
+    approved = await two.quarantined(two.verify("sales_db", config, [tool(description="v2")]))
+    assert approved.status("query") is PinStatus.PINNED
+    assert await shared.entries("sales_db") == {}
+    await client.aclose()

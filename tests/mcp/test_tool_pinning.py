@@ -182,6 +182,49 @@ async def test_a_pin_file_edited_by_hand_fails_closed(pinned: MCPStack, tmp_path
     assert error_text(await write_report(pinned)) == "tool_pin_invalid"
 
 
+# ------------------------------------------------------------------------- quarantine
+
+
+async def test_a_drift_seen_once_blocks_every_session_until_an_operator_clears_it(
+    pinned: MCPStack, servers, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    """Codex P2: a session that cached the approved listing must not keep using the tool, and
+    restoring the metadata must not lift the block without an operator."""
+    early = await connect(pinned, ANNA, "reports")
+    assert await early.tools() == ["write_report"]  # approved listing cached in its session
+    tool = servers.tool("mcp-files", "write_report")
+    tool.description = RUG_PULL
+    assert await listed(pinned, "reports") == {}  # another session sees the drift
+    tool.description = WRITE_DESCRIPTION  # the server restores the approved metadata
+
+    result = await early.call("write_report", name="q3.md", content="ok")
+    assert error_text(result) == "tool_quarantined"
+    assert await listed(pinned, "reports") == {}
+    assert error_text(await write_report(pinned)) == "tool_quarantined"
+    assert pinned.log.of("write_report") == []
+
+    assert await run_pin(pinned, tmp_path / "pins") == 0  # baseline unchanged: nothing to write
+    out = capsys.readouterr().out
+    assert "! quarantined write_report: tool_pin_mismatch" in out
+    assert await run_pin(pinned, tmp_path / "pins", "--write") == 0
+    assert error_text(await write_report(pinned)) == "tool_quarantined"  # still blocked
+
+    assert await run_pin(pinned, tmp_path / "pins", "--clear-quarantine", "write_report") == 0
+    assert "quarantine of write_report lifted" in capsys.readouterr().out
+    assert (await early.call("write_report", name="q3.md", content="ok"))["isError"] is False
+    assert set(await listed(pinned, "reports")) == {"write_report"}
+    assert await run_pin(pinned, tmp_path / "pins", "--clear-quarantine", "write_report") == 1
+
+
+async def test_a_missing_tool_is_refused_but_not_quarantined(pinned: MCPStack, servers):
+    server = servers.by_host["mcp-files"]
+    removed = servers.tool("mcp-files", "write_report")
+    server.remove_tool("write_report")
+    assert error_text(await write_report(pinned)) == "tool_pin_mismatch"
+    server._tool_manager._tools["write_report"] = removed  # the same tool comes back
+    assert (await write_report(pinned))["isError"] is False
+
+
 # ------------------------------------------------------------------------ require_pin
 
 
@@ -204,7 +247,7 @@ async def test_require_pin_false_opts_a_server_out(pinned: MCPStack, tmp_path, s
 
 
 async def run_pin(stack: MCPStack, pins_dir: Path, *args: str) -> int:
-    token = await stack.gateway.token("root@demo")
+    token = await stack.gateway.operator_token("root@demo")
     transport = httpx.ASGITransport(app=create_operator_app(stack.gateway.container))
     argv = ["pin", "reports", "--pins-dir", str(pins_dir), *args]
     return await cli(argv, env={BEARER_ENV: token}, transport=transport)
@@ -232,11 +275,12 @@ async def test_acl_pin_diffs_then_writes_the_reviewed_baseline(
     approved = pin.tool("write_report")
     assert approved is not None
     assert approved.description == RUG_PULL
-    assert (await write_report(pinned))["isError"] is False
+    assert (await write_report(pinned))["isError"] is False  # the new baseline lifts it
+    assert await pinned.gateway.container.state.tool_quarantine.entries("reports") == {}
 
 
 async def test_acl_pin_needs_an_admin_token(pinned: MCPStack, tmp_path: Path, capsys):
-    token = await pinned.gateway.token(ANNA)
+    token = await pinned.gateway.operator_token("olga@demo")  # an approver, not an admin
     transport = httpx.ASGITransport(app=create_operator_app(pinned.gateway.container))
     argv = ["pin", "reports", "--pins-dir", str(tmp_path / "pins")]
     assert await cli(argv, env={BEARER_ENV: token}, transport=transport) == 1

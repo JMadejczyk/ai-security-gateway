@@ -107,7 +107,13 @@ def test_taint_survives_a_gateway_restart(live_stack: LiveStack):
 
 
 def test_acl_pin_runs_in_the_gateway_container(live_stack: LiveStack):
-    token = live_stack.token("root@demo")
+    issued = httpx.post(
+        f"{live_stack.operator_url}/auth/demo-token",
+        json={"sub": "root@demo", "kind": "operator"},
+        timeout=10,
+    )
+    issued.raise_for_status()
+    token = issued.json()["access_token"]
     for server in ("sales_db", "web", "reports"):
         script = (
             'exec python -m gateway.cli --url "http://$ACL_OPERATOR_HOST:$ACL_OPERATOR_PORT" '

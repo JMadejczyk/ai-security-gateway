@@ -6,14 +6,23 @@ tool results, where indirect injection (a fetched page, a document) enters the a
 context.
 
 **What is classified.** The segments `TextExtractor` yields for the stage (every string leaf,
-decoded tool-call arguments and base64 text included), minus protocol fields (``role``,
-``name``, ``model``...) and strings without a letter. The system prompt is classified like
+decoded tool-call arguments and base64 text included), minus protocol fields at their
+protocol places (``/messages/0/role``, ``/content/1/type``: `TextSegment.joinable`; a ``name``
+in tool data is data) and strings without a letter. The system prompt is classified like
 everything else: an attacker who controls any part of the request can put text there too. A
 long benign system prompt full of rules ("never reveal...", "always answer in...") is the
 most likely false positive; the score is per text, so it never dilutes or inflates a user
-message next to it. On top of each segment, the text around every boundary between two
-consecutive segments (`BOUNDARY_CHARS` each side) is classified once more, so an
-instruction split across content parts or messages is still seen whole. A text longer than
+message next to it.
+
+**Split text.** An instruction can be cut into many parts (content parts, argument fields, MCP
+content items, down to one character each). Within one group (a message, a declared tool,
+the whole tool call or tool result) whose content is more than one segment, the segments are
+concatenated as written (whitespace-only parts included) and classified again in rolling
+windows of `WINDOW_CHARS` overlapping by `WINDOW_OVERLAP_CHARS`. Between consecutive groups
+(a message split across two messages), the `BOUNDARY_CHARS` on each side of the boundary are
+classified once more. Window and boundary texts count against ``max_chars`` like segments, so
+the cap still bounds the work, and they are cached like any text: a re-sent history adds
+nothing. A text longer than
 the model window is classified in overlapping windows and scores as its best window
 (`gateway.injection.classifier`).
 
@@ -70,7 +79,10 @@ TOO_LARGE: Final = "content_too_large_to_classify"
 UNSCANNABLE: Final = "content_unscannable"
 CLASSIFIER_UNAVAILABLE: Final = "classifier_unavailable"
 
-BOUNDARY_CHARS: Final = 1000  # text taken from each side of a segment boundary
+BOUNDARY_CHARS: Final = 1000  # text taken from each side of a boundary between groups
+WINDOW_CHARS: Final = 1000  # rolling window over the concatenated segments of one group
+WINDOW_OVERLAP_CHARS: Final = 200
+_GROUPED: Final = frozenset({"messages", "choices", "tools"})  # one group per list item
 MAX_JUDGED: Final = 4  # uncertain texts judged per call; more fail closed
 SCORE_BUCKETS: Final = (0.0, 0.5, 0.7, 0.85, 0.95, 0.99, 1.0)
 JUDGE_CACHE_ENTRIES: Final = 4096
@@ -91,7 +103,7 @@ right; rationale is one short sentence without quoting the content."""
 class InjectionJudgement(BaseModel):
     """What the judge answers about one uncertain text."""
 
-    model_config = ConfigDict(frozen=True, extra="ignore")
+    model_config = ConfigDict(frozen=True, extra="forbid")  # a garbled answer is no answer
 
     is_injection: bool
     confidence: float = Field(ge=0.0, le=1.0)
@@ -114,20 +126,46 @@ def score_bucket(score: float) -> str:
     return f"{SCORE_BUCKETS[-2]:.2f}-{SCORE_BUCKETS[-1]:.2f}"
 
 
+def _group(segment: TextSegment) -> str:
+    """The message, choice or declared tool a segment belongs to; the document otherwise."""
+    match segment.pointer.split("/")[1:3]:
+        case [first, index] if first in _GROUPED:
+            return f"/{first}/{index}"
+        case _:
+            return ""
+
+
+def rolling_windows(text: str) -> list[str]:
+    """``text`` in windows of `WINDOW_CHARS` sharing `WINDOW_OVERLAP_CHARS`; the last one
+    ends at the end of ``text``."""
+    step = WINDOW_CHARS - WINDOW_OVERLAP_CHARS
+    starts = range(0, max(len(text) - WINDOW_OVERLAP_CHARS, 1), step)
+    return [text[start : start + WINDOW_CHARS] for start in starts]
+
+
 def classified_texts(segments: Sequence[TextSegment]) -> list[str]:
-    """Texts to classify: content segments, then the joins around their boundaries."""
-    units = [
-        s.text
-        for s in segments
-        if s.joinable
-        and s.kind in {SegmentKind.TEXT, SegmentKind.OPAQUE}
-        and any(c.isalpha() for c in s.text)
+    """Texts to classify: content segments, rolling windows over each multi-segment group,
+    and the joins around the boundaries between groups (see the module docstring)."""
+    content = [
+        s for s in segments if s.joinable and s.kind in {SegmentKind.TEXT, SegmentKind.OPAQUE}
+    ]
+    units = [s.text for s in content if any(c.isalpha() for c in s.text)]
+    groups: dict[str, list[str]] = {}
+    for segment in content:
+        groups.setdefault(_group(segment), []).append(segment.text)
+    joined = ["".join(parts) for parts in groups.values()]
+    windows = [
+        window
+        for parts, text in zip(groups.values(), joined, strict=True)
+        if len(parts) > 1
+        for window in rolling_windows(text)
     ]
     joins = [
-        before[-BOUNDARY_CHARS:] + after[:BOUNDARY_CHARS]  # joined as concatenated
-        for before, after in itertools.pairwise(units)
+        before[-BOUNDARY_CHARS:] + after[:BOUNDARY_CHARS]
+        for before, after in itertools.pairwise(joined)
     ]
-    return list(dict.fromkeys([*units, *joins]))  # distinct, in order
+    texts = [*units, *windows, *joins]
+    return list(dict.fromkeys(t for t in texts if any(c.isalpha() for c in t)))
 
 
 class Outcome(StrEnum):
@@ -211,11 +249,13 @@ class PromptInjectionControl(Control):
         runner: ClassifierRunner,
         judge: InjectionJudge | None,
         extractor: TextExtractor | None = None,
+        *,
+        judge_cache_entries: int = JUDGE_CACHE_ENTRIES,
     ) -> None:
         self._runner = runner
         self._judge = judge
         self._extractor = extractor or TextExtractor()
-        self._judged = _JudgeMemory()
+        self._judged = _JudgeMemory(judge_cache_entries)
 
     @override
     async def evaluate(self, interaction: Interaction, stage: Stage, cfg: ControlConfig) -> Verdict:
@@ -265,8 +305,15 @@ class PromptInjectionControl(Control):
         return await self._judge_band(windows, uncertain[0][1])
 
     async def _judge_band(self, windows: list[str], top: InjectionScore) -> Finding:
+        """Decide from this request's own answers: remembered ones are copied out first, so
+        storing fresh answers (which may evict entries) cannot lose one. A window without an
+        answer is unavailable, never clean."""
         bucket = score_bucket(top.score)
-        unjudged = [w for w in windows if self._judged.get(w) is None]
+        answers: dict[str, bool] = {}
+        for window in windows:
+            if (known := self._judged.get(window)) is not None:
+                answers[window] = known
+        unjudged = [w for w in windows if w not in answers]
         if len(unjudged) > MAX_JUDGED:
             return Finding.refusal(
                 JUDGE_BAND_OVERFLOW, f"{len(unjudged)} uncertain texts, {MAX_JUDGED} judged at most"
@@ -284,11 +331,12 @@ class PromptInjectionControl(Control):
             elif isinstance(outcome, BaseException):
                 raise outcome  # a bug, not an unavailable judge: the pipeline fails closed
             else:
+                answers[window] = outcome.is_injection
                 self._judged.put(window, outcome.is_injection)
-        if any(self._judged.get(w) for w in windows):
+        if any(answers.values()):
             return Finding.detection(DETECTED, f"judge: injection; classifier score {bucket}")
-        if failures:
-            reasons = ",".join(sorted(set(failures)))
+        if failures or len(answers) < len(windows):
+            reasons = ",".join(sorted(set(failures))) or "no_answer"
             return Finding.refusal(JUDGE_UNAVAILABLE, f"judge {reasons}; classifier score {bucket}")
         return Finding.passed(JUDGE_CLEARED, f"judge: no injection; classifier score {bucket}")
 

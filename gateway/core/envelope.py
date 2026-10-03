@@ -117,6 +117,9 @@ class SessionContext(FrozenModel):
     freeze_until: AwareDatetime | None = None
     cooldowns: tuple[Cooldown, ...] = ()
     flagged_tool_calls: tuple[FlaggedToolCall, ...] = ()
+    # More flags than the session keeps were raised: the evicted ones are pending approval
+    # obligations, so from then on every MCP tools/call needs approval (sticky).
+    flags_overflowed: bool = False
     call_history: tuple[CallRecord, ...] = ()
     # The user's goal: the first user message the gateway forwarded to the LLM in this session,
     # set once and never from a later transcript (SPEC "Intent vs enforcement"). Raw text for

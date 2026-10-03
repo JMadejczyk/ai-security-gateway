@@ -51,14 +51,34 @@ LISTING_TOO_LARGE: Final = "tool_listing_too_large"
 
 LISTING_BUDGET_S: Final = 10.0  # one deadline for classifying a whole listing
 MAX_LISTED_TOOLS: Final = 256  # tools screened per listing; any beyond are hidden
-# Keys whose string values are identifiers or grammar, not prose the model reads as advice.
+# JSON Schema keywords whose string values are identifiers or grammar, not prose the model
+# reads as advice. Skipped only where they are keywords: never inside a data value.
 _IDENTIFIER_KEYS: Final = frozenset(
     {"type", "format", "$schema", "$id", "$ref", "pattern", "required", "mimeType", "uri"}
 )
+# JSON Schema keywords whose values are instance data: every string inside them, object keys
+# included, is text the model may read (``"default": {"type": "ignore previous..."}``).
+_DATA_KEYS: Final = frozenset({"default", "examples", "enum", "const"})
+
+
+def _data_strings(value: object) -> Iterator[str]:
+    """Every string in a JSON value: values and object keys, at any depth."""
+    if isinstance(value, str):
+        if value:
+            yield value
+    elif isinstance(value, Mapping):
+        for child_key, child in cast("Mapping[str, Any]", value).items():
+            yield child_key
+            yield from _data_strings(child)
+    elif isinstance(value, list):
+        for child in cast("list[Any]", value):
+            yield from _data_strings(child)
 
 
 def _strings(value: object, key: str | None = None) -> Iterator[str]:
-    if isinstance(value, str):
+    if key in _DATA_KEYS:
+        yield from _data_strings(value)
+    elif isinstance(value, str):
         if value and key not in _IDENTIFIER_KEYS:
             yield value
     elif isinstance(value, Mapping):
@@ -73,7 +93,8 @@ def _strings(value: object, key: str | None = None) -> Iterator[str]:
 
 def definition_text(tool: wire.ToolDefinition) -> str:
     """Everything a tool definition tells the model, one line per string: its name, the
-    description, titles, every schema description, default and example, and parameter names."""
+    description, titles, every schema description, parameter names, and every string inside a
+    ``default``, ``examples``, ``enum`` or ``const`` value, object keys included."""
     return "\n".join(dict.fromkeys(_strings(tool.as_wire())))
 
 
@@ -141,11 +162,9 @@ class ToolPoisoningControl(Control):
         self, tools: Sequence[wire.ToolDefinition], threshold: float
     ) -> dict[str, tuple[str, str]]:
         screened = list(tools[:MAX_LISTED_TOOLS])
-        flagged = {
-            tool.name: (LISTING_TOO_LARGE, "")
-            for tool in tools[MAX_LISTED_TOOLS:]
-            if tool.name not in {s.name for s in screened}
-        }
+        # A name with any entry past the cap is hidden, even if earlier entries of it are
+        # clean: the agent would be shown the unclassified one too.
+        flagged = {tool.name: (LISTING_TOO_LARGE, "") for tool in tools[MAX_LISTED_TOOLS:]}
         try:
             async with asyncio.timeout(self._budget_s):
                 scores = await self._runner.scores([definition_text(t) for t in screened])

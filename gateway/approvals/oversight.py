@@ -10,10 +10,13 @@ keeps the rules.
 the id attached: MCP ``tools/call`` params ``_meta: {"ai-control-layer/approval_id": "<id>"}``;
 LLM the ``X-ACL-Approval-Id`` header. The id is only a pointer, never a credential: the
 gateway re-authenticates the caller, requires the record to be bound to exactly this call
-(session, principal, agent, channel, server, tool and argument digest), then runs base
-authorization, blocklist, kill switch and every control again under the *current* policy.
-Only the approval obligation is satisfied by the record; right before dispatch the record
-moves ``approved → executing`` atomically, so it executes at most once.
+(session, principal, agent, channel, server, tool, argument digest and every normalized
+``action:resource``), then runs base authorization, blocklist, kill switch and every control
+again under the *current* policy. The record satisfies only the approval obligation, and only
+for the exact final operation it was held for (the digest of the payload after rewrites and
+redactions): a different final payload needs a new approval. Right before dispatch the
+record moves ``approved → executing`` atomically and the kill switch is checked once more, so
+an approval executes at most once and never after a kill.
 
 A record created under an older policy revision stays usable if, and only if, the current
 policy still allows the call (SPEC "Hot reload": re-checked when consumed): base
@@ -22,7 +25,7 @@ anything outside base authorization.
 """
 
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from enum import StrEnum
 from typing import Any, Final, cast
 
@@ -33,6 +36,7 @@ from gateway.approvals.model import (
     ApprovalBinding,
     ApprovalConflictError,
     ApprovalState,
+    operations_of,
 )
 from gateway.approvals.service import ApprovalService
 from gateway.core.types import Action, Channel
@@ -122,9 +126,15 @@ class Oversight:
         return await self._kill_switch.check(agent)
 
     def binding(
-        self, claims: TokenClaims, channel: Channel, server: str | None, payload: object
+        self,
+        claims: TokenClaims,
+        channel: Channel,
+        server: str | None,
+        payload: object,
+        interactions: Iterable[tuple[Action, str]],
     ) -> ApprovalBinding | None:
-        """The exact operation ``payload`` is; None when it has no canonical form."""
+        """The exact operation ``payload`` is, with the normalized ``(action, resource)`` of
+        each of its ``interactions``; None when it has no canonical form."""
         digest = self._approvals.args_digest(payload)
         if digest is None:
             return None
@@ -140,6 +150,23 @@ class Oversight:
             server=server,
             tool=tool,
             args_digest=digest,
+            operations=operations_of(interactions),
+        )
+
+    def operation_digest(self, final_payload: object) -> str | None:
+        """Keyed digest of the final payload (after rewrites and redactions)."""
+        return self._approvals.args_digest(final_payload)
+
+    @staticmethod
+    def covers(approval: Approval | None, operation_digest: str | None) -> bool:
+        """An approved record covers the approval obligation of exactly the final operation
+        it was held for; anything else (another redaction result, a rewrite) needs a new
+        approval."""
+        return (
+            approval is not None
+            and approval.state is ApprovalState.APPROVED
+            and operation_digest is not None
+            and approval.operation_digest == operation_digest
         )
 
     async def presented(
@@ -160,17 +187,23 @@ class Oversight:
             return record
         return refusal_for(record.state)
 
-    async def hold(
+    async def hold(  # noqa: PLR0913 -- the facts of one held operation
         self,
         binding: ApprovalBinding,
         snapshot: PolicySnapshot,
         *,
+        operation_digest: str,
         actions: tuple[Action, ...],
         resources: tuple[str, ...],
         reasons: tuple[str, ...],
     ) -> Approval:
         return await self._approvals.hold(
-            binding, snapshot, actions=actions, resources=resources, reasons=reasons
+            binding,
+            snapshot,
+            operation_digest=operation_digest,
+            actions=actions,
+            resources=resources,
+            reasons=reasons,
         )
 
     async def consume(self, approval: Approval) -> Approval | ApprovalRefusal:
@@ -179,6 +212,10 @@ class Oversight:
             return await self._approvals.begin(approval.id)
         except ApprovalConflictError as exc:
             return refusal_for(exc.current.state if exc.current is not None else None)
+
+    async def abandon(self, approval: Approval, outcome: str) -> None:
+        """A consumed approval stopped before dispatch (a kill landed): closed, never run."""
+        await self._approvals.abandon(approval.id, outcome)
 
     async def finish(
         self, approval: Approval, result: UpstreamResult | None, error: UpstreamError | None

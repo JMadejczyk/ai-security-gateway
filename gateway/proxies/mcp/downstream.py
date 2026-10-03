@@ -217,7 +217,8 @@ class MCPProxy:
             try:
                 advertised = await upstream.list_tools(snapshot)
                 server = session.binding.server
-                tools = list(self._pinning.screen_listing(server, config, advertised).definitions)
+                screened = await self._pinning.screen_listing(server, config, advertised)
+                tools = list(screened.definitions)
             except RejectionError as exc:  # upstream down, unreadable pin file
                 return _rpc_error(
                     message, wire.INTERNAL_ERROR, exc.message, {"reason_code": exc.reason_code}

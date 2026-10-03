@@ -23,7 +23,7 @@ import asyncio
 import json
 from typing import ClassVar, Final, override
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from gateway.core.envelope import FlaggedToolCall, Interaction, Verdict
 from gateway.core.interfaces import Control, ControlConfig
@@ -54,10 +54,12 @@ Return `aligned` (true or false), `confidence` between 0 and 1, and a one-senten
 
 
 class IntentAssessment(BaseModel):
-    """The judge's verdict on one tool call."""
+    """The judge's verdict on one tool call. Strict: no default verdict, no unknown keys."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     aligned: bool
-    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    confidence: float = Field(ge=0.0, le=1.0)
     rationale: str = Field(default="", max_length=2000)
 
 

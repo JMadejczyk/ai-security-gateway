@@ -35,8 +35,8 @@ from gateway.errors import RejectionError
 from gateway.policy.schema import Sessions
 
 MAX_CALL_HISTORY: Final = 256
-# Newest kept. Each flag comes from a judged-misaligned tool call that also adds risk, so a
-# session flooding past this cap is frozen by its risk rules long before it gets there.
+# Newest kept. A flag is a pending approval obligation, so none is ever dropped silently:
+# past this cap the session is marked `flags_overflowed` and every MCP call needs approval.
 MAX_FLAGGED_TOOL_CALLS: Final = 1024
 MAX_GOAL_CHARS: Final = 4000
 
@@ -86,6 +86,7 @@ def apply_update(
     """The session after ``update``: decay, add, clamp; taint and running timers are kept, and
     so is the goal once set (a later call can never replace it)."""
     risk = min(max(ctx.risk_at(now, half_life_s) + update.risk_delta, 0.0), 1.0)
+    flags = tuple(dict.fromkeys((*ctx.flagged_tool_calls, *update.flagged_tool_calls)))
     cooldowns: dict[str, Cooldown] = {}
     for cooldown in (*ctx.cooldowns, *update.cooldowns):
         if cooldown.until > now and (
@@ -102,9 +103,8 @@ def apply_update(
             "freeze_until": max(freezes, default=None),
             "cooldowns": tuple(cooldowns.values()),
             "call_history": (*ctx.call_history, *update.calls)[-MAX_CALL_HISTORY:],
-            "flagged_tool_calls": tuple(
-                dict.fromkeys((*ctx.flagged_tool_calls, *update.flagged_tool_calls))
-            )[-MAX_FLAGGED_TOOL_CALLS:],
+            "flagged_tool_calls": flags[-MAX_FLAGGED_TOOL_CALLS:],
+            "flags_overflowed": ctx.flags_overflowed or len(flags) > MAX_FLAGGED_TOOL_CALLS,
             "goal": ctx.goal if ctx.goal is not None else update.goal,
         }
     )
@@ -145,6 +145,13 @@ class SessionStore(ABC):
     @abstractmethod
     async def tainted_count(self) -> int:
         """Number of live tainted sessions (the ``acl_tainted_sessions`` gauge)."""
+
+    async def before_dispatch(self, session_id: str, *, upstream_timeout_s: float) -> None:
+        """Called right before the session's call goes upstream, under its lock. A store whose
+        lock can be lost (a lease shared across processes) raises a 503 `RejectionError` when
+        this call no longer holds it, and fences the session until the call has persisted its
+        outcome. A process-local lock cannot be lost: nothing to do."""
+        del session_id, upstream_timeout_s
 
 
 @dataclass(slots=True)

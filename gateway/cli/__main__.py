@@ -1,8 +1,9 @@
-"""``python -m gateway.cli [--url URL] [--token TOKEN] [--json] <command> ...``
+"""``acl [--url URL] [--token TOKEN] [--json] <command> ...`` (or ``python -m gateway.cli``)
 
 Talks to the operator listener only. ``--url`` defaults to ``ACL_OPERATOR_URL`` (else
-``http://127.0.0.1:9090``), ``--token`` to ``ACL_OPERATOR_TOKEN``. Exit codes: 0 done,
-1 refused by the API (reason code on stderr), 2 usage error.
+``http://127.0.0.1:9090``), ``--token`` to ``ACL_OPERATOR_TOKEN``: an operator token
+(``POST /auth/demo-token`` with ``"kind": "operator"``), never an agent token.
+Exit codes: 0 done, 1 refused by the API (reason code on stderr), 2 usage error.
 """
 
 import argparse
@@ -18,7 +19,7 @@ from gateway.cli.registry import COMMANDS, Run
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m gateway.cli", description=__doc__)
+    parser = argparse.ArgumentParser(prog="acl", description=__doc__)
     parser.add_argument("--url", default=None, help=f"operator API (env {URL_ENV})")
     parser.add_argument("--token", default=None, help=f"operator bearer token (env {BEARER_ENV})")
     parser.add_argument("--json", action="store_true", help="print JSON instead of tables")

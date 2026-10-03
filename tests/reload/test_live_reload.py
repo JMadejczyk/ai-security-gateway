@@ -23,7 +23,7 @@ def edit(gateway, old: str, new: str) -> None:
 
 
 async def reload(gateway, sub: str = "root@demo") -> httpx.Response:
-    token = await gateway.token(sub)
+    token = await gateway.operator_token(sub)
     return await gateway.operator.post("/admin/reload", headers=bearer(token))
 
 
@@ -66,12 +66,21 @@ async def test_unchanged_file(gateway):
     assert (response.status_code, response.json()["result"]) == (200, "unchanged")
 
 
-@pytest.mark.parametrize("sub", ["anna@demo", "olga@demo", "svc:nightly_etl"])
-async def test_reload_needs_the_admin_role(gateway, sub):
+async def test_reload_needs_the_admin_role(gateway):
     edit(gateway, *GRANT_LLAMA)
     revision = gateway.container.policy_store.current.revision
-    response = await reload(gateway, sub)
+    response = await reload(gateway, "olga@demo")  # an operator, but an approver only
     assert (response.status_code, response.json()["error"]["code"]) == (403, "admin_required")
+    assert gateway.container.policy_store.current.revision == revision
+
+
+@pytest.mark.parametrize("sub", ["root@demo", "anna@demo", "svc:nightly_etl"])
+async def test_reload_refuses_agent_tokens(gateway, sub):
+    edit(gateway, *GRANT_LLAMA)
+    revision = gateway.container.policy_store.current.revision
+    token = await gateway.token(sub)  # an agent token, even root's
+    response = await gateway.operator.post("/admin/reload", headers=bearer(token))
+    assert (response.status_code, response.json()["error"]["code"]) == (401, "wrong_audience")
     assert gateway.container.policy_store.current.revision == revision
 
 

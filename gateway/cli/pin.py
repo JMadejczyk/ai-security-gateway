@@ -1,4 +1,5 @@
-"""``pin <server> [--write] [--pins-dir DIR]``: review and approve an MCP server's tool baseline.
+"""``pin <server> [--write | --clear-quarantine TOOL] [--pins-dir DIR]``: review and approve an
+MCP server's tool baseline.
 
 Fetches what the gateway sees upstream (``GET /admin/mcp/{server}/tools``, admin role) as a
 candidate pin file, prints a diff against ``<pins-dir>/<server>.json`` (tools added, removed,
@@ -9,6 +10,13 @@ mounts it read-only and picks a new file up on the next call, no restart needed:
     python -m gateway.cli --token "$ADMIN_TOKEN" pin sales_db          # review
     python -m gateway.cli --token "$ADMIN_TOKEN" pin sales_db --write  # approve
 
+A tool ``tool_pinning`` caught drifting is quarantined for every session until an operator
+acts (the review lists them): writing a new baseline for it lifts the quarantine, and so does
+``--clear-quarantine <tool>`` once the operator has confirmed the server again advertises the
+approved definition (the diff is empty)::
+
+    python -m gateway.cli --token "$ADMIN_TOKEN" pin reports --clear-quarantine write_report
+
 Exit codes: 0 up to date or written, 3 differences found and not written (so a CI job can
 detect drift), 1 refused by the API, 2 usage error.
 """
@@ -18,7 +26,7 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from pydantic import ValidationError
+from pydantic import AwareDatetime, BaseModel, ValidationError
 
 from gateway.cli.client import OperatorClient, OperatorError, parse
 from gateway.proxies.mcp.pins import MISSING, PinDiff, PinFile, ToolBaseline
@@ -36,23 +44,56 @@ def register(subparsers: "Subcommands") -> None:
         "pin", help="diff an MCP server's tools against its pin file; --write approves (admin)"
     )
     pin.add_argument("server", help="MCP server name from policy.yaml (upstreams.mcp)")
-    pin.add_argument("--write", action="store_true", help="write the reviewed baseline")
+    action = pin.add_mutually_exclusive_group()
+    action.add_argument("--write", action="store_true", help="write the reviewed baseline")
+    action.add_argument(
+        "--clear-quarantine", metavar="TOOL", help="lift a quarantined tool's block"
+    )
     pin.add_argument("--pins-dir", type=Path, default=DEFAULT_PINS_DIR, help="default: ./pins")
     pin.set_defaults(run=run)
 
 
+class QuarantineView(BaseModel):
+    tool: str
+    reason: str
+    detected_at: AwareDatetime
+
+
+class QuarantineList(BaseModel):
+    server: str
+    quarantined: list[QuarantineView]
+
+
 async def run(args: argparse.Namespace, client: OperatorClient) -> int:
     server: str = args.server
+    if args.clear_quarantine is not None:
+        tool: str = args.clear_quarantine
+        await client.post(f"/admin/mcp/{server}/quarantine/{tool}/clear")
+        print(
+            json.dumps({"server": server, "tool": tool, "cleared": True})
+            if args.json
+            else (f"{server}: quarantine of {tool} lifted")
+        )
+        return 0
     candidate = parse(await client.get(f"/admin/mcp/{server}/tools"), PinFile)
+    quarantine = parse(await client.get(f"/admin/mcp/{server}/quarantine"), QuarantineList)
     if candidate.server != server:
         raise OperatorError("server_mismatch", "the gateway answered for another server")
     path: Path = args.pins_dir / f"{server}.json"
     current = _read(path)
     diff = PinDiff.between(current, candidate)
     if args.json:
-        print(json.dumps(_diff_json(diff, path, written=args.write and not diff.empty)))
+        document = _diff_json(diff, path, written=args.write and not diff.empty)
+        document["quarantined"] = [entry.tool for entry in quarantine.quarantined]
+        print(json.dumps(document))
     else:
         print(render(diff, server, path, exists=current is not None))
+        for entry in quarantine.quarantined:
+            print(
+                f"! quarantined {entry.tool}: {entry.reason} since "
+                f"{entry.detected_at.isoformat(timespec='seconds')} "
+                "(--write a new baseline, or --clear-quarantine once the diff is empty)"
+            )
     if diff.empty:
         return 0
     if not args.write:

@@ -1,25 +1,23 @@
 """Who may use ``/admin/*`` (SPEC "Identity": operator tokens).
 
-An operator token is an ordinary gateway JWT, verified against the current policy. Role
-``admin`` may do everything. Any other caller must hold an approver role (a role some agent
-names in ``approvers``) and then sees and decides only the approvals of agents that name one
-of its roles. Nobody decides an approval for their own session: the approver's principal
-(``sub``) must differ from the record's principal and the token's agent (``act.sub``) from
-the record's agent.
+An operator token (`gateway.identity.OperatorClaims`: audience ``ai-control-layer-operator``,
+no agent, no session) is verified against the current policy. Role ``admin`` may do
+everything. Any other caller must hold an approver role (a role some agent names in
+``approvers``) and then sees and decides only the approvals of agents that name one of its
+roles. Nobody decides an approval for their own session: the approver (``sub``) must differ
+from the record's principal. An agent can never approve anything: agent tokens do not open
+the operator API at all.
 
 Authorization reads the current policy, not the one the approval was created under: an
 approver role removed by a reload stops working at once.
 """
 
 from enum import StrEnum
-from typing import Final
 
 from gateway.approvals.model import Approval
 from gateway.errors import RejectionError
-from gateway.identity import TokenClaims
+from gateway.identity import ADMIN_ROLE, OperatorClaims
 from gateway.policy.loader import PolicySnapshot
-
-ADMIN_ROLE: Final = "admin"
 
 
 class OperatorReason(StrEnum):
@@ -40,17 +38,13 @@ class OperatorRefusedError(RejectionError):
 class OperatorAccess:
     """One verified operator token under one policy snapshot."""
 
-    def __init__(self, claims: TokenClaims, snapshot: PolicySnapshot) -> None:
+    def __init__(self, claims: OperatorClaims, snapshot: PolicySnapshot) -> None:
         self._claims = claims
         self._snapshot = snapshot
 
     @property
     def principal(self) -> str:
         return self._claims.sub
-
-    @property
-    def agent(self) -> str:
-        return self._claims.agent
 
     @property
     def roles(self) -> tuple[str, ...]:
@@ -84,6 +78,5 @@ class OperatorAccess:
     def require_decider(self, approval: Approval) -> None:
         if not self.can_view(approval):
             raise OperatorRefusedError(OperatorReason.APPROVER_ROLE_REQUIRED)
-        binding = approval.binding
-        if self.principal == binding.principal or self.agent == binding.agent:
+        if self.principal == approval.binding.principal:
             raise OperatorRefusedError(OperatorReason.SELF_APPROVAL)

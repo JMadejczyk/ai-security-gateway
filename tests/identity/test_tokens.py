@@ -12,6 +12,7 @@ from gateway_testkit import (
     sign,
     unsigned,
 )
+from pydantic import ValidationError
 
 from gateway.core.types import SessionMode
 from gateway.identity import (
@@ -24,7 +25,6 @@ from gateway.identity import (
     UnknownIdentityError,
     mint_principal_assertion,
 )
-from gateway.sessions import InMemorySessionStore
 
 
 @pytest.fixture
@@ -38,17 +38,11 @@ def verifier(clock) -> TokenVerifier:
 
 
 @pytest.fixture
-def sessions(clock) -> InMemorySessionStore:
-    return InMemorySessionStore(clock=clock)
-
-
-@pytest.fixture
-def issuer(verifier, sessions, clock) -> DemoTokenIssuer:
+def issuer(verifier, clock) -> DemoTokenIssuer:
     return DemoTokenIssuer(
         DemoIdentities.load(IDENTITIES),
         JWT_SECRET.encode(),
         verifier,
-        sessions.is_retired,
         clock=clock,
     )
 
@@ -112,6 +106,36 @@ def test_expires_with_the_clock(verifier, snapshot, clock):
     verifier.verify(token, snapshot)
     clock.advance(600)
     assert refusal(verifier, snapshot, token).reason is TokenReason.EXPIRED
+
+
+def test_a_token_names_a_session_only_while_it_could_be_alive(verifier, snapshot, clock):
+    """``sid_iat`` (when the id was minted) bounds every later token naming the id: past
+    ``sessions.max_lifetime_s`` it is refused, so no token outlives a retired id's tombstone."""
+    minted = int(clock().timestamp())
+    lifetime = int(snapshot.policy.sessions.max_lifetime_s)
+    clock.advance(lifetime - 10)
+    refreshed = sign(claims(clock, sid_iat=minted))  # a fresh token for the same session
+    assert verifier.verify(refreshed, snapshot).sid_iat == minted
+    clock.advance(10)
+    late = sign(claims(clock, sid_iat=minted))
+    assert refusal(verifier, snapshot, late).reason is TokenReason.SESSION_TOO_OLD
+
+
+@pytest.mark.parametrize(
+    "override",
+    [{"sid_iat": None}, {"sid_iat": "x"}],
+    ids=["missing", "not-an-int"],
+)
+def test_sid_iat_is_required(verifier, snapshot, clock, override):
+    assert refusal(verifier, snapshot, sign(claims(clock, **override))).reason is (
+        TokenReason.INVALID
+    )
+
+
+def test_sid_iat_after_iat_is_refused(verifier, snapshot, clock):
+    now = int(clock().timestamp())
+    token = sign(claims(clock, sid_iat=now + 1))
+    assert refusal(verifier, snapshot, token).reason is TokenReason.INVALID
 
 
 def test_issued_in_the_future(verifier, snapshot, clock):
@@ -205,15 +229,14 @@ async def test_demo_issuer_issues_verifiable_tokens_with_fresh_sessions(issuer, 
     assert (verified.sub, verified.agent, verified.roles) == ("anna@demo", "databot", ("analyst",))
 
 
-async def test_demo_issuer_keeps_a_requested_session(issuer, snapshot):
-    issued = await issuer.issue(
-        DemoTokenRequest(sub="svc:nightly_etl", session_id="s-etl-1"), snapshot
-    )
-    assert (issued.session_id, issued.agent, issued.mode) == (
-        "s-etl-1",
-        "nightly_etl",
-        SessionMode.AUTONOMOUS,
-    )
+async def test_demo_issuer_never_accepts_a_session_id(issuer, verifier, snapshot):
+    """A caller-chosen id could name a retired session (or someone else's): refused."""
+    with pytest.raises(ValidationError):
+        DemoTokenRequest.model_validate({"sub": "svc:nightly_etl", "session_id": "s-etl-1"})
+    issued = await issuer.issue(DemoTokenRequest(sub="svc:nightly_etl"), snapshot)
+    assert (issued.agent, issued.mode) == ("nightly_etl", SessionMode.AUTONOMOUS)
+    verified = verifier.verify(issued.access_token, snapshot)
+    assert verified.sid_iat == verified.iat  # the id was minted with this token
 
 
 async def test_demo_issuer_refuses_unknown_identity(issuer, snapshot):

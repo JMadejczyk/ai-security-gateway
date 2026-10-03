@@ -4,7 +4,9 @@
   Errors use the OpenAI shape ``{"error": {"message", "type", "code"}}`` with the reason code
   as ``code`` and never any payload or upstream data. ``/mcp/{server}`` speaks MCP streamable
   HTTP (`gateway.proxies.mcp.downstream`) and answers in JSON-RPC instead.
-- Operator API (``ops`` network only): ``/healthz``, ``/metrics``, ``/auth/demo-token``,
+- Operator API (``ops`` network only; every ``/admin/*`` route takes an operator token,
+  audience ``ai-control-layer-operator``, never an agent token): ``/healthz``, ``/metrics``,
+  ``/auth/demo-token``,
   ``/admin/reload``, ``/admin/mcp/{server}/tools`` (candidate pin file for ``acl pin``),
   ``/admin/approvals*`` and ``/admin/kill``/``/admin/unkill`` (`gateway.approvals.api`).
 
@@ -289,7 +291,8 @@ def create_operator_app(container: GatewayContainer) -> FastAPI:
 
     @app.post("/admin/reload")
     async def reload_policy(request: Request) -> Response:
-        claims = container.verifier.verify(bearer_token(request), container.policy_store.current)
+        token, snapshot = bearer_token(request), container.policy_store.current
+        claims = container.verifier.verify_operator(token, snapshot)
         if ADMIN_ROLE not in claims.roles:
             raise RejectionError("admin_required", "this operation needs the admin role")
         outcome = await asyncio.to_thread(container.policy_store.reload)
@@ -300,12 +303,34 @@ def create_operator_app(container: GatewayContainer) -> FastAPI:
     async def mcp_tools(server: str, request: Request) -> Response:
         """A candidate pin file from what the gateway sees upstream (``acl pin``)."""
         snapshot = container.policy_store.current
-        claims = container.verifier.verify(bearer_token(request), snapshot)
+        claims = container.verifier.verify_operator(bearer_token(request), snapshot)
         if ADMIN_ROLE not in claims.roles:
             raise RejectionError("admin_required", "this operation needs the admin role")
         pin = await capture_pin(
             container.mcp_connector, server, snapshot, principal=claims.sub, now=container.clock()
         )
         return JSONResponse(pin.model_dump(mode="json", by_alias=True))
+
+    @app.get("/admin/mcp/{server}/quarantine")
+    async def mcp_quarantine(server: str, request: Request) -> Response:
+        """Tools ``tool_pinning`` quarantined on ``server`` (digests and times only)."""
+        snapshot = container.policy_store.current
+        claims = container.verifier.verify_operator(bearer_token(request), snapshot)
+        if ADMIN_ROLE not in claims.roles:
+            raise RejectionError("admin_required", "this operation needs the admin role")
+        entries = await container.state.tool_quarantine.entries(server)
+        body = [entry.model_dump(mode="json") for _, entry in sorted(entries.items())]
+        return JSONResponse({"server": server, "quarantined": body})
+
+    @app.post("/admin/mcp/{server}/quarantine/{tool}/clear")
+    async def mcp_quarantine_clear(server: str, tool: str, request: Request) -> Response:
+        """Lift one tool's quarantine after the operator confirmed it is the approved one."""
+        snapshot = container.policy_store.current
+        claims = container.verifier.verify_operator(bearer_token(request), snapshot)
+        if ADMIN_ROLE not in claims.roles:
+            raise RejectionError("admin_required", "this operation needs the admin role")
+        if not await container.state.tool_quarantine.clear(server, tool):
+            return error_response(404, "not_quarantined", "that tool is not quarantined")
+        return JSONResponse({"server": server, "tool": tool, "cleared": True})
 
     return app

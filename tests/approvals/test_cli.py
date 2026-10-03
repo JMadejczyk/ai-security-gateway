@@ -24,8 +24,9 @@ async def held_write(stack: Any) -> tuple[Any, str]:
     return reports, result["_meta"][META]
 
 
-async def cli(stack: Any, sub: str | None, *argv: str) -> int:
-    env = {"ACL_OPERATOR_TOKEN": await stack.gateway.token(sub)} if sub else {}
+async def cli(stack: Any, sub: str | None, *argv: str, agent_token: bool = False) -> int:
+    issue = stack.gateway.token if agent_token else stack.gateway.operator_token
+    env = {"ACL_OPERATOR_TOKEN": await issue(sub)} if sub else {}
     transport = httpx.ASGITransport(app=create_operator_app(stack.gateway.container))
     return await run(list(argv), env=env, transport=transport)
 
@@ -59,8 +60,9 @@ async def test_deny_and_refusals_exit_1_with_the_reason_code(
     stack: Any, capsys: pytest.CaptureFixture
 ):
     _reports, approval_id = await held_write(stack)
-    assert await cli(stack, BARTEK, "approvals", "approve", approval_id) == 1
-    assert "operator_role_required (HTTP 403)" in capsys.readouterr().err
+    # An agent token never opens the operator API, whoever holds it.
+    assert await cli(stack, ROOT, "approvals", "approve", approval_id, agent_token=True) == 1
+    assert "wrong_audience (HTTP 401)" in capsys.readouterr().err
     assert await cli(stack, None, "approvals", "list") == 1
     assert "token_missing" in capsys.readouterr().err
 

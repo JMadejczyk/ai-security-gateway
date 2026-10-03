@@ -41,6 +41,7 @@ from gateway.feed.store import FeedStore
 from gateway.identity import DemoIdentities, DemoTokenIssuer, TokenVerifier
 from gateway.injection.classifier import ClassifierRunner, InjectionClassifier, load_classifier
 from gateway.judges import JudgeClient
+from gateway.judges.client import JudgeFactory
 from gateway.pipeline import ChannelRoute, DecisionRecorder, Pipeline, SessionGate
 from gateway.policy.evaluator import PolicyEvaluator
 from gateway.policy.store import PolicyStore
@@ -94,6 +95,7 @@ class GatewayContainer:
         env: Mapping[str, str] | None = None,
         audit_stream: TextIO | None = None,
         classifier: InjectionClassifier | None = None,
+        judge_factory: JudgeFactory = JudgeClient,
     ) -> Self:
         """Raises `PolicyLoadError` (no valid policy, no gateway), `FeedError` (the policy names
         a signature feed that cannot be loaded), `ModelVerificationError` (the pinned injection
@@ -120,9 +122,7 @@ class GatewayContainer:
         state = StateStores.from_settings(settings, clock=clock)
         sessions = state.sessions
         issuer = (
-            DemoTokenIssuer(
-                identities, settings.jwt_key, verifier, sessions.is_retired, clock=clock
-            )
+            DemoTokenIssuer(identities, settings.jwt_key, verifier, clock=clock)
             if identities is not None
             else None
         )
@@ -130,7 +130,8 @@ class GatewayContainer:
         llm = LLMProxy(env=env, transport=transport)
         # Judges call the LLM upstream directly (router key, response cap), never through the
         # pipeline: not audited as agent requests, not charged to budgets.
-        judges = JudgeClient(llm, lambda: policy_store.current)
+        # ``judge_factory`` builds the client: tests hand in a deterministic stand-in.
+        judges = judge_factory(llm, lambda: policy_store.current)
         audit = AuditLogger(stream=audit_stream, path=settings.audit_path)
         recorder = DecisionRecorder(
             audit,
@@ -141,7 +142,9 @@ class GatewayContainer:
         mcp_connector = MCPConnector(settings.internal_key_bytes, clock=clock, transport=transport)
         # sql_guard prices statements through the SQL server's gateway-only `explain` tool.
         sql_guard = SqlGuardControl(functools.partial(explain_cost, mcp_connector))
-        pinning = ToolPinningControl(PinStore(settings.pins_dir))
+        pinning = ToolPinningControl(
+            PinStore(settings.pins_dir), state.tool_quarantine, clock=clock
+        )
         budgets = BudgetLedger(budget_store_from_settings(settings, clock=clock), clock=clock)
         operator_stores = operator_stores_from_settings(settings)
         oversight = Oversight(
@@ -222,7 +225,9 @@ class GatewayContainer:
             if self.settings.policy_watch:
                 self._watcher = asyncio.create_task(self.policy_store.watch())
             self._feed_refresher = asyncio.create_task(self.feed_store.run())
-            self._approval_sweeper = asyncio.create_task(sweep_forever(self.oversight))
+            self._approval_sweeper = asyncio.create_task(
+                sweep_forever(self.oversight, lambda: self.policy_store.current)
+            )
         self._users += 1
         try:
             yield self

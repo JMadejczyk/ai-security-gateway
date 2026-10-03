@@ -8,8 +8,10 @@ from typing import Any
 import httpx
 import pytest
 import respx
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
+from gateway.controls.intent_judge import IntentAssessment
+from gateway.controls.output_policy import OutputAssessment
 from gateway.controls.scope import CallScope, call_scope
 from gateway.core.types import SessionMode
 from gateway.judges.client import (
@@ -18,6 +20,7 @@ from gateway.judges.client import (
     JudgeResult,
     JudgeUnavailableError,
     escape_delimiters,
+    forbids_extra,
 )
 from gateway.policy.evaluator import PrincipalContext
 from gateway.policy.loader import PolicyLoadError
@@ -29,8 +32,14 @@ NONCE = "n0nce"
 
 
 class Verdict(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     aligned: bool
     confidence: float = 0.0
+
+
+class Lenient(BaseModel):
+    aligned: bool
 
 
 def answer(content: str | None, **extra: Any) -> httpx.Response:
@@ -182,7 +191,8 @@ async def test_content_over_the_cap_is_not_sent(client, upstream):
     assert not route.called
 
 
-async def test_no_judges_section_is_unavailable(snapshot, upstream):
+async def test_no_judges_section_is_unavailable(policy_doc, snapshot_from, upstream):
+    snapshot = snapshot_from(without_judges(policy_doc))
     proxy = LLMProxy(env={})
     await proxy.start()
     route = upstream.post("/chat/completions").mock(return_value=answer('{"aligned": true}'))
@@ -316,3 +326,81 @@ def test_judges_section_defaults(policy_doc, snapshot_from):
         16_000,
         1024,
     )
+
+
+@pytest.mark.parametrize(
+    ("model", "content"),
+    [
+        (OutputAssessment, "{}"),  # no verdict is not "no violations"
+        (OutputAssessment, '{"error": "unable to assess"}'),
+        (OutputAssessment, '{"violation": []}'),  # misspelled key
+        (OutputAssessment, '{"violations": [], "note": "x"}'),
+        (OutputAssessment, '{"violations": [{"quote": "x", "why": "y"}]}'),  # nested extra key
+        (IntentAssessment, '{"aligned": true}'),  # confidence is a required verdict field
+        (IntentAssessment, '{"aligned": "yes", "confidence": 1}'),  # strict: not a bool
+        (IntentAssessment, '{"aligned": true, "confidence": "0.9"}'),
+        (Verdict, '{"aligned": true, "extra": 1}'),
+    ],
+)
+async def test_missing_or_garbled_verdicts_are_unavailable(client, upstream, model, content):
+    upstream.post("/chat/completions").mock(return_value=answer(content))
+    with pytest.raises(JudgeUnavailableError) as raised:
+        await client.judge(
+            control_id="output_policy", instructions="i", content="c", response_model=model
+        )
+    assert raised.value.reason is JudgeResult.SCHEMA_MISMATCH
+
+
+async def test_a_lenient_response_model_is_refused_before_any_call(client, upstream):
+    route = upstream.post("/chat/completions").mock(return_value=answer('{"aligned": true}'))
+    with pytest.raises(TypeError, match="extra='forbid'"):
+        await client.judge(
+            control_id="intent_judge", instructions="i", content="c", response_model=Lenient
+        )
+    assert not route.called
+
+
+def test_forbids_extra_checks_nested_models():
+    assert forbids_extra(OutputAssessment.model_json_schema())
+    assert forbids_extra(IntentAssessment.model_json_schema())
+    assert not forbids_extra(Lenient.model_json_schema())
+
+    class Outer(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        inner: Lenient
+
+    assert not forbids_extra(Outer.model_json_schema())
+
+
+def without_judges(policy_doc):
+    del policy_doc["judges"]
+    for control in ("intent_judge", "output_policy"):
+        policy_doc["controls"].pop(control, None)
+    policy_doc["controls"]["prompt_injection"].pop("judge_band", None)
+    return policy_doc
+
+
+@pytest.mark.parametrize(
+    ("controls", "named"),
+    [
+        ({"intent_judge": {"mode": "log_only"}}, "intent_judge"),
+        ({"intent_judge": {}}, "intent_judge"),
+        ({"output_policy": {"mode": "redact"}}, "output_policy"),
+        ({"prompt_injection": {"mode": "block", "judge_band": [0.5, 0.85]}}, "judge_band"),
+    ],
+)
+def test_judge_controls_configured_without_judges_are_invalid(
+    policy_doc, snapshot_from, controls, named
+):
+    without_judges(policy_doc)["controls"].update(controls)
+    with pytest.raises(PolicyLoadError, match=named):
+        snapshot_from(policy_doc)
+
+
+def test_without_judges_and_unconfigured_controls_the_policy_loads(policy_doc, snapshot_from):
+    doc = without_judges(policy_doc)
+    doc["controls"]["prompt_injection"] = {"mode": "block", "threshold": 0.9}  # no band
+    policy = snapshot_from(doc).policy
+    assert policy.judges is None
+    assert policy.controls.intent_judge is None
+    assert policy.controls.output_policy is None

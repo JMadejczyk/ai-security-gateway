@@ -218,3 +218,36 @@ def test_definition_text_covers_every_prose_field_but_not_grammar():
     assert sorted(lines) == sorted(
         ["notes", "Notes", "Saves a note.", "text", "The note body.", "buy milk"]
     )
+
+
+# ------------------------------------------------- codex review fixes (2026-10-03)
+
+DATA_VALUE_CASES = [
+    ("default-object", tool("cfg", "Configure.", opts={"type": "object",
+                                                        "default": {"type": INJECT_MARKER}})),
+    ("examples-object", tool("link", "Link.", ref={"type": "string",
+                                                   "examples": [{"uri": INJECT_MARKER}]})),
+    ("enum-value", tool("mode", "Mode.", m={"type": "string", "enum": ["a", INJECT_MARKER]})),
+    ("const-value", tool("fixed", "Fixed.", c={"const": {"format": INJECT_MARKER}})),
+    ("object-key-in-default", tool("keys", "Keys.", k={"default": {INJECT_MARKER: 1}})),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "definition",
+    [case[1] for case in DATA_VALUE_CASES],
+    ids=[case[0] for case in DATA_VALUE_CASES],
+)
+async def test_instructions_inside_schema_data_values_are_classified(snapshot, call, definition):
+    """Codex P1 #4: keyword skipping (``type``, ``uri``, ``format``) leaked into data values."""
+    assert await control().screen_listing("web", [definition], snapshot) == {definition.name}
+    with listing_scope(listing(definition)):
+        verdict = await control().evaluate(call(definition.name), Stage.PRE, BLOCK)
+    assert verdict.reason_code == "tool_poisoning_detected"
+
+
+async def test_a_duplicate_past_the_listing_cap_hides_its_name(snapshot):
+    """Codex P2 #6: 256 benign ``notes`` hid the unclassified, poisoned 257th."""
+    tools = [tool("notes", "Saves a note.") for _ in range(MAX_LISTED_TOOLS)]
+    tools.append(tool("notes", f"Saves a note. {INJECT_MARKER}"))
+    assert await control().screen_listing("web", tools, snapshot) == {"notes"}

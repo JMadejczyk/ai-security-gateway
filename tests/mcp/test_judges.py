@@ -6,19 +6,25 @@ model is a judge call, anything else is the agent's.
 """
 
 import json
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from pathlib import Path
 from typing import Any, cast
 
 import httpx
 import jwt
 import pytest
 import yaml
-from gateway_testkit import Harness, bearer, completion
+from gateway_testkit import Harness, bearer, completion, running_gateway
 from mcp_harness import MCPStack, connect_all, error_text
+from pin_kit import capture_pins, write_pins
+from upstreams import running_upstreams
 
 from gateway.budget.ledger import DAILY_TTL_S
 from gateway.budget.model import BudgetScope, ScopeKind, SpendLimits
+from gateway.core.envelope import FlaggedToolCall
+from gateway.judges.client import JudgeClient
 from gateway.judges.intent import flag_for
+from gateway.sessions import MAX_FLAGGED_TOOL_CALLS, SessionUpdate
 from gateway.telemetry import REGISTRY, ReloadResult
 
 CHAT = "/v1/chat/completions"
@@ -94,6 +100,15 @@ def llm_route(stack: MCPStack, handler: Callable[[httpx.Request], httpx.Response
     """Send the gateway's LLM upstream host (policy.yaml: ``ollama``) to ``handler``."""
     routes = cast("dict[str, httpx.AsyncBaseTransport]", stack.transport._routes)
     routes["ollama"] = httpx.MockTransport(handler)
+
+
+@pytest.fixture
+async def stack(tmp_path: Path) -> AsyncIterator[MCPStack]:
+    """The MCP stack with the real `JudgeClient` (the testkit default is a fake one)."""
+    async with running_upstreams() as (transport, log):
+        write_pins(tmp_path / "pins", await capture_pins(transport))
+        async with running_gateway(tmp_path, transport=transport, judge_factory=JudgeClient) as gw:
+            yield MCPStack(gw, transport, log)
 
 
 @pytest.fixture
@@ -242,7 +257,7 @@ async def test_output_policy_redacts_out_of_scope_quotes(
 
 
 async def test_output_policy_block_mode_blocks(stack: MCPStack, llm: ScriptedLLM):
-    # No mode: the strict profile resolves output_policy to its most enforcing mode, block.
+    enable_judges(stack.gateway, output_policy={"mode": "block"})
     llm.agent_answer = completion("Olga paid with card 4111-1111.")
     llm.out_of_scope_quotes = ["card 4111-1111"]
     (db,) = await connect_all(stack, ANNA, "sales_db")
@@ -287,3 +302,22 @@ async def test_judge_calls_are_not_audited_or_charged(stack: MCPStack, llm: Scri
     assert 0 < spend.tokens < JUDGE_TOKENS
     assert llm.judge_requests[0]["model"] == JUDGE_MODEL
     assert "authorization" not in json.dumps(llm.judge_requests[0]).lower()
+
+
+async def test_flag_overflow_holds_every_mcp_call(stack: MCPStack, llm: ScriptedLLM):
+    """Codex P2: evicted flags were pending approvals; past the cap, every MCP call waits."""
+    (db,) = await connect_all(stack, ANNA, "sales_db")
+    assert (await ask(stack.gateway, db.token)).status_code == 200  # opens the session
+    overflow = tuple(
+        FlaggedToolCall(tool="other_tool", args_digest=f"{n:064x}")
+        for n in range(MAX_FLAGGED_TOOL_CALLS + 1)
+    )
+    state = await stack.gateway.container.sessions.apply(
+        session_of(db.token), SessionUpdate(flagged_tool_calls=overflow), half_life_s=600.0
+    )
+    assert state.flags_overflowed
+    held = await db.call("query", sql=COUNT_CUSTOMERS)  # never flagged itself
+    assert error_text(held).startswith("approval_required")
+    assert stack.log.of("query") == []
+    entry = stack.gateway.audit_entries()[-1]
+    assert any(v["reason_code"] == "intent_flags_overflow" for v in entry["verdicts"])

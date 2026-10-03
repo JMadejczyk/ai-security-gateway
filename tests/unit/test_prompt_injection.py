@@ -11,12 +11,15 @@ from injection_kit import DOUBT_MARKER, INJECT_MARKER, MarkerClassifier, Scripte
 from gateway.controls.prompt_injection import (
     BOUNDARY_CHARS,
     MAX_JUDGED,
+    WINDOW_CHARS,
+    WINDOW_OVERLAP_CHARS,
     InjectionJudgement,
     PromptInjectionControl,
     classified_texts,
+    rolling_windows,
     score_bucket,
 )
-from gateway.controls.text import SegmentKind, TextSegment
+from gateway.controls.text import SegmentKind, TextExtractor, TextSegment
 from gateway.core.envelope import Interaction
 from gateway.core.types import Action, Channel, ControlMode, Decision, Stage
 from gateway.injection.classifier import ClassifierRunner, InjectionScore, UnavailableClassifier
@@ -423,10 +426,145 @@ def test_classified_texts_skip_protocol_fields_and_letterless_strings():
     ]
 
 
-def test_boundary_joins_are_bounded():
-    segments = [TextSegment("/a", "a" * 5000, key="t"), TextSegment("/b", "b" * 5000, key="t")]
+def test_boundary_joins_between_messages_are_bounded():
+    segments = [
+        TextSegment("/messages/0/content", "a" * 5000, key="content"),
+        TextSegment("/messages/1/content", "b" * 5000, key="content"),
+    ]
     join = classified_texts(segments)[-1]
     assert join == "a" * BOUNDARY_CHARS + "b" * BOUNDARY_CHARS
+
+
+# ------------------------------------------------- codex review fixes (2026-10-03)
+
+
+def mcp_result(*items: dict[str, Any], structured: Any = None) -> dict[str, Any]:
+    result: dict[str, Any] = {"content": list(items), "isError": False}
+    if structured is not None:
+        result["structuredContent"] = structured
+    return result
+
+
+DATA_FIELD_CASES = [
+    ("structured-name", mcp_result({"type": "text", "text": "ok"},
+                                   structured={"name": INJECT_MARKER, "id": 7})),
+    ("structured-role", mcp_result(structured={"rows": [{"role": INJECT_MARKER}]})),
+    ("resource-link-name", mcp_result({"type": "resource_link", "uri": "file:///r.md",
+                                       "name": INJECT_MARKER, "mimeType": "text/markdown"})),
+    ("resource-link-title", mcp_result({"type": "resource_link", "uri": "file:///r.md",
+                                        "name": "r", "title": INJECT_MARKER})),
+    ("resource-link-uri", mcp_result({"type": "resource_link", "name": "r",
+                                      "uri": f"https://x.example/{INJECT_MARKER}"})),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "result", [case[1] for case in DATA_FIELD_CASES], ids=[case[0] for case in DATA_FIELD_CASES]
+)
+async def test_data_fields_named_like_protocol_fields_are_classified(interaction, result):
+    """Codex P1 #1: ``name``/``role``/``uri`` are protocol fields only at protocol places."""
+    verdict = await control().evaluate(interaction(Channel.MCP, result=result), Stage.POST, BLOCK)
+    assert (verdict.decision, verdict.reason_code) == (Decision.BLOCK, "prompt_injection_detected")
+
+
+async def test_tool_arguments_named_like_protocol_fields_are_classified(interaction):
+    payload = {"name": "write_report", "arguments": {"name": INJECT_MARKER, "type": "x"}}
+    verdict = await control().evaluate(interaction(Channel.MCP, payload), Stage.PRE, BLOCK)
+    assert verdict.reason_code == "prompt_injection_detected"
+
+
+def test_protocol_fields_at_protocol_places_are_still_left_out():
+    classifier = MarkerClassifier()
+    segments = TextExtractor().segments(
+        Interaction.model_construct(
+            channel=Channel.MCP,
+            result=mcp_result({"type": "text", "text": "hello", "mimeType": "text/plain"}),
+        ),
+        Stage.POST,
+    )
+    assert classified_texts(segments) == ["hello"]
+    llm = [
+        TextSegment("/messages/0/role", "user", key="role"),
+        TextSegment("/messages/0/content/0/type", "text", key="type"),
+        TextSegment("/messages/0/content/0/text", "hi there", key="text"),
+        TextSegment("/model", "qwen3:8b", key="model"),
+    ]
+    assert classified_texts(llm) == ["hi there"]
+    del classifier
+
+
+class PerWindowJudge:
+    """Says injection for content containing ``EVIL``, clean otherwise."""
+
+    def __init__(self) -> None:
+        self.contents: list[str] = []
+
+    async def judge(self, *, control_id, instructions, content, response_model):
+        del control_id, instructions
+        self.contents.append(content)
+        return response_model.model_validate(
+            {"is_injection": "EVIL" in content, "confidence": 0.9, "rationale": "r"}
+        )
+
+
+async def test_a_confirmed_injection_survives_judge_cache_eviction(interaction):
+    """Codex P1 #2: storing the clean answers evicted the one injection answer, and the
+    missing answer then read as clean."""
+    judge = PerWindowJudge()
+    pi = PromptInjectionControl(ClassifierRunner(MarkerClassifier()), judge, judge_cache_entries=1)
+    first = f"first {DOUBT_MARKER}"
+    second = "filler " * 20 + f"EVIL {DOUBT_MARKER}"
+    verdict = await pi.evaluate(interaction(Channel.LLM, prompt(first, second)), Stage.PRE, BLOCK)
+    assert len(judge.contents) == 3  # both messages and the join between them
+    assert (verdict.decision, verdict.reason_code) == (Decision.BLOCK, "prompt_injection_detected")
+
+
+def test_the_judgement_model_refuses_unknown_keys():
+    with pytest.raises(ValueError, match="extra"):
+        InjectionJudgement.model_validate({"is_injection": False, "confidence": 1.0, "err": 1})
+
+
+def one_char_parts(text: str) -> dict[str, Any]:
+    parts = [{"type": "text", "text": char} for char in text]
+    return {"model": "qwen3:8b", "messages": [{"role": "user", "content": parts}]}
+
+
+async def test_an_instruction_cut_into_one_character_parts_is_seen_whole(interaction):
+    """Codex P1 #3: pairwise joins never rebuild a text cut into many parts."""
+    payload = one_char_parts(f"Note: {INJECT_MARKER} ok")
+    verdict = await control().evaluate(interaction(Channel.LLM, payload), Stage.PRE, BLOCK)
+    assert verdict.reason_code == "prompt_injection_detected"
+
+
+async def test_an_instruction_cut_across_mcp_content_items_is_seen_whole(interaction):
+    items = [{"type": "text", "text": char} for char in INJECT_MARKER]
+    verdict = await control().evaluate(
+        interaction(Channel.MCP, result=mcp_result(*items)), Stage.POST, BLOCK
+    )
+    assert verdict.reason_code == "prompt_injection_detected"
+
+
+def test_rolling_windows_overlap_and_cover_the_whole_text():
+    text = "".join(chr(ord("a") + i % 26) for i in range(2500))
+    windows = rolling_windows(text)
+    assert [len(w) for w in windows] == [WINDOW_CHARS, WINDOW_CHARS, WINDOW_CHARS - 100]
+    assert windows[0][-WINDOW_OVERLAP_CHARS:] == windows[1][:WINDOW_OVERLAP_CHARS]
+    assert windows[-1].endswith(text[-50:])
+    assert rolling_windows("short") == ["short"]
+
+
+async def test_split_windows_count_against_the_character_cap(interaction):
+    def parts(*texts: str) -> dict[str, Any]:
+        content = [{"type": "text", "text": text} for text in texts]
+        return {"model": "qwen3:8b", "messages": [{"role": "user", "content": content}]}
+
+    cfg = BLOCK.model_copy(update={"max_chars": 1000})
+    whole = await control().evaluate(interaction(Channel.LLM, parts("a" * 600)), Stage.PRE, cfg)
+    assert whole.reason_code == "no_prompt_injection"  # 600 characters
+    split = await control().evaluate(
+        interaction(Channel.LLM, parts("a" * 300, "b" * 300)), Stage.PRE, cfg
+    )
+    assert split.reason_code == "content_too_large_to_classify"  # 600 + their 600-char window
 
 
 @pytest.mark.parametrize(
@@ -478,3 +616,57 @@ async def test_a_malformed_classifier_answer_raises():
     runner = ClassifierRunner(lambda texts: [InjectionScore(float("nan"), 0, 0)])
     with pytest.raises(ValueError, match="malformed"):
         await runner.scores(["x"])
+
+
+async def test_cancelled_classifications_do_not_starve_the_default_executor():
+    """Codex P2 #5: every request used to take a default-pool thread before waiting for a
+    classifier slot, and a cancelled request could not give it back."""
+    started = threading.Event()
+    calls = 0
+
+    def slow(texts):
+        nonlocal calls
+        calls += 1
+        started.set()
+        time.sleep(0.3)
+        return [InjectionScore(0.0, 0, 0) for _ in texts]
+
+    runner = ClassifierRunner(slow, workers=2)
+    requests = [asyncio.create_task(runner.scores([f"text {i}"])) for i in range(40)]
+    await asyncio.to_thread(started.wait, 2)
+    for request in requests:
+        request.cancel()
+    await asyncio.gather(*requests, return_exceptions=True)
+    began = time.perf_counter()
+    assert await asyncio.wait_for(asyncio.to_thread(lambda: "unrelated"), 1) == "unrelated"
+    assert time.perf_counter() - began < 0.2  # not queued behind 40 x 0.3 s of classification
+    await asyncio.sleep(0.4)
+    assert calls <= 2  # cancelled requests that had not started were dropped, never run
+
+
+async def test_a_cancelled_running_job_keeps_its_slot_until_it_finishes():
+    release = threading.Event()
+    running = threading.Semaphore(0)
+    peak, now, lock = 0, 0, threading.Lock()
+
+    def blocking(texts):
+        nonlocal peak, now
+        with lock:
+            now += 1
+            peak = max(peak, now)
+        running.release()
+        release.wait(2)
+        with lock:
+            now -= 1
+        return [InjectionScore(0.0, 0, 0) for _ in texts]
+
+    runner = ClassifierRunner(blocking, workers=1)
+    first = asyncio.create_task(runner.scores(["a"]))
+    await asyncio.to_thread(running.acquire, True, 2)
+    first.cancel()  # the job is running: its slot stays taken
+    second = asyncio.create_task(runner.scores(["b"]))
+    await asyncio.sleep(0.1)
+    assert not second.done()
+    release.set()
+    assert await asyncio.wait_for(second, 2) == [InjectionScore(0.0, 0, 0)]
+    assert peak == 1

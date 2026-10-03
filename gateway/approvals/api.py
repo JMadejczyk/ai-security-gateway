@@ -62,7 +62,7 @@ def admin_router(  # noqa: PLR0913 -- the collaborators of the admin routes, wir
 
     def operator(request: Request) -> tuple[OperatorAccess, PolicySnapshot]:
         snapshot = policy()
-        claims = verifier.verify(token_of(request), snapshot)
+        claims = verifier.verify_operator(token_of(request), snapshot)
         return OperatorAccess(claims, snapshot), snapshot
 
     def approval_id_of(raw: str) -> str:
@@ -122,7 +122,7 @@ def admin_router(  # noqa: PLR0913 -- the collaborators of the admin routes, wir
         await kill_switch.kill(record)
         # The kill already holds every call; denying its unused approvals makes them
         # unusable for good, even after an unkill.
-        revoked = await approvals.revoke_agent(body.agent, by=access.principal)
+        revoked = await approvals.revoke_agent(body.agent)
         log_operator_action(
             "kill",
             agent=body.agent,

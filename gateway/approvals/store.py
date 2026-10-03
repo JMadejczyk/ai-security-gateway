@@ -34,6 +34,7 @@ from gateway.approvals.model import (
 from gateway.errors import RejectionError
 
 LIST_LIMIT: Final = 500
+AGENT_REVOKED: Final = "agent_killed"  # outcome of a record its agent's kill revoked
 
 
 class ApprovalStoreUnavailableError(RejectionError):
@@ -49,7 +50,13 @@ class ApprovalStoreUnavailableError(RejectionError):
 
 class ApprovalStore(ABC):
     """Approval records. Every method but `healthy` raises `ApprovalStoreUnavailableError`
-    when the backing service cannot be reached; callers fail closed."""
+    when the backing service cannot be reached; callers fail closed.
+
+    "Lapse" below means: a pending or approved record past its deadline becomes ``expired``
+    (outcome ``approval_timeout``), and one whose agent was revoked after it was created
+    becomes ``denied`` (outcome ``agent_killed``). Every write path applies it first, in the
+    same atomic step.
+    """
 
     kind: ClassVar[str]
 
@@ -59,17 +66,27 @@ class ApprovalStore(ABC):
     ) -> tuple[Approval, bool]:
         """The open approval of ``draft.operation``, or a new pending one; True if created.
 
-        An open record past its deadline is expired first (it no longer holds the slot).
+        The slot's record lapses first (a lapsed record no longer holds the slot). A new
+        record carries the agent's current revocation generation.
         """
 
     @abstractmethod
     async def get(self, approval_id: str) -> Approval | None:
-        """The record as stored (callers expire it lazily through `transition`)."""
+        """The record as stored, without lapsing it (see `settle`)."""
+
+    @abstractmethod
+    async def settle(self, approval_id: str, now: datetime) -> Approval | None:
+        """The record after lapsing it atomically; None if there is none."""
 
     @abstractmethod
     async def transition(self, approval_id: str, change: Transition) -> Approval:
         """Apply ``change`` atomically or raise `ApprovalConflictError` with the current
-        record. A pending or approved record past its deadline is expired first."""
+        record. The record lapses first; ``expired`` is reached only by lapsing."""
+
+    @abstractmethod
+    async def revoke_agent(self, agent: str) -> int:
+        """Bump the agent's revocation generation: every pending or approved record it has
+        now lapses to ``denied`` wherever it is next read or moved. Returns the generation."""
 
     @abstractmethod
     async def records(
@@ -80,6 +97,14 @@ class ApprovalStore(ABC):
     @abstractmethod
     async def due(self, now: datetime) -> list[str]:
         """Ids of pending or approved records whose deadline has passed."""
+
+    @abstractmethod
+    async def open_ids(self) -> list[str]:
+        """Ids of every pending or approved record, unbounded."""
+
+    @abstractmethod
+    async def stuck(self, since: datetime) -> list[str]:
+        """Ids of ``executing`` records not updated since ``since``."""
 
     @abstractmethod
     async def pending_count(self) -> int: ...
@@ -106,10 +131,17 @@ def apply_transition(record: Approval, change: Transition) -> Approval:
     return record.model_copy(update=update)
 
 
-def expired(record: Approval, at: datetime) -> Approval:
-    return record.model_copy(
-        update={"state": ApprovalState.EXPIRED, "updated_at": at, "outcome": "approval_timeout"}
-    )
+def lapsed(record: Approval, at: datetime, generation: int) -> Approval | None:
+    """The record a lapse turns ``record`` into, or None if it still stands."""
+    if record.state not in EXPIRING_STATES:
+        return None
+    if at >= record.expires_at:
+        state, outcome = ApprovalState.EXPIRED, "approval_timeout"
+    elif record.generation != generation:
+        state, outcome = ApprovalState.DENIED, AGENT_REVOKED
+    else:
+        return None
+    return record.model_copy(update={"state": state, "updated_at": at, "outcome": outcome})
 
 
 class InMemoryApprovalStore(ApprovalStore):
@@ -120,6 +152,16 @@ class InMemoryApprovalStore(ApprovalStore):
     def __init__(self) -> None:
         self._records: dict[str, Approval] = {}
         self._slots: dict[str, tuple[str, int]] = {}  # operation -> (current id, generation)
+        self._revocations: dict[str, int] = {}  # agent -> revocation generation
+
+    def _lapse(self, approval_id: str, at: datetime) -> Approval | None:
+        record = self._records.get(approval_id)
+        if record is None:
+            return None
+        changed = lapsed(record, at, self._revocations.get(record.binding.agent, 0))
+        if changed is not None:
+            record = self._records[approval_id] = changed
+        return record
 
     async def create_or_get(
         self, draft: ApprovalDraft, *, expires_at: datetime, retention_s: int
@@ -127,12 +169,9 @@ class InMemoryApprovalStore(ApprovalStore):
         del retention_s  # nothing outlives the process anyway
         now = draft.created_at
         approval_id, generation = self._slots.get(draft.operation, ("", 0))
-        current = self._records.get(approval_id)
-        if current is not None:
-            if current.expired_at(now):
-                current = self._records[approval_id] = expired(current, now)
-            if current.state in OPEN_STATES:
-                return current, False
+        current = self._lapse(approval_id, now)
+        if current is not None and current.state in OPEN_STATES:
+            return current, False
         generation += 1
         record = Approval(
             **draft.model_dump(),
@@ -140,6 +179,7 @@ class InMemoryApprovalStore(ApprovalStore):
             state=ApprovalState.PENDING,
             expires_at=expires_at,
             updated_at=now,
+            generation=self._revocations.get(draft.binding.agent, 0),
         )
         self._records[record.id] = record
         self._slots[draft.operation] = (record.id, generation)
@@ -148,18 +188,25 @@ class InMemoryApprovalStore(ApprovalStore):
     async def get(self, approval_id: str) -> Approval | None:
         return self._records.get(approval_id)
 
+    async def settle(self, approval_id: str, now: datetime) -> Approval | None:
+        return self._lapse(approval_id, now)
+
     async def transition(self, approval_id: str, change: Transition) -> Approval:
-        record = self._records.get(approval_id)
+        before = self._records.get(approval_id)
+        record = self._lapse(approval_id, change.at)
         if record is None:
             raise ApprovalConflictError(approval_id, None)
-        if record.expired_at(change.at):
-            record = self._records[approval_id] = expired(record, change.at)
-            if change.target is ApprovalState.EXPIRED:
-                return record
+        lapsed_now = before is not None and before.state is not record.state
+        if lapsed_now and change.target is record.state is ApprovalState.EXPIRED:
+            return record  # the lapse was the requested move
         if change.target is ApprovalState.EXPIRED or record.state not in change.sources:
             raise ApprovalConflictError(approval_id, record)
         record = self._records[approval_id] = apply_transition(record, change)
         return record
+
+    async def revoke_agent(self, agent: str) -> int:
+        self._revocations[agent] = self._revocations.get(agent, 0) + 1
+        return self._revocations[agent]
 
     async def records(
         self, states: frozenset[ApprovalState] | None = None, limit: int = LIST_LIMIT
@@ -172,6 +219,16 @@ class InMemoryApprovalStore(ApprovalStore):
             r.id
             for r in self._records.values()
             if r.state in EXPIRING_STATES and now >= r.expires_at
+        ]
+
+    async def open_ids(self) -> list[str]:
+        return [r.id for r in self._records.values() if r.state in EXPIRING_STATES]
+
+    async def stuck(self, since: datetime) -> list[str]:
+        return [
+            r.id
+            for r in self._records.values()
+            if r.state is ApprovalState.EXECUTING and r.updated_at <= since
         ]
 
     async def pending_count(self) -> int:

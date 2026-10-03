@@ -11,9 +11,12 @@ LLM upstream (``upstreams.llm``) a question and get a verdict back as a Pydantic
 - ``temperature: 0``, ``response_format: json_object`` (OpenAI, LiteLLM, OpenRouter and
   Ollama's OpenAI-compatible endpoint all accept it; Ollama maps it to ``format: json``),
   a bounded ``max_tokens``, and a total deadline of ``judges.timeout_s``.
-- The answer must be one JSON object valid against ``response_model``. A ``<think>`` block
-  (Qwen3 and other reasoning models) and a Markdown code fence around the object are removed
-  first; anything else is malformed.
+- ``response_model`` must forbid unknown keys (``extra="forbid"``, nested models too; a
+  model that does not is a programming error, `TypeError`), and should declare its verdict
+  fields without defaults. The answer must be one JSON object valid against it in strict
+  mode, so ``{}``, ``{"error": ...}`` or a misspelled key is unavailable, never a verdict.
+  A ``<think>`` block (Qwen3 and other reasoning models) and a Markdown code fence around
+  the object are removed first; anything else is malformed.
 - Any failure (no ``judges`` section, content over ``judges.max_content_chars``, timeout,
   upstream error, oversized, non-JSON or schema-invalid answer) raises
   `JudgeUnavailableError`. The calling control decides what unavailable means in its mode
@@ -127,8 +130,30 @@ class JudgeUnavailableError(Exception):
 
 
 def escape_delimiters(content: str) -> str:
-    """``content`` with every delimiter-like tag defused (``<untrusted_data`` → ``&lt;...``)."""
+    """``content`` with every delimiter-like tag defused (``<untrusted_data`` → ``&lt;...``).
+    Idempotent: escaped text has no ``<`` left before the tag name."""
     return _DELIMITER_LIKE.sub(r"&lt;\1", content)
+
+
+def escape_with_map(content: str) -> tuple[str, tuple[int, ...]]:
+    """`escape_delimiters` of ``content`` plus, per escaped character, the index of the
+    original character it came from (the four characters of ``&lt;`` all map to the ``<``).
+
+    A judge quotes what it saw, the escaped text: the map takes a quote found there back to
+    exact original offsets, without unescaping anything (a literal ``&lt;`` the content
+    really contains stays what it is)."""
+    escaped: list[str] = []
+    origin: list[int] = []
+    done = 0
+    for match in _DELIMITER_LIKE.finditer(content):
+        escaped.append(content[done : match.start()])
+        origin.extend(range(done, match.start()))
+        escaped.append("&lt;")
+        origin.extend([match.start()] * 4)
+        done = match.start() + 1  # the rest of the tag is copied as is
+    escaped.append(content[done:])
+    origin.extend(range(done, len(content)))
+    return "".join(escaped), tuple(origin)
 
 
 def judge_messages(
@@ -143,6 +168,18 @@ def judge_messages(
     )
     user = USER_PROMPT.format(tag=DELIMITER_TAG, nonce=nonce, content=escape_delimiters(content))
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def forbids_extra(schema: Mapping[str, Any]) -> bool:
+    """True when every object in a response model's JSON schema (the root and each ``$defs``
+    entry) forbids properties it does not declare: a judge answer with an unknown or
+    misspelled key must fail validation, not validate as a default verdict."""
+    objects = [schema, *cast("Mapping[str, Any]", schema.get("$defs", {})).values()]
+    return all(
+        cast("Mapping[str, Any]", item).get("additionalProperties") is False
+        for item in objects
+        if cast("Mapping[str, Any]", item).get("type") == "object"
+    )
 
 
 def _answer_text(body: object) -> str | None:
@@ -223,6 +260,10 @@ class JudgeClient:
             raise JudgeUnavailableError(JudgeResult.NOT_CONFIGURED)
         if len(content) > settings.max_content_chars:
             raise JudgeUnavailableError(JudgeResult.CONTENT_TOO_LARGE)
+        schema = response_model.model_json_schema()
+        if not forbids_extra(schema):
+            msg = f"judge response model {response_model.__name__} must set extra='forbid'"
+            raise TypeError(msg)
         override = (
             getattr(snapshot.policy.control_config(control_id), "model", None)
             if control_id in CONTROL_CATALOG
@@ -233,7 +274,7 @@ class JudgeClient:
             "messages": judge_messages(
                 instructions=instructions,
                 content=content,
-                schema=response_model.model_json_schema(),
+                schema=schema,
                 nonce=self._nonce(),
             ),
             "temperature": 0,
@@ -262,6 +303,12 @@ class JudgeClient:
         if not isinstance(parsed, dict):
             raise JudgeUnavailableError(JudgeResult.INVALID_JSON)
         try:
-            return response_model.model_validate(parsed)
+            # Strict: "yes" is not true and "0.9" is not a number. The model forbids unknown
+            # keys, so {} or {"error": ...} is a schema mismatch, never a default verdict.
+            return response_model.model_validate(parsed, strict=True)
         except ValidationError:
             raise JudgeUnavailableError(JudgeResult.SCHEMA_MISMATCH) from None
+
+
+# How the composition root builds the one client (tests hand in a deterministic stand-in).
+type JudgeFactory = Callable[[Upstream, Callable[[], PolicySnapshot]], JudgeClient]

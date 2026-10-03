@@ -14,19 +14,24 @@ ONNX Runtime and ``tokenizers``:
 - the model is warmed up once at construction, so a graph that does not run fails at
   startup, not on the first agent call.
 
-`ClassifierRunner` is what the controls share: it runs the classifier off the event loop
-with at most ``workers`` calls at once (the model is CPU-bound; more threads only queue
-behind ONNX Runtime's own), and remembers scores by text digest in a bounded LRU, so the
+`ClassifierRunner` is what the controls share: it runs the classifier in a pool of its own
+(``workers`` threads, never the loop's default executor), admitting at most ``workers`` calls
+at once on the event loop before anything is submitted, so cancelled or waiting callers hold
+no thread (the model is CPU-bound; more threads only queue behind ONNX Runtime's own). It
+remembers scores by text digest in a bounded LRU, so the
 history an agent re-sends on every chat turn is classified once.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 import math
 import threading
+import weakref
 from collections import OrderedDict
 from collections.abc import Iterator, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Protocol, Self, cast
@@ -198,7 +203,12 @@ class ClassifierRunner:
         cache_entries: int = CACHE_ENTRIES,
     ) -> None:
         self._classifier = classifier
-        self._slots = threading.BoundedSemaphore(workers)  # held by the worker thread itself
+        # A pool of its own: classifier work never occupies the loop's default executor, which
+        # `asyncio.to_thread` callers elsewhere in the gateway share.
+        self._executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="classifier")
+        weakref.finalize(self, self._executor.shutdown, wait=False, cancel_futures=True)
+        self._workers = workers
+        self._admission: asyncio.Semaphore | None = None  # created on the running loop
         self._cache: OrderedDict[bytes, InjectionScore] = OrderedDict()
         self._cache_entries = cache_entries
         self._lock = threading.Lock()
@@ -220,16 +230,37 @@ class ClassifierRunner:
                     known[key] = cached
         pending = {key: t for key, t in zip(keys, texts, strict=True) if key not in known}
         if pending:
-            fresh = await asyncio.to_thread(self._classify, list(pending.values()))
+            fresh = await self._run(list(pending.values()))
             known.update(zip(pending, fresh, strict=True))
             with self._lock:
                 for key in pending:
                     self._remember(key, known[key])
         return [known[key] for key in keys]
 
+    async def _run(self, texts: list[str]) -> list[InjectionScore]:
+        """Classify in the dedicated pool, admitted by an asyncio semaphore taken before the
+        job is submitted. A caller cancelled while waiting submits nothing; a job cancelled
+        before it starts is dropped; a running job keeps its slot until it really finishes."""
+        loop = asyncio.get_running_loop()
+        if self._admission is None:
+            self._admission = asyncio.Semaphore(self._workers)
+        admission = self._admission
+        await admission.acquire()
+        try:
+            job = self._executor.submit(self._classify, texts)
+        except BaseException:
+            admission.release()
+            raise
+
+        def release(_: Future[list[InjectionScore]]) -> None:
+            with contextlib.suppress(RuntimeError):  # the loop is gone: nobody waits any more
+                loop.call_soon_threadsafe(admission.release)
+
+        job.add_done_callback(release)
+        return await asyncio.wrap_future(job)  # cancelling this cancels a job not yet started
+
     def _classify(self, texts: list[str]) -> list[InjectionScore]:
-        with self._slots:  # held in the thread: a cancelled caller cannot free a busy slot
-            scores = self._classifier(texts)
+        scores = self._classifier(texts)
         if len(scores) != len(texts) or not all(math.isfinite(s.score) for s in scores):
             msg = "the classifier returned a malformed score list"
             raise ValueError(msg)

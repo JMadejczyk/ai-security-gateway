@@ -100,7 +100,7 @@ async def test_raising_max_cost_on_reload_lets_the_same_query_run(stack: MCPStac
     policy = stack.gateway.policy_path
     policy.write_text(policy.read_text().replace("max_cost: 10000", "max_cost: 100000"))
     reload = await stack.gateway.operator.post(
-        "/admin/reload", headers=bearer(await stack.gateway.token("root@demo"))
+        "/admin/reload", headers=bearer(await stack.gateway.operator_token("root@demo"))
     )
     assert reload.status_code == 200
     assert (await sales.call("query", sql=HEAVY))["isError"] is False

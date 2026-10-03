@@ -30,7 +30,8 @@ REPORT = {"name": "nightly.md", "content": "numbers"}
 
 async def admin(stack_or_gateway: Any, path: str, sub: str = ROOT, **body: Any) -> httpx.Response:
     harness = getattr(stack_or_gateway, "gateway", stack_or_gateway)
-    return await harness.operator.post(path, json=body, headers=bearer(await harness.token(sub)))
+    headers = bearer(await harness.operator_token(sub))
+    return await harness.operator.post(path, json=body, headers=headers)
 
 
 def killed_gauge(agent: str) -> float:
@@ -52,7 +53,7 @@ async def test_kill_blocks_the_next_call_and_unkill_restores(stack: Any):
     assert any(v["control"] == "kill_switch" for v in entry["verdicts"])
 
     listed = await stack.gateway.operator.get(
-        "/admin/kill", headers=bearer(await stack.gateway.token(ROOT))
+        "/admin/kill", headers=bearer(await stack.gateway.operator_token(ROOT))
     )
     assert [k["agent"] for k in listed.json()["kills"]] == ["nightly_etl"]
 
@@ -131,7 +132,7 @@ async def test_kill_revokes_the_agents_unused_approvals(stack: Any):
     assert killed.json()["revoked_approvals"] == 1
     record = await stack.gateway.container.oversight.approvals.get(approval_id)
     assert (record.state, record.outcome) == (ApprovalState.DENIED, "agent_killed")
-    olga = bearer(await stack.gateway.token(OLGA))
+    olga = bearer(await stack.gateway.operator_token(OLGA))
     path = f"/admin/approvals/{approval_id}/approve"
     late = await stack.gateway.operator.post(path, headers=olga)
     assert late.status_code == 409

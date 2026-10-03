@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 type ReloadListener = Callable[[PolicySnapshot, PolicySnapshot], None]
 """Called with ``(previous, current)`` after a successful swap."""
+type OutcomeListener = Callable[["ReloadOutcome"], None]
+"""Called after every reload attempt (ok, unchanged or invalid), e.g. to audit it."""
 
 
 class ReloadOutcome(FrozenModel):
@@ -41,6 +43,7 @@ class PolicyStore:
         self._current = snapshot
         self._reload_lock = threading.Lock()
         self._listeners: list[ReloadListener] = []
+        self._observers: list[OutcomeListener] = []
         set_active_policy_revision(snapshot.revision)
 
     @classmethod
@@ -62,6 +65,11 @@ class PolicyStore:
         """Register a listener for successful reloads; returns an unsubscribe function."""
         self._listeners.append(listener)
         return lambda: self._listeners.remove(listener)
+
+    def observe(self, listener: OutcomeListener) -> Callable[[], None]:
+        """Register a listener for every reload outcome; returns an unsubscribe function."""
+        self._observers.append(listener)
+        return lambda: self._observers.remove(listener)
 
     def reload(self) -> ReloadOutcome:
         """Re-read the file and swap it in if it is valid and different."""
@@ -111,8 +119,8 @@ class PolicyStore:
             except Exception:
                 logger.exception("policy reload raised; the watcher keeps running")
 
-    @staticmethod
     def _finish(
+        self,
         result: ReloadResult,
         previous: PolicySnapshot,
         current: PolicySnapshot,
@@ -120,9 +128,15 @@ class PolicyStore:
         error: str | None = None,
     ) -> ReloadOutcome:
         record_policy_reload(result)
-        return ReloadOutcome(
+        outcome = ReloadOutcome(
             result=result,
             revision=current.revision,
             previous_revision=previous.revision,
             error=error,
         )
+        for observer in list(self._observers):
+            try:
+                observer(outcome)
+            except Exception:
+                logger.exception("policy reload observer failed")
+        return outcome

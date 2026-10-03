@@ -20,6 +20,9 @@ from gateway.approvals.model import ApprovalState
 from gateway.core.types import Channel, Stage
 from gateway.telemetry import REGISTRY
 
+DENY = pytest.mark.control("authz", "deny")
+ALLOW = pytest.mark.control("authz", "allow")
+
 connect_all = mcp_harness.connect_all
 error_text = mcp_harness.error_text
 
@@ -38,6 +41,8 @@ def killed_gauge(agent: str) -> float:
     return REGISTRY.get_sample_value("acl_kill_switch_active", {"agent": agent}) or 0.0
 
 
+@DENY
+@ALLOW
 async def test_kill_blocks_the_next_call_and_unkill_restores(stack: Any):
     (reports,) = await connect_all(stack, ETL, "reports")
     assert (await reports.call("write_report", **REPORT))["isError"] is False
@@ -62,6 +67,7 @@ async def test_kill_blocks_the_next_call_and_unkill_restores(stack: Any):
     assert (await reports.call("write_report", name="again.md", content="x"))["isError"] is False
 
 
+@DENY
 async def test_a_killed_agent_cannot_use_the_llm_either(gateway, llm_upstream):
     upstream = llm_upstream.post("/chat/completions").mock(
         return_value=httpx.Response(200, json=completion())
@@ -77,6 +83,7 @@ async def test_a_killed_agent_cannot_use_the_llm_either(gateway, llm_upstream):
     assert ok.status_code == 200
 
 
+@DENY
 async def test_a_kill_landing_between_pre_controls_and_dispatch_stops_the_call(
     stack: Any, monkeypatch: pytest.MonkeyPatch
 ):
@@ -101,6 +108,7 @@ async def test_a_kill_landing_between_pre_controls_and_dispatch_stops_the_call(
     assert stack.transport.tool_calls("mcp-files", "write_report") == []
 
 
+@DENY
 async def test_a_kill_landing_during_the_upstream_call_withholds_the_result(
     stack: Any, monkeypatch: pytest.MonkeyPatch
 ):
@@ -144,6 +152,7 @@ async def test_kill_revokes_the_agents_unused_approvals(stack: Any):
     assert stack.log.of("write_report") == []
 
 
+@DENY
 async def test_redis_down_fails_closed(stack: Any, monkeypatch: pytest.MonkeyPatch):
     (reports,) = await connect_all(stack, ETL, "reports")
     dead = Redis.from_url("redis://127.0.0.1:1/0", socket_connect_timeout=0.2)  # pyright: ignore[reportUnknownMemberType]

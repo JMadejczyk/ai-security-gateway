@@ -23,6 +23,10 @@ ROOT_POLICY = REPO_ROOT / "policy.yaml"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 NOW = datetime(2026, 10, 4, 10, 0, tzinfo=UTC)
 
+# control(<id>, outcome) markers + the per-control coverage check and report (make test);
+# pytester runs the plugin's own tests (tests/unit/test_control_report.py).
+pytest_plugins = ["pytester", "plugins.control_report"]
+
 
 @pytest.fixture(scope="session")
 def root_policy_doc() -> dict[str, Any]:

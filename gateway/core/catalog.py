@@ -121,7 +121,8 @@ CONTROL_CATALOG: Mapping[str, ControlSpec] = MappingProxyType(
                 "secrets", _DET, {_PRE, _POST}, (_BLOCK, _REDACT), mandatory=True, risk_delta=0.3
             ),
             _spec("sql_guard", _DET, {_PRE}, (_BLOCK,), channels=_MCP, mandatory=True),
-            _spec("egress", _DET, {_PRE}, (_BLOCK, _APPROVAL), channels=_MCP),
+            # An attempt to reach an internal address is a threat signal, like a leaked secret.
+            _spec("egress", _DET, {_PRE}, (_BLOCK, _APPROVAL), channels=_MCP, risk_delta=0.3),
             _spec("signatures", _DET, {_PRE, _POST}, (_BLOCK, _LOG), risk_delta=0.4),
             _spec("tool_pinning", _DET, {_PRE}, (_BLOCK,), channels=_MCP),
             _spec("budget", _DET, {_PRE, _POST}, (_BLOCK,)),

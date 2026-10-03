@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 
+import pytest
 import yaml
 from gateway_testkit import running_gateway
 from mcp_harness import MCPStack, connect
@@ -10,6 +11,9 @@ from pin_kit import capture_pins, write_pins
 from upstreams import running_upstreams
 
 from gateway.telemetry import ReloadResult
+
+ALLOW = pytest.mark.control("budget", "allow")
+DENY = pytest.mark.control("budget", "deny")
 
 DEAD_REDIS = "redis://127.0.0.1:1/0"  # nothing listens on port 1
 
@@ -22,6 +26,8 @@ def set_budgets(stack: MCPStack, budgets: dict[str, object]) -> None:
     assert outcome.result is ReloadResult.OK, outcome.error
 
 
+@ALLOW
+@DENY
 async def test_the_51st_tool_call_of_a_session_is_blocked(stack: MCPStack):
     set_budgets(stack, {"per_session": {"tool_calls": 50}})
     reports = await connect(stack, "anna@demo", "reports")
@@ -34,6 +40,7 @@ async def test_the_51st_tool_call_of_a_session_is_blocked(stack: MCPStack):
     assert len(stack.log.of("write_report")) == 50
 
 
+@DENY
 async def test_mcp_calls_fail_closed_with_503_when_redis_is_down(tmp_path: Path):
     async with running_upstreams() as (transport, log):
         write_pins(tmp_path / "pins", await capture_pins(transport))

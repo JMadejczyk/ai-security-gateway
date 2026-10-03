@@ -16,6 +16,8 @@ from gateway.sessions import (
     SessionUpdate,
 )
 
+AUTHN_DENY = pytest.mark.control("authn", "deny")
+
 ANNA = SessionBinding(principal="anna@demo", actor="databot", mode=SessionMode.INTERACTIVE)
 LIMITS = Sessions(idle_ttl_s=3600, max_lifetime_s=86400)
 HALF_LIFE = 600.0
@@ -30,6 +32,7 @@ async def bump(store, delta: float = 0.0, *, taint: bool = False, session_id: st
     return await store.apply(session_id, update, half_life_s=HALF_LIFE)
 
 
+@AUTHN_DENY
 @pytest.mark.parametrize(
     "other",
     [
@@ -99,6 +102,7 @@ async def test_timers_are_kept_until_they_expire(store, clock):
     assert (state.freeze_until, state.cooldowns) == (None, ())
 
 
+@AUTHN_DENY
 async def test_idle_ttl_ends_the_session(store, clock):
     limits = Sessions(idle_ttl_s=60, max_lifetime_s=86400)
     await open_anna(store, limits=limits)
@@ -110,6 +114,7 @@ async def test_idle_ttl_ends_the_session(store, clock):
     assert (caught.value.reason, caught.value.status_code) == (SessionReason.ENDED, 401)
 
 
+@AUTHN_DENY
 async def test_max_lifetime_ends_an_active_session(store, clock):
     limits = Sessions(idle_ttl_s=60, max_lifetime_s=120)
     await open_anna(store, limits=limits)
@@ -121,6 +126,7 @@ async def test_max_lifetime_ends_an_active_session(store, clock):
         await open_anna(store, limits=limits)
 
 
+@AUTHN_DENY
 async def test_ended_session_is_never_revived(store):
     await open_anna(store)
     await bump(store, 0.5, taint=True)
@@ -178,6 +184,7 @@ async def test_lock_does_not_serialize_different_sessions(store):
     assert events == ["b ran while a held its lock"]
 
 
+@AUTHN_DENY
 async def test_retired_ids_stay_retired_past_every_lifetime(store, clock):
     await open_anna(store)
     await bump(store, 0.5, taint=True)

@@ -295,6 +295,10 @@ class SignatureFeed:
     def __len__(self) -> int:
         return len(self._document.signatures) if self._document is not None else 0
 
+    @property
+    def signature_ids(self) -> tuple[str, ...]:
+        return tuple(s.id for s in self._document.signatures) if self._document else ()
+
     def signatures(self, pattern_type: PatternType, channel: Channel) -> tuple[Signature, ...]:
         if self._document is None:
             return ()

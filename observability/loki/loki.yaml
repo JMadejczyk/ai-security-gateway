@@ -1,0 +1,58 @@
+# Loki for the demo stack: single binary, filesystem storage on the `loki_data` volume,
+# 7 days of retention enforced by the compactor. It runs on `ops` only; Grafana Alloy pushes
+# the gateway's audit lines here and Grafana queries it. No multi-tenancy (auth_enabled: false)
+# because nothing outside `ops` can reach it.
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9095
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2026-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  retention_period: 168h          # 7 days
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+  max_query_lookback: 168h
+  allow_structured_metadata: true
+  volume_enabled: true
+
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: true
+  delete_request_store: filesystem
+  compaction_interval: 10m
+
+pattern_ingester:
+  enabled: false
+
+ruler:
+  storage:
+    type: local
+    local:
+      directory: /loki/rules
+
+analytics:
+  reporting_enabled: false        # no usage reports to grafana.com

@@ -54,6 +54,8 @@ def edit(path: Path, old: str, new: str) -> None:
     path.write_text(text.replace(old, new, 1))
 
 
+@pytest.mark.control("authz", "allow")
+@pytest.mark.control("authz", "deny")
 def test_valid_reload_changes_revision_and_decision(store, policy_path):
     before = store.current
     assert not bartek_may_read_payments(before)

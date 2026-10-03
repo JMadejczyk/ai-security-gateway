@@ -29,12 +29,17 @@ PROTECTED_PORTS = {
     "redis": 6379,
 }
 
+# Observability on `ops`. Alloy's HTTP server binds 127.0.0.1 inside its container, so it has
+# no network listener at all; it is probed anyway, by name and address.
+OBSERVABILITY_PORTS = {"prometheus": 9090, "loki": 3100, "grafana": 3000, "alloy": 12345}
+NETWORK_LISTENERS = ("prometheus", "loki", "grafana")
+
 StackAddresses = dict[str, dict[str, str]]
 
 
 @pytest.fixture(scope="module")
 def addresses(stack_probe: StackProbe) -> StackAddresses:
-    services = [*PROTECTED_PORTS, "gateway", "agent"]
+    services = [*PROTECTED_PORTS, *OBSERVABILITY_PORTS, "gateway", "agent"]
     return {service: stack_probe.addresses(service) for service in services}
 
 
@@ -173,3 +178,34 @@ def test_gateway_reaches_redis_by_name(stack_probe: StackProbe) -> None:
     """Positive control for the test above."""
     result = stack_probe.from_service("gateway", ["redis:6379"])["redis:6379"]
     assert result.connected, result
+
+
+# --------------------------------------------------------------------------- observability
+
+
+def _observability_targets(addresses: StackAddresses) -> list[str]:
+    by_address = [
+        f"{ip}:{port}"
+        for service, port in OBSERVABILITY_PORTS.items()
+        for ip in addresses[service].values()
+    ]
+    by_name = [f"{service}:{port}" for service, port in OBSERVABILITY_PORTS.items()]
+    return sorted({*by_address, *by_name})
+
+
+def test_observability_listeners_are_up(stack_probe: StackProbe, addresses: StackAddresses) -> None:
+    """Positive controls: the gateway shares `ops` with Prometheus, Loki and Grafana."""
+    targets = [f"{addresses[s]['ops']}:{OBSERVABILITY_PORTS[s]}" for s in NETWORK_LISTENERS]
+    targets += [f"{s}:{OBSERVABILITY_PORTS[s]}" for s in NETWORK_LISTENERS]
+    results = stack_probe.from_service("gateway", targets)
+    assert [result for result in results.values() if not result.connected] == []
+
+
+@pytest.mark.parametrize("service", ["agent", "mcp-fetch"])
+def test_observability_is_unreachable_from_agent_and_fetch(
+    stack_probe: StackProbe, addresses: StackAddresses, service: str
+) -> None:
+    for observability in OBSERVABILITY_PORTS:
+        assert set(addresses[observability]) == {"ops"}, observability
+    results = stack_probe.from_service(service, _observability_targets(addresses))
+    assert _connected(results) == []

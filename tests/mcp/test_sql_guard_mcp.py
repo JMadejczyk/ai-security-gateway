@@ -20,6 +20,9 @@ from gateway.core.interfaces import Control
 from gateway.core.types import ControlKind, Decision, Stage
 from gateway.proxies.mcp.explain import EXPLAIN_TOOL
 
+SQL_ALLOW = pytest.mark.control("sql_guard", "allow")
+SQL_DENY = pytest.mark.control("sql_guard", "deny")
+
 ANNA, BARTEK = "anna@demo", "bartek@demo"
 ALL_ORDERS = "SELECT * FROM sales.orders"
 LIMITED_ORDERS = "SELECT * FROM sales.orders LIMIT 500"
@@ -48,6 +51,7 @@ def sql_guard_verdicts(stack: MCPStack) -> list[dict]:
     ]
 
 
+@SQL_ALLOW
 async def test_the_limited_rewrite_is_priced_then_executed_exactly(stack: MCPStack):
     sales = await connect(stack, ANNA, "sales_db")
     result = await sales.call("query", sql=ALL_ORDERS)
@@ -79,6 +83,7 @@ async def test_a_join_is_priced_per_table_and_executed_once(stack: MCPStack):
     assert [c.arguments["sql"] for c in stack.log.of("query")] == [rewritten]
 
 
+@SQL_DENY
 async def test_cost_over_the_threshold_never_executes(stack: MCPStack):
     stack.log.plan_cost = 70_495.2  # the demo database's estimate for this cross join
     sales = await connect(stack, ANNA, "sales_db")
@@ -91,6 +96,8 @@ async def test_cost_over_the_threshold_never_executes(stack: MCPStack):
     assert "CROSS JOIN" not in json.dumps(entries)  # no SQL text in the audit
 
 
+@SQL_ALLOW
+@SQL_DENY
 async def test_raising_max_cost_on_reload_lets_the_same_query_run(stack: MCPStack):
     """Demo step 7: same request, new policy revision, different verdict."""
     stack.log.plan_cost = 70_495.2
@@ -108,6 +115,7 @@ async def test_raising_max_cost_on_reload_lets_the_same_query_run(stack: MCPStac
     assert query.arguments["sql"].endswith("LIMIT 500")
 
 
+@SQL_DENY
 async def test_no_plan_means_no_execution(stack: MCPStack):
     stack.log.explain_fails = True
     sales = await connect(stack, ANNA, "sales_db")
@@ -115,6 +123,7 @@ async def test_no_plan_means_no_execution(stack: MCPStack):
     assert stack.log.of("query") == []
 
 
+@SQL_DENY
 async def test_an_unreachable_planner_fails_closed(stack: MCPStack):
     sales = await connect(stack, ANNA, "sales_db")
     await sales.tools()  # the agent's own session is up; now every plan request fails
@@ -158,6 +167,7 @@ def planner_cost(sql: str) -> float:
     return 70_495.2
 
 
+@SQL_DENY
 async def test_pii_redaction_cannot_turn_a_cheap_plan_into_a_heavy_query(stack: MCPStack):
     """Codex P1: priced as constant-false, then made true by the pii redaction."""
     stack.log.plan_cost_for = planner_cost
@@ -187,7 +197,9 @@ async def test_the_priced_statement_is_the_executed_statement(stack: MCPStack):
 class RedactSqlKeyword(Control):
     """A pre control whose redaction breaks the statement (it masks the ``FROM`` keyword)."""
 
-    id: ClassVar[str] = "egress"  # any catalog id the default container leaves free
+    # Borrows the id of egress, which never applies to sales_db (sql adapter): the test
+    # swaps the real one out (each catalog id registers once).
+    id: ClassVar[str] = "egress"
     stages: ClassVar[frozenset[Stage]] = frozenset({Stage.PRE})
     kind: ClassVar[ControlKind] = ControlKind.DETERMINISTIC
 
@@ -201,6 +213,7 @@ class RedactSqlKeyword(Control):
 
 
 async def test_redaction_that_breaks_the_statement_fails_closed(stack: MCPStack):
+    stack.gateway.container.pipeline.controls.remove("egress")
     stack.gateway.container.pipeline.controls.register(RedactSqlKeyword())
     sales = await connect(stack, ANNA, "sales_db")
     result = await sales.call("query", sql="SELECT COUNT(*) FROM sales.customers")
@@ -208,6 +221,7 @@ async def test_redaction_that_breaks_the_statement_fails_closed(stack: MCPStack)
     assert stack.log.calls == []
 
 
+@SQL_DENY
 async def test_a_statement_changed_after_sql_guard_is_never_dispatched(stack, monkeypatch):
     """Anything between sql_guard and dispatch (here the budget hold) must not alter the SQL."""
     ledger = stack.gateway.container.pipeline._budgets
@@ -302,6 +316,7 @@ async def test_explain_runs_under_the_admitted_snapshot_across_a_reload(stack: M
     """Codex P2: the plan goes to the endpoint, with the limits, the statement runs under."""
     sales = await connect(stack, ANNA, "sales_db")
     await sales.tools()
+    stack.gateway.container.pipeline.controls.remove("egress")  # see RedactSqlKeyword
     stack.gateway.container.pipeline.controls.register(ReloadMidCall(stack))
     assert (await sales.call("query", sql=ALL_ORDERS))["isError"] is False
     [explain] = stack.log.of("explain")

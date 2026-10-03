@@ -30,6 +30,8 @@ from gateway.policy.schema import LoopDetectConfig
 BLOCK = LoopDetectConfig(mode=ControlMode.BLOCK, max_repeats=5, window_s=60)
 LOG_ONLY = LoopDetectConfig(mode=ControlMode.LOG_ONLY, max_repeats=5, window_s=60)
 DEAD_REDIS = "redis://127.0.0.1:1/0"  # nothing listens on port 1
+ALLOWED = pytest.mark.control("loop_detect", "allow")
+DENIED = pytest.mark.control("loop_detect", "deny")
 
 
 @pytest.fixture
@@ -128,8 +130,11 @@ def test_fingerprint_covers_route_and_resource(interaction):
 # ----------------------------------------------------------------------------- control
 
 
+@ALLOWED
 @pytest.mark.parametrize(
-    ("cfg", "enforced"), [(BLOCK, True), (LOG_ONLY, False)], ids=["block", "log_only"]
+    ("cfg", "enforced"),
+    [pytest.param(BLOCK, True, marks=DENIED), (LOG_ONLY, False)],
+    ids=["block", "log_only"],
 )
 async def test_more_than_max_repeats_is_a_loop(control, interaction, cfg, enforced):
     call = interaction()
@@ -140,6 +145,8 @@ async def test_more_than_max_repeats_is_a_loop(control, interaction, cfg, enforc
     assert verdict.reason == "6 identical calls within 60s"
 
 
+@ALLOWED
+@DENIED
 async def test_a_different_call_has_its_own_count(control, interaction):
     await decisions(control, interaction(), 6)
     other = interaction({"name": "write_report", "arguments": {"name": "q4.md"}})
@@ -147,11 +154,14 @@ async def test_a_different_call_has_its_own_count(control, interaction):
     assert await decisions(control, interaction(), 1) == ["loop_detected"]
 
 
+@ALLOWED
 async def test_sessions_are_counted_separately(control, interaction):
     await decisions(control, interaction(), 6)
     assert await decisions(control, interaction(session_id="s-other"), 1) == ["no_loop"]
 
 
+@ALLOWED
+@DENIED
 async def test_the_window_slides(control, interaction, clock):
     call = interaction()
     await decisions(control, call, 5)
@@ -162,6 +172,7 @@ async def test_the_window_slides(control, interaction, clock):
     assert await decisions(control, call, 1) == ["loop_detected"]
 
 
+@ALLOWED
 async def test_approval_retries_are_neither_counted_nor_blocked(
     control, interaction, snapshot, counter
 ):
@@ -176,6 +187,7 @@ async def test_approval_retries_are_neither_counted_nor_blocked(
     assert count == 7  # the three retries were not recorded
 
 
+@DENIED
 async def test_redis_down_fails_closed(interaction):
     client = Redis.from_url(DEAD_REDIS, socket_connect_timeout=0.2, socket_timeout=0.2)
     control = LoopDetectControl(RedisCallCounter(client))

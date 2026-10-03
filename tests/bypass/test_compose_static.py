@@ -5,12 +5,13 @@ These run anywhere the docker CLI exists (no daemon, no running stack needed).
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from compose_support import REPO_ROOT, ComposeConfig
+from compose_support import _PLACEHOLDER_SECRETS, REPO_ROOT, ComposeConfig
 
 INTERNAL_NETWORKS = ("edge", "llm_backend", "mcp_backend", "mcp_untrusted", "state")
 
@@ -25,6 +26,18 @@ EXPECTED_NETWORKS = {
     "postgres": {"mcp_backend"},
     "mcp-fetch": {"mcp_untrusted", "fetch_egress"},
     "redis": {"state"},
+    "prometheus": {"ops"},
+    "loki": {"ops"},
+    "alloy": {"ops"},
+    "grafana": {"ops"},
+}
+
+OBSERVABILITY = ("prometheus", "loki", "alloy", "grafana")
+OBSERVABILITY_VOLUMES = {
+    "prometheus": {"prometheus_data"},
+    "loki": {"loki_data"},
+    "alloy": {"alloy_data", "audit_log"},
+    "grafana": {"grafana_data"},
 }
 
 AGENT_FORBIDDEN_ENV = re.compile(r"JWT|SECRET|INTERNAL_KEY|PASSWORD|TOKEN", re.IGNORECASE)
@@ -67,9 +80,13 @@ def test_only_fetch_and_init_join_networks_with_internet(compose_config: Compose
         assert members == expected
 
 
-def test_only_gateway_publishes_ports_and_only_on_loopback(compose_config: ComposeConfig) -> None:
+def test_only_gateway_and_grafana_publish_ports_and_only_on_loopback(
+    compose_config: ComposeConfig,
+) -> None:
     publishing = {name for name, svc in compose_config.services.items() if svc.get("ports")}
-    assert publishing == {"gateway"}
+    assert publishing == {"gateway", "grafana"}
+    grafana = cast(list[dict[str, Any]], compose_config.service("grafana")["ports"])
+    assert [(p["host_ip"], p["target"]) for p in grafana] == [("127.0.0.1", 3000)]
     ports = cast(list[dict[str, Any]], compose_config.service("gateway")["ports"])
     # Host-side port numbers are overridable (ACL_*_HOST_PORT); the bind address is not.
     assert sorted((p["host_ip"], p["target"]) for p in ports) == [
@@ -98,6 +115,7 @@ def test_operator_listener_binds_the_gateway_ops_address(compose_config: Compose
         "postgres",
         "redis",
         "models-init",
+        *OBSERVABILITY,
     ],
 )
 def test_no_service_escapes_docker_isolation(compose_config: ComposeConfig, service: str) -> None:
@@ -221,3 +239,94 @@ def test_injection_model_is_fetched_on_bootstrap_and_mounted_read_only(
         k for k in compose_config.environment_of("models-init") if AGENT_FORBIDDEN_ENV.search(k)
     ]
     assert "gateway.injection.fetch" in " ".join(cast(list[str], init["command"]))
+
+
+# --------------------------------------------------------------------------- observability
+
+
+def test_ops_members_are_the_gateway_and_the_observability_services(
+    compose_config: ComposeConfig,
+) -> None:
+    members = {s for s in compose_config.services if "ops" in compose_config.networks_of(s)}
+    assert members == {"gateway", *OBSERVABILITY}
+
+
+@pytest.mark.parametrize("service", OBSERVABILITY)
+def test_observability_services_are_hardened(compose_config: ComposeConfig, service: str) -> None:
+    spec = compose_config.service(service)
+    assert spec.get("cap_drop") == ["ALL"]
+    assert "no-new-privileges:true" in spec.get("security_opt", [])
+    assert spec.get("read_only") is True
+    assert str(spec.get("user", "")) not in {"0", "root", "0:0"}
+    assert compose_config.networks_of(service) == {"ops"}
+    tag = _image_tag(str(spec["image"]))
+    assert tag is not None
+    assert re.fullmatch(r"v?\d+\.\d+\.\d+", tag), f"{service}: {spec['image']} not an exact tag"
+
+
+@pytest.mark.parametrize("service", OBSERVABILITY)
+def test_observability_services_mount_only_their_volumes_and_config(
+    compose_config: ComposeConfig, service: str
+) -> None:
+    mounts = cast(list[dict[str, Any]], compose_config.service(service).get("volumes", []))
+    volumes = {str(m["source"]) for m in mounts if m.get("type") == "volume"}
+    assert volumes == OBSERVABILITY_VOLUMES[service]
+    for mount in mounts:
+        if mount.get("type") == "bind":  # configuration from the repo, never writable
+            assert mount.get("read_only") is True, mount
+            assert Path(str(mount["source"])).resolve().is_relative_to(REPO_ROOT), mount
+        assert "docker.sock" not in str(mount.get("source", "")) + str(mount.get("target", ""))
+
+
+def test_alloy_has_no_docker_socket_and_reads_the_audit_log_only(
+    compose_config: ComposeConfig,
+) -> None:
+    alloy = compose_config.service("alloy")
+    rendered = json.dumps(alloy)
+    assert "docker.sock" not in rendered
+    assert "/var/run" not in rendered
+    audit = _volume_mounts(compose_config, "alloy")["audit_log"]
+    assert audit.get("read_only") is True
+    assert audit["target"] == "/var/log/acl"
+
+
+def test_audit_log_volume_is_operator_only(compose_config: ComposeConfig) -> None:
+    """The gateway writes the JSONL export; alloy reads it; nothing else mounts it."""
+    holders = {
+        s for s in compose_config.services if "audit_log" in _volume_mounts(compose_config, s)
+    }
+    assert holders == {"gateway", "alloy"}
+    gateway_mount = _volume_mounts(compose_config, "gateway")["audit_log"]
+    assert not gateway_mount.get("read_only")
+    audit_path = compose_config.environment_of("gateway")["ACL_AUDIT_PATH"]
+    assert audit_path is not None
+    assert Path(audit_path).parent == Path(gateway_mount["target"])
+
+
+def test_grafana_secret_reaches_only_grafana(compose_config: ComposeConfig) -> None:
+    placeholder = _PLACEHOLDER_SECRETS["ACL_GRAFANA_ADMIN_PASSWORD"]
+    holders = {s for s, spec in compose_config.services.items() if placeholder in json.dumps(spec)}
+    assert holders == {"grafana"}
+    environment = compose_config.environment_of("grafana")
+    assert environment["GF_SECURITY_ADMIN_PASSWORD"] == placeholder
+    assert environment["GF_AUTH_ANONYMOUS_ENABLED"] == "false"
+    assert environment["GF_USERS_ALLOW_SIGN_UP"] == "false"
+
+
+@pytest.mark.parametrize("service", ["prometheus", "loki", "alloy"])
+def test_observability_services_hold_no_secrets(
+    compose_config: ComposeConfig, service: str
+) -> None:
+    rendered = json.dumps(compose_config.service(service))
+    assert "placeholder" not in rendered
+    assert not compose_config.service(service).get("env_file")
+
+
+def test_observability_image_versions_are_recorded_in_licenses(
+    compose_config: ComposeConfig,
+) -> None:
+    """LICENSES.md records these exact versions; a bump must update it."""
+    licenses = (REPO_ROOT / "LICENSES.md").read_text()
+    for service in OBSERVABILITY:
+        image = str(compose_config.service(service)["image"])
+        assert image in licenses, f"{image} is not recorded in LICENSES.md"

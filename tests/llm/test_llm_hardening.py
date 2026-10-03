@@ -21,6 +21,10 @@ from gateway.core.types import ControlKind, Decision, Stage
 from gateway.sessions import SessionUpdate
 from gateway.telemetry import REGISTRY
 
+AUTHZ_ALLOW = pytest.mark.control("authz", "allow")
+AUTHZ_DENY = pytest.mark.control("authz", "deny")
+AUTHN_DENY = pytest.mark.control("authn", "deny")
+
 CHAT = "/v1/chat/completions"
 ETL = "svc:nightly_etl"
 
@@ -66,6 +70,7 @@ async def raise_risk(gateway, token: str, delta: float) -> str:
 # ----------------------------------------------------------- 1. rewrites are authorized
 
 
+@AUTHZ_DENY
 async def test_rewrite_to_an_unauthorized_model_is_blocked(gateway, upstream):
     def to_llama(interaction, stage):
         if stage is Stage.POST:
@@ -100,6 +105,7 @@ async def test_rewrite_into_an_invalid_request_is_blocked(gateway, upstream):
     assert not upstream.called
 
 
+@AUTHZ_ALLOW
 async def test_authorized_rewrite_still_runs(gateway, upstream):
     def lower_temperature(interaction, stage):
         if stage is Stage.POST:
@@ -119,6 +125,7 @@ async def test_authorized_rewrite_still_runs(gateway, upstream):
 # ---------------------------------------------------------------- 2. throttling + alerts
 
 
+@AUTHZ_DENY
 async def test_autonomous_agent_at_elevated_risk_is_throttled(gateway, upstream, caplog):
     token = await gateway.token(ETL)
     first = await gateway.agent.post(CHAT, json=chat(), headers=bearer(token))
@@ -170,6 +177,7 @@ async def test_throttle_backoff_resets_after_a_compliant_window(gateway, upstrea
     assert (await call()).headers["retry-after"] == "5"  # back to base_s
 
 
+@AUTHZ_ALLOW
 async def test_interactive_sessions_are_never_throttled(gateway, upstream):
     token = await gateway.token("anna@demo")
     await gateway.agent.post(CHAT, json=chat(), headers=bearer(token))
@@ -184,6 +192,7 @@ async def test_interactive_sessions_are_never_throttled(gateway, upstream):
 # ------------------------------------------------------- 3. retired sessions stay retired
 
 
+@AUTHN_DENY
 @pytest.mark.parametrize("how", ["deleted", "idle"])
 async def test_retired_tainted_session_never_comes_back_clean(gateway, upstream, how):
     token = sign(claims(gateway.clock, session_id="s-tainted"))

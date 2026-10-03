@@ -27,6 +27,9 @@ from gateway.main import create_operator_app
 from gateway.proxies.mcp.pins import PinFile
 from gateway.telemetry import ReloadResult
 
+ALLOW = pytest.mark.control("tool_pinning", "allow")
+DENY = pytest.mark.control("tool_pinning", "deny")
+
 ANNA = "anna@demo"
 WRITE_DESCRIPTION = (
     "Create a new text report `name` (a plain file name); never replaces an existing one."
@@ -107,6 +110,7 @@ def pin_verdicts(stack: MCPStack) -> list[str]:
 # ---------------------------------------------------------------------- matching pins
 
 
+@ALLOW
 async def test_matching_pins_list_and_allow(pinned: MCPStack):
     tools = await listed(pinned, "reports")
     assert set(tools) == {"write_report"}
@@ -126,6 +130,7 @@ async def test_listing_shows_only_the_pinned_fields(pinned: MCPStack, servers):
 # --------------------------------------------------------------------------- rug pulls
 
 
+@DENY
 async def test_a_rewritten_description_is_hidden_and_blocked(pinned: MCPStack, servers):
     servers.tool("mcp-files", "write_report").description = RUG_PULL
     assert await listed(pinned, "reports") == {}
@@ -134,6 +139,7 @@ async def test_a_rewritten_description_is_hidden_and_blocked(pinned: MCPStack, s
     assert pin_verdicts(pinned) == ["tool_pin_mismatch"]
 
 
+@DENY
 async def test_a_change_mid_session_is_caught_at_the_next_listing(pinned: MCPStack, servers):
     reports = await connect(pinned, ANNA, "reports")
     assert await reports.tools() == ["write_report"]
@@ -143,6 +149,7 @@ async def test_a_change_mid_session_is_caught_at_the_next_listing(pinned: MCPSta
     assert error_text(result) == "tool_pin_mismatch"
 
 
+@DENY
 async def test_an_annotation_only_change_is_blocked(pinned: MCPStack, servers):
     servers.tool("mcp-files", "write_report").annotations = ToolAnnotations(
         read_only_hint=False, destructive_hint=True
@@ -151,6 +158,8 @@ async def test_an_annotation_only_change_is_blocked(pinned: MCPStack, servers):
     assert error_text(await write_report(pinned)) == "tool_pin_mismatch"
 
 
+@ALLOW
+@DENY
 async def test_a_new_unpinned_tool_is_hidden_and_blocked(pinned: MCPStack, servers):
     async def export_reports(destination: str, ctx: Context) -> str:
         """Copy every report to `destination`."""
@@ -171,11 +180,13 @@ async def test_a_new_unpinned_tool_is_hidden_and_blocked(pinned: MCPStack, serve
     assert (await write_report(pinned))["isError"] is False  # the pinned tool still works
 
 
+@DENY
 async def test_a_pinned_tool_no_longer_advertised_is_refused(pinned: MCPStack, servers):
     servers.by_host["mcp-files"].remove_tool("write_report")
     assert error_text(await write_report(pinned)) == "tool_pin_mismatch"
 
 
+@DENY
 async def test_a_pin_file_edited_by_hand_fails_closed(pinned: MCPStack, tmp_path: Path):
     path = tmp_path / "pins" / "reports.json"
     path.write_text(path.read_text().replace("Create a new", "Create any"))
@@ -185,6 +196,7 @@ async def test_a_pin_file_edited_by_hand_fails_closed(pinned: MCPStack, tmp_path
 # ------------------------------------------------------------------------- quarantine
 
 
+@DENY
 async def test_a_drift_seen_once_blocks_every_session_until_an_operator_clears_it(
     pinned: MCPStack, servers, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ):
@@ -232,6 +244,8 @@ async def test_a_stale_cached_listing_never_quarantines_a_re_approved_tool(
     assert set(await listed(pinned, "reports")) == {"write_report"}
 
 
+@ALLOW
+@DENY
 async def test_a_missing_tool_is_refused_but_not_quarantined(pinned: MCPStack, servers):
     server = servers.by_host["mcp-files"]
     removed = servers.tool("mcp-files", "write_report")
@@ -244,12 +258,14 @@ async def test_a_missing_tool_is_refused_but_not_quarantined(pinned: MCPStack, s
 # ------------------------------------------------------------------------ require_pin
 
 
+@DENY
 async def test_a_server_without_a_pin_file_is_blocked_by_default(pinned: MCPStack, tmp_path):
     (tmp_path / "pins" / "reports.json").unlink()
     assert await listed(pinned, "reports") == {}
     assert error_text(await write_report(pinned)) == "tool_not_pinned"
 
 
+@ALLOW
 async def test_require_pin_false_opts_a_server_out(pinned: MCPStack, tmp_path, servers):
     (tmp_path / "pins" / "reports.json").unlink()
     edit_policy(pinned, lambda d: d["upstreams"]["mcp"]["reports"].update(require_pin=False))
@@ -291,7 +307,10 @@ async def test_acl_pin_diffs_then_writes_the_reviewed_baseline(
     approved = pin.tool("write_report")
     assert approved is not None
     assert approved.description == RUG_PULL
-    assert (await write_report(pinned))["isError"] is False  # the new baseline lifts it
+    # The new baseline lifts the pin mismatch; signatures still refuses this description when
+    # the tool is called by name (it says "do not tell the user").
+    assert error_text(await write_report(pinned)) == "signature_match"
+    assert pin_verdicts(pinned)[-1] == "tool_pinned"
     assert await pinned.gateway.container.state.tool_quarantine.entries("reports") == {}
 
 

@@ -27,6 +27,8 @@ APPROVALS = Counter(
     ["decision"],
     registry=REGISTRY,
 )
+for _state in ApprovalState:  # every state at 0, so `increase()` sees the first of each
+    APPROVALS.labels(decision=_state.value)
 KILL_SWITCH_ACTIVE = Gauge(
     "acl_kill_switch_active",
     "1 for every agent whose kill switch is on.",

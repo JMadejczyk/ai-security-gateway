@@ -3,12 +3,16 @@
 from typing import ClassVar
 
 import jwt
+import pytest
 from mcp_harness import MCPClient, MCPStack, connect, error_text
 
 from gateway.core.envelope import Verdict
 from gateway.core.interfaces import Control
 from gateway.core.types import ControlKind, Decision, Stage
 from gateway.sessions import SessionUpdate
+
+AUTHZ_ALLOW = pytest.mark.control("authz", "allow")
+AUTHZ_DENY = pytest.mark.control("authz", "deny")
 
 BARTEK, ETL = "bartek@demo", "svc:nightly_etl"
 COUNT_CUSTOMERS = "SELECT COUNT(*) FROM sales.customers"
@@ -31,6 +35,7 @@ class RewriteSql(Control):
         )
 
 
+@AUTHZ_DENY
 async def test_rewrite_to_a_forbidden_table_is_blocked(stack: MCPStack):
     stack.gateway.container.pipeline.controls.clear()  # scripted below, replacing the real controls
     stack.gateway.container.pipeline.controls.register(
@@ -48,6 +53,7 @@ async def test_rewrite_to_a_forbidden_table_is_blocked(stack: MCPStack):
     )
 
 
+@AUTHZ_ALLOW
 async def test_rewrite_within_the_grant_still_runs(stack: MCPStack):
     stack.gateway.container.pipeline.controls.clear()  # scripted below, replacing the real controls
     stack.gateway.container.pipeline.controls.register(
@@ -60,6 +66,7 @@ async def test_rewrite_within_the_grant_still_runs(stack: MCPStack):
     assert call.arguments == {"sql": "SELECT COUNT(*) FROM sales.orders"}
 
 
+@AUTHZ_DENY
 async def test_autonomous_tool_calls_are_throttled_with_retry_after(stack: MCPStack):
     etl = await connect(stack, ETL, "sales_db")  # initialize opened the gateway session
     assert etl.token is not None
@@ -90,6 +97,7 @@ async def test_oversize_mcp_request_is_413_and_audited(stack: MCPStack):
     assert stack.log.of("query") == []
 
 
+@pytest.mark.control("authn", "deny")
 async def test_mcp_admission_refusals_are_audited(stack: MCPStack):
     anonymous = MCPClient(stack.gateway.agent, None, "sales_db")
     assert (await anonymous.initialize()).status_code == 401

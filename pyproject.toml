@@ -71,9 +71,9 @@ known-first-party = ["gateway"]
 pythonVersion = "3.12"
 venvPath = "."
 venv = ".venv"
-include = ["gateway", "tests"]
+include = ["gateway", "tests", "grafana", "observability"]
 typeCheckingMode = "basic"
-strict = ["gateway"]
+strict = ["gateway", "grafana", "observability"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -84,4 +84,5 @@ markers = [
     "docker: needs the live docker compose stack (run with `make test-docker`)",
     "redis: needs a real Redis (a throwaway docker container, or ACL_TEST_REDIS_URL); skips without",
     "model: needs the pinned injection model in models/cache (python -m gateway.injection.fetch); skips without",
+    "perf: full gateway overhead measurement writing reports/perf.{json,md}; runs only when selected (`make perf`)",
 ]

@@ -15,6 +15,12 @@ import respx
 import yaml
 from gateway_testkit import Harness, bearer, chat, completion
 
+PII_DENY = pytest.mark.control("pii", "deny")
+PII_REDACT = pytest.mark.control("pii", "redact")
+PII_LOG = pytest.mark.control("pii", "log_only")
+SECRETS_DENY = pytest.mark.control("secrets", "deny")
+SECRETS_REDACT = pytest.mark.control("secrets", "redact")
+
 CHAT = "/v1/chat/completions"
 PESEL = "44051401359"
 API_KEY = "sk-proj-" + "Ab3De5Fg7Hi9Jk1Lm3No5Pq7Rs9Tu1Vw3Xy5Za7Bc9De"  # fake, assembled
@@ -68,6 +74,7 @@ def answer(llm_upstream) -> ScriptedAnswer:
     return ScriptedAnswer(llm_upstream)
 
 
+@PII_REDACT
 @pytest.mark.parametrize("stream", [False, True])
 async def test_pesel_in_the_prompt_is_redacted_before_the_upstream(gateway, answer, stream):
     response = await ask(gateway, f"Klient o numerze PESEL {PESEL} pyta o fakturę.", stream=stream)
@@ -89,6 +96,7 @@ async def test_pesel_in_the_prompt_is_redacted_before_the_upstream(gateway, answ
     assert_nothing_leaked(gateway, PESEL)
 
 
+@SECRETS_DENY
 async def test_api_key_in_the_prompt_is_blocked_and_never_sent(gateway, answer):
     response = await ask(gateway, f"Use this key: {API_KEY} to call the API")
     assert (response.status_code, response.json()["error"]["code"]) == (403, "secret_detected")
@@ -100,6 +108,7 @@ async def test_api_key_in_the_prompt_is_blocked_and_never_sent(gateway, answer):
     assert_nothing_leaked(gateway, API_KEY)
 
 
+@SECRETS_DENY
 @pytest.mark.parametrize("stream", [False, True])
 async def test_secret_in_the_answer_is_withheld(gateway, answer, stream):
     answer.content = f"Sure, the production key is {STRIPE}."
@@ -112,6 +121,7 @@ async def test_secret_in_the_answer_is_withheld(gateway, answer, stream):
     assert_nothing_leaked(gateway, STRIPE)
 
 
+@SECRETS_DENY
 async def test_secret_in_a_tool_call_argument_is_withheld(gateway, llm_upstream):
     call = {
         "id": "call_1",
@@ -126,6 +136,7 @@ async def test_secret_in_a_tool_call_argument_is_withheld(gateway, llm_upstream)
     assert STRIPE not in response.text
 
 
+@SECRETS_REDACT
 @pytest.mark.parametrize("stream", [False, True])
 async def test_secrets_in_redact_mode_mask_the_answer(gateway, answer, stream):
     edit_policy(gateway, secrets={"mode": "redact"})
@@ -141,6 +152,7 @@ async def test_secrets_in_redact_mode_mask_the_answer(gateway, answer, stream):
         )
 
 
+@PII_REDACT
 @pytest.mark.parametrize("stream", [False, True])
 async def test_personal_data_in_the_answer_is_redacted(gateway, answer, stream):
     answer.content = f"Anna's PESEL is {PESEL}, mail anna@firma.pl."
@@ -155,6 +167,7 @@ async def test_personal_data_in_the_answer_is_redacted(gateway, answer, stream):
     assert_nothing_leaked(gateway, PESEL, "anna@firma.pl")
 
 
+@PII_DENY
 async def test_pii_block_mode_refuses_the_prompt(gateway, answer):
     edit_policy(gateway, pii={"mode": "block"})
     response = await ask(gateway, f"PESEL {PESEL}")
@@ -162,12 +175,15 @@ async def test_pii_block_mode_refuses_the_prompt(gateway, answer):
     assert not answer.route.called
 
 
+@PII_REDACT
 async def test_unconfigured_entities_pass(gateway, answer):
     edit_policy(gateway, pii={"mode": "redact", "entities": ["EMAIL_ADDRESS"]})
     await ask(gateway, f"PESEL {PESEL}, mail jan@firma.pl")
     assert sent_content(answer.route) == f"PESEL {PESEL}, mail [REDACTED:EMAIL_ADDRESS]"
 
 
+@PII_LOG
+@SECRETS_DENY
 async def test_permissive_profile_logs_pii_but_secrets_still_enforce(gateway, answer):
     # Drop the explicit modes so the profile decides; secrets is mandatory and ignores it.
     edit_policy(gateway, profile="permissive", pii={"threshold": 0.6}, secrets={})
@@ -188,6 +204,7 @@ async def test_permissive_profile_logs_pii_but_secrets_still_enforce(gateway, an
 # ------------------------------------------------------------------ review evasions
 
 
+@SECRETS_DENY
 async def test_secret_in_a_tool_definition_never_reaches_the_upstream(gateway, answer):
     tool = {"type": "function", "function": {"name": "pay", "description": f"key {STRIPE}"}}
     response = await ask(gateway, "Pay the invoice.", tools=[tool])
@@ -195,6 +212,7 @@ async def test_secret_in_a_tool_definition_never_reaches_the_upstream(gateway, a
     assert not answer.route.called
 
 
+@SECRETS_REDACT
 @pytest.mark.parametrize("stream", [False, True])
 async def test_legacy_function_call_with_an_escaped_key_is_masked_in_json_and_sse(
     gateway, llm_upstream, stream
@@ -211,6 +229,7 @@ async def test_legacy_function_call_with_an_escaped_key_is_masked_in_json_and_ss
     assert "[REDACTED:" in response.text
 
 
+@SECRETS_DENY
 async def test_unparseable_escaped_tool_arguments_are_refused(gateway, llm_upstream):
     call = {"id": "c", "type": "function", "function": {"name": "f", "arguments": '{"a": "\\u00'}}
     llm_upstream.post("/chat/completions").mock(
@@ -223,6 +242,7 @@ async def test_unparseable_escaped_tool_arguments_are_refused(gateway, llm_upstr
     )
 
 
+@PII_REDACT
 async def test_zero_width_split_pesel_is_masked_before_the_upstream(gateway, answer):
     await ask(gateway, "PESEL 4405\u200b1401359, ok?")
     assert sent_content(answer.route) == "PESEL [REDACTED:PL_PESEL], ok?"

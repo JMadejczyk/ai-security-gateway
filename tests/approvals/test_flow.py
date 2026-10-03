@@ -30,6 +30,14 @@ from gateway.judges.client import JudgeClient
 from gateway.sessions import SessionUpdate
 from gateway.telemetry import REGISTRY, ReloadResult
 
+AUTHZ_ALLOW = pytest.mark.control("authz", "allow")
+AUTHZ_DENY = pytest.mark.control("authz", "deny")
+AUTHZ_HOLD = pytest.mark.control("authz", "require_approval")
+AUTHN_DENY = pytest.mark.control("authn", "deny")
+LOOP_DENY = pytest.mark.control("loop_detect", "deny")
+INTENT_HOLD = pytest.mark.control("intent_judge", "require_approval")
+PII_REDACT = pytest.mark.control("pii", "redact")
+
 connect_all = mcp_harness.connect_all
 error_text = mcp_harness.error_text
 
@@ -96,6 +104,8 @@ def approvals_total(decision: str) -> float:
 # ------------------------------------------------------------------- demo step 3
 
 
+@AUTHZ_HOLD
+@AUTHZ_ALLOW
 async def test_held_write_is_approved_and_runs_exactly_once(stack: Any):
     reports = await tainted_etl(stack)
     approved_before = approvals_total("approved")
@@ -178,6 +188,7 @@ async def test_retrying_a_pending_operation_returns_the_same_id(stack: Any):
     assert [r.id for r in records] == [approval_id]
 
 
+@LOOP_DENY
 async def test_approval_retries_do_not_trip_loop_detection(stack: Any):
     reports = await tainted_etl(stack)
     approval_id = await held(reports)
@@ -209,6 +220,7 @@ async def test_someone_without_an_approver_role_gets_no_operator_token(stack: An
     assert await state_of(stack, approval_id) is ApprovalState.PENDING
 
 
+@AUTHN_DENY
 @pytest.mark.parametrize("sub", [BARTEK, OLGA, ROOT])
 async def test_agent_tokens_never_open_the_operator_api(stack: Any, sub: str):
     reports = await tainted_etl(stack)
@@ -222,6 +234,7 @@ async def test_agent_tokens_never_open_the_operator_api(stack: Any, sub: str):
     assert await state_of(stack, approval_id) is ApprovalState.PENDING
 
 
+@AUTHN_DENY
 async def test_operator_tokens_never_open_the_agent_api(stack: Any):
     token = await stack.gateway.operator_token(ROOT)
     client = mcp_harness.MCPClient(stack.gateway.agent, token, "reports")
@@ -251,6 +264,7 @@ async def risky_databot_write(stack: Any, sub: str) -> tuple[Any, str]:
     return reports, await held(reports)
 
 
+@AUTHZ_HOLD
 async def test_an_approver_decides_another_persons_databot_call(stack: Any):
     """olga (ops-team) approves anna's databot write: operators are not agents."""
     reports, approval_id = await risky_databot_write(stack, ANNA)
@@ -289,6 +303,7 @@ async def test_a_decided_approval_cannot_be_decided_again(stack: Any):
 # ------------------------------------------------------------- denial and expiry
 
 
+@AUTHZ_DENY
 async def test_denied_approval_blocks_the_retry(stack: Any):
     reports = await tainted_etl(stack)
     approval_id = await held(reports)
@@ -333,6 +348,7 @@ async def test_an_approval_not_used_in_time_expires(stack: Any):
 # ------------------------------------------------------------------- hot reload
 
 
+@AUTHZ_DENY
 async def test_a_reload_revoking_the_grant_stops_an_approved_call(stack: Any):
     reports = await tainted_etl(stack)
     approval_id = await held(reports)
@@ -465,6 +481,7 @@ async def judged_stack(tmp_path: Path) -> AsyncIterator[Any]:
             yield mcp_harness.MCPStack(gw, transport, log)
 
 
+@INTENT_HOLD
 async def test_an_intent_flagged_mcp_call_goes_through_the_same_queue(judged_stack: Any):
     """The LLM answer is released; the flagged tool_call's MCP call is held (intent_flagged),
     approved, and the retry with the id runs it once."""
@@ -520,6 +537,7 @@ async def test_a_changed_resource_mapping_needs_a_new_approval(stack: Any):
     assert view.json()["resources"] == ["fs:archive/nightly.md"]
 
 
+@AUTHZ_DENY
 async def test_a_kill_landing_during_consumption_stops_the_dispatch(
     stack: Any, monkeypatch: pytest.MonkeyPatch
 ):
@@ -543,6 +561,8 @@ async def test_a_kill_landing_during_consumption_stops_the_dispatch(
     assert (record.state, record.outcome) == (ApprovalState.DENIED, "agent_killed")
 
 
+@PII_REDACT
+@AUTHZ_HOLD
 async def test_a_redacted_write_is_held_approved_and_runs_redacted(stack: Any):
     """pii redacts the write (a rewrite), taint holds it: the approval binds the redacted
     operation, and the approved retry is not refused as an unauthorized rewrite."""

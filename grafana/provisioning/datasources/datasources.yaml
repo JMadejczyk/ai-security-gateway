@@ -1,0 +1,30 @@
+# Provisioned at Grafana start (SPEC: "Dashboards and data sources are provisioned as files in
+# the repo"). Both live on `ops`. Dashboards never name these uids: they pick a data source
+# through their `datasource` / `loki` template variables.
+apiVersion: 1
+
+deleteDatasources:
+  - name: Prometheus
+    orgId: 1
+  - name: Loki
+    orgId: 1
+
+datasources:
+  - name: Prometheus
+    uid: acl-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 5s          # the scrape interval: $__rate_interval stays >= 4 scrapes
+      httpMethod: POST
+  - name: Loki
+    uid: acl-loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false
+    jsonData:
+      maxLines: 1000

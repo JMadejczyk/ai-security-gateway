@@ -20,6 +20,9 @@ from gateway.policy.schema import Throttle
 INT, AU = SessionMode.INTERACTIVE, SessionMode.AUTONOMOUS
 MCP, LLM = Channel.MCP, Channel.LLM
 REPORT = "fs:reports/q3.md"
+ALLOW = pytest.mark.control("authz", "allow")
+DENY = pytest.mark.control("authz", "deny")
+APPROVAL = pytest.mark.control("authz", "require_approval")
 
 ANNA = PrincipalContext(principal="anna@demo", roles=("analyst",), agent="databot", mode=INT)
 BARTEK = PrincipalContext(principal="bartek@demo", roles=("intern",), agent="databot", mode=INT)
@@ -49,6 +52,7 @@ def autonomous(make_ctx):
 # ----------------------------------------------------------------------------- interactive
 
 
+@DENY
 @pytest.mark.parametrize("action", [Action.WRITE, Action.DELETE, Action.EGRESS])
 def test_interactive_taint_removes_write_delete_egress(restrict, interactive, action):
     result = restrict(interactive(taint=True), action)
@@ -56,6 +60,7 @@ def test_interactive_taint_removes_write_delete_egress(restrict, interactive, ac
     assert result.reason_code is RestrictionReason.ACTION_REMOVED
 
 
+@ALLOW
 @pytest.mark.parametrize(
     ("action", "resource", "channel"),
     [
@@ -72,6 +77,7 @@ def test_interactive_taint_keeps_reads_and_generate(
     assert not result.requires_approval
 
 
+@ALLOW
 def test_clean_session_has_no_restrictions(restrict, interactive):
     result = restrict(interactive(), Action.WRITE)
     assert not result.denied
@@ -87,6 +93,7 @@ def test_risk_exactly_at_threshold_does_not_trigger(restrict, interactive):
     assert result.matched_rules == ()
 
 
+@APPROVAL
 def test_risk_above_half_requires_approval_for_write_only(restrict, interactive, now):
     write = restrict(interactive(risk=0.51), Action.WRITE)
     assert write.requires_approval
@@ -108,6 +115,8 @@ def test_risk_decays_with_half_life(restrict, interactive, now):
     assert result.matched_rules == ()
 
 
+@DENY
+@APPROVAL
 def test_active_cooldown_denies_the_same_action_resource(restrict, interactive, now):
     ctx = interactive(
         risk=0.6, cooldowns=(Cooldown(key=f"write:{REPORT}", until=now + timedelta(seconds=60)),)
@@ -134,6 +143,7 @@ def test_expired_cooldown_no_longer_denies(restrict, interactive, now):
     assert not restrict(ctx, Action.WRITE).denied
 
 
+@DENY
 def test_freeze_above_point_eight_blocks_mcp_tool_calls_not_generate(restrict, interactive, now):
     ctx = interactive(risk=0.81)
     tool = restrict(ctx, Action.READ, "db:sales.orders", MCP)
@@ -147,6 +157,7 @@ def test_freeze_above_point_eight_blocks_mcp_tool_calls_not_generate(restrict, i
     assert generate.start_freeze is not None  # threshold crossed: the timer starts anyway
 
 
+@DENY
 def test_running_freeze_denies_until_it_ends_and_is_not_extended(restrict, interactive, now):
     ctx = interactive(risk=0.1, freeze_until=now + timedelta(seconds=30))
     during = restrict(ctx, Action.READ, "db:sales.orders")
@@ -180,6 +191,7 @@ def test_freeze_applies_to_a2a_tool_calls_too(restrict, interactive):
 # ------------------------------------------------------------------------------ autonomous
 
 
+@APPROVAL
 @pytest.mark.parametrize("action", [Action.WRITE, Action.DELETE, Action.EGRESS])
 def test_autonomous_taint_requires_approval_instead_of_denying(restrict, autonomous, action):
     result = restrict(autonomous(taint=True), action)
@@ -187,6 +199,7 @@ def test_autonomous_taint_requires_approval_instead_of_denying(restrict, autonom
     assert result.requires_approval
 
 
+@ALLOW
 def test_autonomous_taint_keeps_reads_unconditioned(restrict, autonomous):
     result = restrict(autonomous(taint=True), Action.READ, "db:sales.orders")
     assert not result.denied
@@ -210,12 +223,12 @@ def test_autonomous_at_threshold_is_not_throttled(restrict, autonomous):
 @pytest.mark.parametrize(
     ("action", "needs_approval"),
     [
-        (Action.WRITE, True),
-        (Action.DELETE, True),
-        (Action.EXECUTE, True),
-        (Action.EGRESS, True),
-        (Action.READ, False),
-        (Action.GENERATE, False),
+        pytest.param(Action.WRITE, True, marks=APPROVAL),
+        pytest.param(Action.DELETE, True, marks=APPROVAL),
+        pytest.param(Action.EXECUTE, True, marks=APPROVAL),
+        pytest.param(Action.EGRESS, True, marks=APPROVAL),
+        pytest.param(Action.READ, False, marks=ALLOW),
+        pytest.param(Action.GENERATE, False, marks=ALLOW),
     ],
 )
 def test_autonomous_high_risk_queues_everything_but_read_and_generate(
@@ -231,6 +244,7 @@ def test_autonomous_high_risk_queues_everything_but_read_and_generate(
 # --------------------------------------------------------------- restrictions only narrow
 
 
+@DENY
 def test_decide_tainted_interactive_write_is_blocked(evaluator, snapshot, interactive, now):
     decision = evaluator.decide(
         snapshot,
@@ -246,6 +260,7 @@ def test_decide_tainted_interactive_write_is_blocked(evaluator, snapshot, intera
     assert decision.reason_code == RestrictionReason.ACTION_REMOVED
 
 
+@APPROVAL
 def test_decide_same_event_on_autonomous_requires_approval(evaluator, snapshot, autonomous, now):
     decision = evaluator.decide(
         snapshot,
@@ -268,6 +283,7 @@ SESSIONS = [
 ]
 
 
+@DENY
 @pytest.mark.parametrize("state", SESSIONS)
 @pytest.mark.parametrize(
     ("principal", "mode", "action", "resource"),
@@ -308,6 +324,7 @@ FROZEN = (Decision.BLOCK, "tools_frozen", (), False)
 REMOVED = (Decision.BLOCK, "action_removed_by_session_risk", (), False)
 OK_THR = (Decision.ALLOW, "allowed", THR, True)
 ASK_THR = (Decision.REQUIRE_APPROVAL, "session_requires_approval", THR, True)
+OUTCOME_MARK = {Decision.ALLOW: ALLOW, Decision.REQUIRE_APPROVAL: APPROVAL, Decision.BLOCK: DENY}
 
 type Expected = tuple[Decision, str, tuple[Throttle, ...], bool]
 CALLS: list[tuple[PrincipalContext, SessionMode, Channel, Action, str, list[Expected]]] = [
@@ -327,6 +344,7 @@ ROWS = [
         resource,
         state,
         expected,
+        marks=OUTCOME_MARK[expected[0]],
         id=f"{mode}-{action}-{state_id}",
     )
     for principal, mode, channel, action, resource, column in CALLS
@@ -399,6 +417,7 @@ def test_all_matching_throttles_are_returned(evaluator, policy_doc, snapshot_fro
     )
 
 
+@DENY
 def test_base_deny_still_reports_the_cooldown_it_triggers(evaluator, snapshot, interactive, now):
     # "A call denied in this state starts a cooldown" applies to base denials too.
     decision = evaluator.decide(

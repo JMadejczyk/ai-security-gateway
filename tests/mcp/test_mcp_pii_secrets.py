@@ -9,6 +9,10 @@ line carries any of it.
 import pytest
 from mcp_harness import MCPStack, connect, connect_all, error_text
 
+PII_ALLOW = pytest.mark.control("pii", "allow")
+PII_REDACT = pytest.mark.control("pii", "redact")
+SECRETS_DENY = pytest.mark.control("secrets", "deny")
+
 ANNA = "anna@demo"
 PESEL = "44051401359"
 GITHUB = "ghp_" + "aB3dE5fG7hI9jK1lM3nO5pQ7rS9tU1vW3xY5"  # fake, assembled
@@ -25,6 +29,7 @@ def text_of(result: dict) -> str:
     return result["content"][0]["text"]
 
 
+@PII_REDACT
 async def test_fetched_pesel_comes_back_redacted(stack: MCPStack):
     stack.log.fetch_page = f"<p>Kontakt: Jan Kowalski, PESEL {PESEL}</p>"
     web = await connect(stack, ANNA, "web")
@@ -38,6 +43,7 @@ async def test_fetched_pesel_comes_back_redacted(stack: MCPStack):
     assert_nothing_leaked(stack, PESEL)
 
 
+@SECRETS_DENY
 async def test_fetched_credential_is_withheld_and_still_taints(stack: MCPStack):
     stack.log.fetch_page = f"<pre>GITHUB_TOKEN={GITHUB}</pre>"
     web = await connect(stack, ANNA, "web")
@@ -50,6 +56,7 @@ async def test_fetched_credential_is_withheld_and_still_taints(stack: MCPStack):
     assert_nothing_leaked(stack, GITHUB)
 
 
+@SECRETS_DENY
 async def test_credential_in_an_argument_never_reaches_the_upstream(stack: MCPStack):
     reports = await connect(stack, ANNA, "reports")
     result = await reports.call("write_report", name="q3.txt", content=f"token {GITHUB}")
@@ -58,6 +65,7 @@ async def test_credential_in_an_argument_never_reaches_the_upstream(stack: MCPSt
     assert_nothing_leaked(stack, GITHUB)
 
 
+@PII_REDACT
 async def test_personal_data_in_an_argument_is_masked_before_the_upstream(stack: MCPStack):
     reports = await connect(stack, ANNA, "reports")
     result = await reports.call(
@@ -72,8 +80,10 @@ async def test_personal_data_in_an_argument_is_masked_before_the_upstream(stack:
 @pytest.mark.parametrize(
     ("page", "expected"),
     [
-        ("Quarterly outlook: stable.", "Quarterly outlook: stable."),
-        ("Write to biuro@firma.pl", "Write to [REDACTED:EMAIL_ADDRESS]"),
+        pytest.param("Quarterly outlook: stable.", "Quarterly outlook: stable.", marks=PII_ALLOW),
+        pytest.param(
+            "Write to biuro@firma.pl", "Write to [REDACTED:EMAIL_ADDRESS]", marks=PII_REDACT
+        ),
     ],
 )
 async def test_clean_and_dirty_results_side_by_side(stack: MCPStack, page, expected):
@@ -82,6 +92,7 @@ async def test_clean_and_dirty_results_side_by_side(stack: MCPStack, page, expec
     assert text_of(await web.call("fetch", url="https://example.com/")) == expected
 
 
+@SECRETS_DENY
 async def test_a_quoted_password_with_spaces_is_blocked_whole(stack: MCPStack):
     reports = await connect(stack, ANNA, "reports")
     content = 'config: password="Abc12345 secret-tail"'
@@ -91,6 +102,7 @@ async def test_a_quoted_password_with_spaces_is_blocked_whole(stack: MCPStack):
     assert_nothing_leaked(stack, "secret-tail")
 
 
+@PII_REDACT
 async def test_full_width_pesel_in_a_fetched_page_is_masked(stack: MCPStack):
     disguised = "".join(chr(ord(c) + 0xFEE0) for c in PESEL)
     stack.log.fetch_page = f"PESEL: {disguised}."

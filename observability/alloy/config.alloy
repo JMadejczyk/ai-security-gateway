@@ -1,0 +1,62 @@
+// Grafana Alloy: ships the gateway's audit log to Loki (SPEC "Audit, metrics and Grafana").
+//
+// The gateway writes one JSON line per decision (and per policy reload) to
+// /var/log/acl/audit.jsonl on the `audit_log` volume, which Alloy mounts read-only. No Docker
+// socket: Alloy sees that one file and nothing else. The gateway rotates the file by size
+// (audit.jsonl -> audit.jsonl.1); the tailer follows the name and reopens the new file.
+//
+// Labels stay low-cardinality: job plus `channel`, `decision`, `actor`, `mode` and `event`
+// (all bounded by the policy or by enums). session_id, principal, resource, reason_code and
+// risk stay in the line, queryable with `| json`.
+
+local.file_match "audit" {
+  path_targets = [{"__path__" = "/var/log/acl/audit.jsonl", "job" = "acl"}]
+  sync_period  = "5s"
+}
+
+loki.source.file "audit" {
+  targets    = local.file_match.audit.targets
+  forward_to = [loki.process.audit.receiver]
+}
+
+loki.process "audit" {
+  stage.json {
+    expressions = {
+      ts       = "ts",
+      channel  = "channel",
+      decision = "decision",
+      actor    = "actor",
+      mode     = "mode",
+      event    = "event",
+    }
+  }
+
+  // The decision time from the gateway, not the moment Alloy read the line.
+  stage.timestamp {
+    source = "ts"
+    format = "RFC3339"
+  }
+
+  stage.labels {
+    values = {
+      channel  = "",
+      decision = "",
+      actor    = "",
+      mode     = "",
+      event    = "",
+    }
+  }
+
+  // One file, so the path label carries nothing.
+  stage.label_drop {
+    values = ["filename"]
+  }
+
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

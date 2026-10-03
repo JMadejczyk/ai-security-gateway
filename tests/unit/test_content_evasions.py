@@ -29,6 +29,11 @@ PESEL = "44051401359"
 STRIPE = "sk_live_" + "4eC39HqLyjWDarjtT1zdp7dc"  # fake, assembled
 OPENAI = "sk-proj-" + "Ab3De5Fg7Hi9Jk1Lm3No5Pq7Rs9Tu1Vw3Xy5Za7Bc9De"
 ZWSP, WORD_JOINER, SOFT_HYPHEN = "\u200b", "\u2060", "\u00ad"  # format characters (Cf)
+SECRETS_ALLOW = pytest.mark.control("secrets", "allow")
+SECRETS_DENY = pytest.mark.control("secrets", "deny")
+SECRETS_REDACT = pytest.mark.control("secrets", "redact")
+PII_DENY = pytest.mark.control("pii", "deny")
+PII_REDACT = pytest.mark.control("pii", "redact")
 
 
 def full_width(text: str) -> str:
@@ -89,6 +94,7 @@ def tool_call(arguments: str) -> dict[str, Any]:
 # --------------------------------------------------------------------- 1. tools
 
 
+@SECRETS_DENY
 @pytest.mark.parametrize(
     "tool",
     [
@@ -106,6 +112,7 @@ async def test_1_secret_in_a_tool_definition_is_found(make_ctx, tool):
     assert (verdict.decision, verdict.reason_code) == (Decision.BLOCK, "secret_detected")
 
 
+@PII_REDACT
 async def test_1_personal_data_in_a_tool_description_is_redacted_in_place(make_ctx):
     tool = {"type": "function", "function": {"name": "f", "description": f"for PESEL {PESEL}"}}
     request = chat({"role": "user", "content": "hi"}, tools=[tool])
@@ -120,6 +127,8 @@ async def test_1_personal_data_in_a_tool_description_is_redacted_in_place(make_c
 ESCAPED = json.dumps({"token": STRIPE}).replace("sk_live_", "\\u0073k_live_")
 
 
+@SECRETS_DENY
+@SECRETS_REDACT
 async def test_2_escaped_secret_in_tool_call_arguments_is_found_and_masked_decoded(make_ctx):
     answer = completion(content=None, tool_calls=[tool_call(ESCAPED)])
     verdict, _ = await evaluate(make_ctx, SECRETS, Channel.LLM, Stage.POST, answer, BLOCK)
@@ -134,10 +143,11 @@ async def test_2_escaped_secret_in_tool_call_arguments_is_found_and_masked_decod
     ("arguments", "decision", "reason_code"),
     [
         # an escape could hide anything: refused even in redact mode
-        ('{"token": "\\u0073k_live_4eC39HqLyjWDarjtT1zdp7dc"', Decision.BLOCK,
-         "unscannable_content"),
+        pytest.param('{"token": "\\u0073k_live_4eC39HqLyjWDarjtT1zdp7dc"', Decision.BLOCK,
+                     "unscannable_content", marks=SECRETS_DENY),
         # no escape, so the raw text is the content: scanned and masked as written
-        ('{"q": "sk_live_4eC39HqLyjWDarjtT1zdp7dc"', Decision.REDACT, "secret_detected"),
+        pytest.param('{"q": "sk_live_4eC39HqLyjWDarjtT1zdp7dc"', Decision.REDACT,
+                     "secret_detected", marks=SECRETS_REDACT),
     ],
     ids=["broken-with-escape", "broken-plain"],
 )  # fmt: skip
@@ -147,6 +157,7 @@ async def test_2_unparseable_arguments_fail_closed(make_ctx, arguments, decision
     assert (verdict.decision, verdict.reason_code) == (decision, reason_code)
 
 
+@SECRETS_ALLOW
 async def test_2_clean_broken_arguments_without_escapes_pass(make_ctx):
     answer = completion(content=None, tool_calls=[tool_call('{"q": "weather in Kraków"')])
     verdict, _ = await evaluate(make_ctx, SECRETS, Channel.LLM, Stage.POST, answer)
@@ -156,6 +167,7 @@ async def test_2_clean_broken_arguments_without_escapes_pass(make_ctx):
 # ---------------------------------------------------------------- 3. keyed values
 
 
+@SECRETS_REDACT
 @pytest.mark.parametrize(
     ("channel", "stage", "document", "path", "label"),
     [
@@ -182,6 +194,7 @@ async def test_3_value_under_a_credential_key_is_masked(
     assert redacted == f"[REDACTED:{label}]"
 
 
+@SECRETS_REDACT
 async def test_3_keyed_value_in_decoded_llm_arguments(make_ctx):
     request = chat({"role": "assistant", "tool_calls": [tool_call('{"pwd": "hunter2x"}')]})
     _, redacted = await evaluate(make_ctx, SECRETS, Channel.LLM, Stage.PRE, request)
@@ -189,6 +202,7 @@ async def test_3_keyed_value_in_decoded_llm_arguments(make_ctx):
     assert json.loads(arguments) == {"pwd": "[REDACTED:PASSWORD]"}
 
 
+@SECRETS_ALLOW
 @pytest.mark.parametrize(
     "arguments",
     [
@@ -212,6 +226,7 @@ def b64(text: str) -> str:
     return base64.b64encode(text.encode()).decode()
 
 
+@PII_REDACT
 async def test_4_embedded_resource_text_is_redacted_even_in_an_error(make_ctx):
     result = {
         "content": [{"type": "resource", "resource": {"uri": "r", "text": f"PESEL {PESEL}"}}],
@@ -222,6 +237,7 @@ async def test_4_embedded_resource_text_is_redacted_even_in_an_error(make_ctx):
     assert redacted["content"][0]["resource"]["text"] == "PESEL [REDACTED:PL_PESEL]"
 
 
+@SECRETS_DENY
 @pytest.mark.parametrize("mime", ["text/plain", "image/png"])  # the claimed type does not matter
 async def test_4_text_blob_is_decoded_and_blocks_because_no_mask_fits(make_ctx, mime):
     blob = {"uri": "r", "blob": b64(f"key={STRIPE}"), "mimeType": mime}
@@ -230,6 +246,7 @@ async def test_4_text_blob_is_decoded_and_blocks_because_no_mask_fits(make_ctx, 
     assert (verdict.decision, verdict.reason_code) == (Decision.BLOCK, "secret_detected")
 
 
+@SECRETS_REDACT
 async def test_4_a_key_that_is_valid_base64_is_not_hidden_by_a_blob_field(make_ctx):
     """``AKIA...`` decodes to binary; short payloads are scanned as written too."""
     key = "AKIA" + "Z7QW3ERT5YUI2OPA"
@@ -239,6 +256,7 @@ async def test_4_a_key_that_is_valid_base64_is_not_hidden_by_a_blob_field(make_c
     assert redacted["arguments"]["blob"] == "[REDACTED:API_KEY]"
 
 
+@SECRETS_ALLOW
 async def test_4_binary_blob_is_left_alone(make_ctx):
     data = base64.b64encode(b"\x89PNG\r\n\x1a\n\x00\x00" + STRIPE.encode()).decode()
     result = {"content": [{"type": "image", "data": data, "mimeType": "image/png"}]}
@@ -249,6 +267,8 @@ async def test_4_binary_blob_is_left_alone(make_ctx):
 # ---------------------------------------------------------- 5. legacy function_call
 
 
+@SECRETS_DENY
+@SECRETS_REDACT
 async def test_5_legacy_function_call_is_scanned_and_sse_carries_only_the_mask(make_ctx):
     answer = completion(content=None, function_call={"name": "f", "arguments": ESCAPED})
     verdict, _ = await evaluate(make_ctx, SECRETS, Channel.LLM, Stage.POST, answer, BLOCK)
@@ -303,6 +323,8 @@ def test_7_only_complete_placeholders_are_exempt(text, found):
 # --------------------------------------------------------------- 8. split values
 
 
+@SECRETS_DENY
+@SECRETS_REDACT
 async def test_8_secret_split_across_content_parts_is_masked_in_every_part(make_ctx):
     parts = [{"type": "text", "text": f"key {OPENAI[:14]}"}, {"type": "text", "text": OPENAI[14:]}]
     request = chat({"role": "user", "content": parts})
@@ -313,6 +335,7 @@ async def test_8_secret_split_across_content_parts_is_masked_in_every_part(make_
     assert texts == ["key [REDACTED:API_KEY]", "[REDACTED:API_KEY]"]
 
 
+@PII_REDACT
 async def test_8_pesel_split_across_messages_is_masked_in_both(make_ctx):
     request = chat(
         {"role": "user", "content": "mój PESEL to 44051"}, {"role": "user", "content": "401359"}
@@ -325,6 +348,7 @@ async def test_8_pesel_split_across_messages_is_masked_in_both(make_ctx):
     ]
 
 
+@SECRETS_DENY
 async def test_8_split_into_a_blob_cannot_be_masked_and_blocks(make_ctx):
     result = {
         "content": [
@@ -339,6 +363,8 @@ async def test_8_split_into_a_blob_cannot_be_masked_and_blocks(make_ctx):
 # ------------------------------------------------------------------- 9. numbers
 
 
+@PII_REDACT
+@PII_DENY
 @pytest.mark.parametrize("value", [44051401359, 44051401359.0])
 async def test_9_a_number_is_inspected_and_replaced_whole(make_ctx, value):
     document = {"name": "t", "arguments": {"pesel": value}}
@@ -349,6 +375,7 @@ async def test_9_a_number_is_inspected_and_replaced_whole(make_ctx, value):
     assert verdict.decision is Decision.BLOCK
 
 
+@PII_REDACT
 async def test_9_numbers_in_structured_results_too(make_ctx):
     result = {"content": [], "structuredContent": {"rows": [{"nip": 1234563218}]}}
     _, redacted = await evaluate(make_ctx, PII, Channel.MCP, Stage.POST, result)
@@ -361,12 +388,16 @@ async def test_9_numbers_in_structured_results_too(make_ctx):
 @pytest.mark.parametrize(
     ("control", "text", "masked"),
     [
-        (PII, f"PESEL {full_width(PESEL)} koniec", "PESEL [REDACTED:PL_PESEL] koniec"),
-        (PII, f"PESEL 4405{ZWSP}1401359 koniec", "PESEL [REDACTED:PL_PESEL] koniec"),
-        (PII, f"PESEL 44051{WORD_JOINER}401359{SOFT_HYPHEN}.",
-         f"PESEL [REDACTED:PL_PESEL]{SOFT_HYPHEN}."),
-        (SECRETS, f"key {STRIPE[:10]}{ZWSP}{STRIPE[10:]}!", "key [REDACTED:API_KEY]!"),
-        (SECRETS, f"key {full_width('sk_live_')}{STRIPE[8:]}", "key [REDACTED:API_KEY]"),
+        pytest.param(PII, f"PESEL {full_width(PESEL)} koniec",
+                     "PESEL [REDACTED:PL_PESEL] koniec", marks=PII_REDACT),
+        pytest.param(PII, f"PESEL 4405{ZWSP}1401359 koniec", "PESEL [REDACTED:PL_PESEL] koniec",
+                     marks=PII_REDACT),
+        pytest.param(PII, f"PESEL 44051{WORD_JOINER}401359{SOFT_HYPHEN}.",
+                     f"PESEL [REDACTED:PL_PESEL]{SOFT_HYPHEN}.", marks=PII_REDACT),
+        pytest.param(SECRETS, f"key {STRIPE[:10]}{ZWSP}{STRIPE[10:]}!",
+                     "key [REDACTED:API_KEY]!", marks=SECRETS_REDACT),
+        pytest.param(SECRETS, f"key {full_width('sk_live_')}{STRIPE[8:]}",
+                     "key [REDACTED:API_KEY]", marks=SECRETS_REDACT),
     ],
     ids=["full-width", "zero-width-space", "word-joiner", "zero-width-in-key", "full-width-key"],
 )  # fmt: skip
@@ -422,12 +453,14 @@ def test_11_long_values_are_found_whole(text, secret):
     assert text[finding.start : finding.end] == secret
 
 
+@SECRETS_REDACT
 async def test_11_a_320_character_quoted_password_releases_no_tail(make_ctx):
     request = chat({"role": "user", "content": f'config: password="{LONG_PASSWORD}" done'})
     _, redacted = await evaluate(make_ctx, SECRETS, Channel.LLM, Stage.PRE, request)
     assert redacted["messages"][0]["content"] == 'config: password="[REDACTED:PASSWORD]" done'
 
 
+@SECRETS_REDACT
 @pytest.mark.parametrize(
     "parts",
     [

@@ -260,6 +260,18 @@ class _Trace:
     def verdicts(self) -> list[Verdict]:
         return [v for step in self.steps for _, v in step.verdicts]
 
+    def distinct_verdicts(self) -> list[Verdict]:
+        """Every verdict once: a call-wide one (``budget``, a seal refusal) is attached to each
+        interaction as the same object, but it was decided, and took its time, once."""
+        return list({id(v): v for v in self.verdicts()}.values())
+
+    def control_latency_ms(self) -> dict[str, float]:
+        """Time per control over the whole call, every stage and interaction summed."""
+        totals: dict[str, float] = {}
+        for verdict in self.distinct_verdicts():
+            totals[verdict.control_id] = totals.get(verdict.control_id, 0.0) + verdict.latency_ms
+        return totals
+
 
 @dataclass(frozen=True, slots=True)
 class _Seal:
@@ -633,6 +645,7 @@ class Pipeline:
     def _authorize(
         self, snapshot: PolicySnapshot, call: _Admitted, interaction: Interaction
     ) -> _Step:
+        started = time.perf_counter()
         access = self._evaluator.decide(
             snapshot,
             call.principal,
@@ -648,6 +661,7 @@ class Pipeline:
             control_id=AUTHZ,
             reason_code=access.reason_code,
             risk_delta=snapshot.policy.control_risk_delta(AUTHZ) if denied else 0.0,
+            latency_ms=(time.perf_counter() - started) * 1000,
         )
         step = _Step(interaction=interaction, access=access, original_payload=interaction.payload)
         step.add(Stage.PRE, [verdict])
@@ -1097,15 +1111,17 @@ class Pipeline:
 
         record_request(channel, outcome.decision, agent)
         record_overhead(channel, total - (upstream_s or 0.0))
-        record_verdicts(trace.verdicts())
+        record_verdicts(trace.distinct_verdicts())
         if trace.upstream is not None and trace.upstream.usage is not None:
             usage = trace.upstream.usage
-            record_tokens(user, agent, _model_label(trace.executed), charged_tokens(usage))
+            # Models without a pricing entry share `other`: a wildcard grant must not mint labels.
+            model = bounded(_model_label(trace.executed), snapshot.policy.pricing)
+            record_tokens(user, agent, model, charged_tokens(usage))
 
         latency = AuditLatency(
             total=total * 1000,
             upstream=upstream_s * 1000 if upstream_s is not None else None,
-            controls={v.control_id: v.latency_ms for v in trace.verdicts()},
+            controls=trace.control_latency_ms(),
         )
         identity: dict[str, Any] = {
             "session_id": claims.session_id if claims else None,

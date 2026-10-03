@@ -52,54 +52,106 @@ ANNA, BARTEK, OLGA, ROOT = who("anna@demo"), who("bartek@demo"), who("olga@demo"
 ETL = who("svc:nightly_etl", "nightly_etl", AU)
 
 ALLOWED = AuthzReason.ALLOWED
+ALLOW = pytest.mark.control("authz", "allow")
+DENY = pytest.mark.control("authz", "deny")
 MATRIX: list[Any] = [
     # The challenge owner's case: same agent, two people, different data.
-    pytest.param(ANNA, R, "db:sales.customers", ALLOWED, id="analyst-customers"),
-    pytest.param(BARTEK, R, "db:sales.customers", ALLOWED, id="intern-customers"),
-    pytest.param(ANNA, R, "db:sales.payments", ALLOWED, id="analyst-payments"),
+    pytest.param(ANNA, R, "db:sales.customers", ALLOWED, marks=ALLOW, id="analyst-customers"),
+    pytest.param(BARTEK, R, "db:sales.customers", ALLOWED, marks=ALLOW, id="intern-customers"),
+    pytest.param(ANNA, R, "db:sales.payments", ALLOWED, marks=ALLOW, id="analyst-payments"),
     pytest.param(
-        BARTEK, R, "db:sales.payments", AuthzReason.OUTSIDE_PRINCIPAL_SCOPE, id="intern-payments"
+        BARTEK,
+        R,
+        "db:sales.payments",
+        AuthzReason.OUTSIDE_PRINCIPAL_SCOPE,
+        marks=DENY,
+        id="intern-payments",
     ),
-    pytest.param(BARTEK, R, "db:sales.orders", ALLOWED, id="intern-orders"),
+    pytest.param(BARTEK, R, "db:sales.orders", ALLOWED, marks=ALLOW, id="intern-orders"),
     # Models: concrete names with colons.
-    pytest.param(BARTEK, G, "model:qwen3:8b", ALLOWED, id="intern-qwen"),
+    pytest.param(BARTEK, G, "model:qwen3:8b", ALLOWED, marks=ALLOW, id="intern-qwen"),
     pytest.param(
-        BARTEK, G, "model:llama3:70b", AuthzReason.OUTSIDE_PRINCIPAL_SCOPE, id="intern-llama"
+        BARTEK,
+        G,
+        "model:llama3:70b",
+        AuthzReason.OUTSIDE_PRINCIPAL_SCOPE,
+        marks=DENY,
+        id="intern-llama",
     ),
-    pytest.param(ANNA, G, "model:llama3:70b", ALLOWED, id="analyst-llama"),
+    pytest.param(ANNA, G, "model:llama3:70b", ALLOWED, marks=ALLOW, id="analyst-llama"),
     # Writes and web reads.
-    pytest.param(ANNA, W, "fs:reports/q3.md", ALLOWED, id="analyst-report"),
-    pytest.param(BARTEK, W, "fs:reports/q3.md", ALLOWED, id="intern-report"),
+    pytest.param(ANNA, W, "fs:reports/q3.md", ALLOWED, marks=ALLOW, id="analyst-report"),
+    pytest.param(BARTEK, W, "fs:reports/q3.md", ALLOWED, marks=ALLOW, id="intern-report"),
     pytest.param(
-        ANNA, W, "fs:secrets/keys.txt", AuthzReason.OUTSIDE_AGENT_SCOPE, id="write-outside-reports"
+        ANNA,
+        W,
+        "fs:secrets/keys.txt",
+        AuthzReason.OUTSIDE_AGENT_SCOPE,
+        marks=DENY,
+        id="write-outside-reports",
     ),
-    pytest.param(ANNA, R, "web:example.com", ALLOWED, id="analyst-web"),
+    pytest.param(ANNA, R, "web:example.com", ALLOWED, marks=ALLOW, id="analyst-web"),
     pytest.param(
-        ANNA, W, "db:sales.orders", AuthzReason.OUTSIDE_AGENT_SCOPE, id="analyst-db-write"
+        ANNA,
+        W,
+        "db:sales.orders",
+        AuthzReason.OUTSIDE_AGENT_SCOPE,
+        marks=DENY,
+        id="analyst-db-write",
     ),
     # An agent never gets more than its own grants, even for admin ("*:*").
-    pytest.param(ROOT, E, "http:api.stripe.com", AuthzReason.EXPLICIT_DENY, id="admin-egress"),
-    pytest.param(ANNA, E, "http:pastebin.com", AuthzReason.EXPLICIT_DENY, id="analyst-egress"),
     pytest.param(
-        ROOT, D, "db:sales.orders", AuthzReason.ACTION_NOT_PERMITTED_FOR_AGENT, id="admin-delete"
+        ROOT, E, "http:api.stripe.com", AuthzReason.EXPLICIT_DENY, marks=DENY, id="admin-egress"
     ),
     pytest.param(
-        ROOT, X, "fs:reports/run.sh", AuthzReason.ACTION_NOT_PERMITTED_FOR_AGENT, id="admin-execute"
+        ANNA, E, "http:pastebin.com", AuthzReason.EXPLICIT_DENY, marks=DENY, id="analyst-egress"
     ),
-    pytest.param(ROOT, R, "db:hr.salaries", AuthzReason.OUTSIDE_AGENT_SCOPE, id="admin-other-db"),
-    pytest.param(ROOT, R, "db:sales.payments", ALLOWED, id="admin-payments"),
+    pytest.param(
+        ROOT,
+        D,
+        "db:sales.orders",
+        AuthzReason.ACTION_NOT_PERMITTED_FOR_AGENT,
+        marks=DENY,
+        id="admin-delete",
+    ),
+    pytest.param(
+        ROOT,
+        X,
+        "fs:reports/run.sh",
+        AuthzReason.ACTION_NOT_PERMITTED_FOR_AGENT,
+        marks=DENY,
+        id="admin-execute",
+    ),
+    pytest.param(
+        ROOT, R, "db:hr.salaries", AuthzReason.OUTSIDE_AGENT_SCOPE, marks=DENY, id="admin-other-db"
+    ),
+    pytest.param(ROOT, R, "db:sales.payments", ALLOWED, marks=ALLOW, id="admin-payments"),
     # Approver role grants nothing by itself.
-    pytest.param(OLGA, R, "db:sales.orders", AuthzReason.OUTSIDE_PRINCIPAL_SCOPE, id="ops-read"),
-    # Autonomous agent: svc principal, U = the agent's own allow list.
-    pytest.param(ETL, R, "db:sales.orders", ALLOWED, id="etl-read"),
-    pytest.param(ETL, W, "fs:reports/nightly.md", ALLOWED, id="etl-report"),
-    pytest.param(ETL, G, "model:qwen3:8b", ALLOWED, id="etl-qwen"),
-    pytest.param(ETL, G, "model:llama3:70b", AuthzReason.OUTSIDE_AGENT_SCOPE, id="etl-llama"),
     pytest.param(
-        ETL, D, "db:sales.orders", AuthzReason.ACTION_NOT_PERMITTED_FOR_AGENT, id="etl-delete"
+        OLGA, R, "db:sales.orders", AuthzReason.OUTSIDE_PRINCIPAL_SCOPE, marks=DENY, id="ops-read"
+    ),
+    # Autonomous agent: svc principal, U = the agent's own allow list.
+    pytest.param(ETL, R, "db:sales.orders", ALLOWED, marks=ALLOW, id="etl-read"),
+    pytest.param(ETL, W, "fs:reports/nightly.md", ALLOWED, marks=ALLOW, id="etl-report"),
+    pytest.param(ETL, G, "model:qwen3:8b", ALLOWED, marks=ALLOW, id="etl-qwen"),
+    pytest.param(
+        ETL, G, "model:llama3:70b", AuthzReason.OUTSIDE_AGENT_SCOPE, marks=DENY, id="etl-llama"
     ),
     pytest.param(
-        ETL, E, "http:example.com", AuthzReason.ACTION_NOT_PERMITTED_FOR_AGENT, id="etl-egress"
+        ETL,
+        D,
+        "db:sales.orders",
+        AuthzReason.ACTION_NOT_PERMITTED_FOR_AGENT,
+        marks=DENY,
+        id="etl-delete",
+    ),
+    pytest.param(
+        ETL,
+        E,
+        "http:example.com",
+        AuthzReason.ACTION_NOT_PERMITTED_FOR_AGENT,
+        marks=DENY,
+        id="etl-egress",
     ),
     # Registration, mode and delegation.
     pytest.param(
@@ -107,6 +159,7 @@ MATRIX: list[Any] = [
         R,
         "db:sales.orders",
         AuthzReason.PRINCIPAL_NOT_ALLOWED,
+        marks=DENY,
         id="human-on-autonomous-agent",
     ),
     pytest.param(
@@ -114,6 +167,7 @@ MATRIX: list[Any] = [
         R,
         "db:sales.orders",
         AuthzReason.PRINCIPAL_NOT_ALLOWED,
+        marks=DENY,
         id="wrong-service-principal",
     ),
     pytest.param(
@@ -121,6 +175,7 @@ MATRIX: list[Any] = [
         R,
         "db:sales.orders",
         AuthzReason.PRINCIPAL_NOT_ALLOWED,
+        marks=DENY,
         id="service-principal-on-interactive-agent",
     ),
     pytest.param(
@@ -128,6 +183,7 @@ MATRIX: list[Any] = [
         R,
         "db:sales.orders",
         AuthzReason.MODE_MISMATCH,
+        marks=DENY,
         id="interactive-agent-claims-autonomous",
     ),
     pytest.param(
@@ -135,17 +191,24 @@ MATRIX: list[Any] = [
         R,
         "db:sales.orders",
         AuthzReason.MODE_MISMATCH,
+        marks=DENY,
         id="autonomous-agent-claims-interactive",
     ),
     # Default deny: unknown agent, role, resource.
     pytest.param(
-        who("anna@demo", "shadowbot"), R, "db:sales.orders", AuthzReason.UNKNOWN_AGENT, id="agent"
+        who("anna@demo", "shadowbot"),
+        R,
+        "db:sales.orders",
+        AuthzReason.UNKNOWN_AGENT,
+        marks=DENY,
+        id="agent",
     ),
     pytest.param(
         who("anna@demo", roles=("analyst", "superuser")),
         R,
         "db:sales.orders",
         AuthzReason.UNKNOWN_ROLE,
+        marks=DENY,
         id="unknown-role-poisons-request",
     ),
     pytest.param(
@@ -153,28 +216,42 @@ MATRIX: list[Any] = [
         R,
         "db:sales.orders",
         AuthzReason.OUTSIDE_PRINCIPAL_SCOPE,
+        marks=DENY,
         id="no-roles",
     ),
-    pytest.param(ANNA, R, "crm:accounts", AuthzReason.OUTSIDE_AGENT_SCOPE, id="unmapped-resource"),
-    pytest.param(ANNA, R, "sales.orders", AuthzReason.INVALID_RESOURCE, id="malformed-resource"),
-    pytest.param(ANNA, R, "db:sales.*", AuthzReason.INVALID_RESOURCE, id="wildcard-resource"),
+    pytest.param(
+        ANNA, R, "crm:accounts", AuthzReason.OUTSIDE_AGENT_SCOPE, marks=DENY, id="unmapped-resource"
+    ),
+    pytest.param(
+        ANNA, R, "sales.orders", AuthzReason.INVALID_RESOURCE, marks=DENY, id="malformed-resource"
+    ),
+    pytest.param(
+        ANNA, R, "db:sales.*", AuthzReason.INVALID_RESOURCE, marks=DENY, id="wildcard-resource"
+    ),
     # Roles are a union.
     pytest.param(
         who("bartek@demo", roles=("intern", "analyst")),
         R,
         "db:sales.payments",
         ALLOWED,
+        marks=ALLOW,
         id="role-union",
     ),
     # Task scope: None = unrestricted, [] = nothing, otherwise narrows.
     pytest.param(
-        who("anna@demo", scope=[]), R, "db:sales.orders", AuthzReason.OUTSIDE_TASK_SCOPE, id="t[]"
+        who("anna@demo", scope=[]),
+        R,
+        "db:sales.orders",
+        AuthzReason.OUTSIDE_TASK_SCOPE,
+        marks=DENY,
+        id="t[]",
     ),
     pytest.param(
         who("anna@demo", scope=["read:db:sales.orders"]),
         R,
         "db:sales.orders",
         ALLOWED,
+        marks=ALLOW,
         id="task-scope-match",
     ),
     pytest.param(
@@ -182,6 +259,7 @@ MATRIX: list[Any] = [
         R,
         "db:sales.customers",
         AuthzReason.OUTSIDE_TASK_SCOPE,
+        marks=DENY,
         id="task-scope-narrows",
     ),
     pytest.param(
@@ -189,6 +267,7 @@ MATRIX: list[Any] = [
         R,
         "db:sales.payments",
         AuthzReason.OUTSIDE_PRINCIPAL_SCOPE,
+        marks=DENY,
         id="task-scope-never-widens",
     ),
 ]
@@ -218,19 +297,50 @@ def test_result_carries_effective_grants_for_audit(evaluator, snapshot):
 @pytest.mark.parametrize(
     ("blocklist", "principal", "resource", "reason"),
     [
-        ({"users": ["bartek@demo"]}, BARTEK, "db:sales.orders", AuthzReason.USER_BLOCKLISTED),
-        ({"users": ["bartek@demo"]}, ANNA, "db:sales.orders", ALLOWED),
-        ({"agents": ["databot"]}, ANNA, "db:sales.orders", AuthzReason.AGENT_BLOCKLISTED),
-        ({"agents": ["databot"]}, ETL, "db:sales.orders", ALLOWED),
-        (
+        pytest.param(
+            {"users": ["bartek@demo"]},
+            BARTEK,
+            "db:sales.orders",
+            AuthzReason.USER_BLOCKLISTED,
+            marks=DENY,
+        ),
+        pytest.param({"users": ["bartek@demo"]}, ANNA, "db:sales.orders", ALLOWED, marks=ALLOW),
+        pytest.param(
+            {"agents": ["databot"]},
+            ANNA,
+            "db:sales.orders",
+            AuthzReason.AGENT_BLOCKLISTED,
+            marks=DENY,
+        ),
+        pytest.param({"agents": ["databot"]}, ETL, "db:sales.orders", ALLOWED, marks=ALLOW),
+        pytest.param(
             {"use_cases": ["read:db:sales.payments"]},
             ANNA,
             "db:sales.payments",
             AuthzReason.USE_CASE_BLOCKLISTED,
+            marks=DENY,
         ),
-        ({"use_cases": ["read:db:sales.payments"]}, ANNA, "db:sales.customers", ALLOWED),
-        ({"use_cases": ["*:db:*"]}, ROOT, "db:sales.orders", AuthzReason.USE_CASE_BLOCKLISTED),
-        ({"agents": ["nightly_etl"]}, ETL, "db:sales.orders", AuthzReason.AGENT_BLOCKLISTED),
+        pytest.param(
+            {"use_cases": ["read:db:sales.payments"]},
+            ANNA,
+            "db:sales.customers",
+            ALLOWED,
+            marks=ALLOW,
+        ),
+        pytest.param(
+            {"use_cases": ["*:db:*"]},
+            ROOT,
+            "db:sales.orders",
+            AuthzReason.USE_CASE_BLOCKLISTED,
+            marks=DENY,
+        ),
+        pytest.param(
+            {"agents": ["nightly_etl"]},
+            ETL,
+            "db:sales.orders",
+            AuthzReason.AGENT_BLOCKLISTED,
+            marks=DENY,
+        ),
     ],
 )
 def test_blocklist(evaluator, policy_doc, snapshot_from, blocklist, principal, resource, reason):
@@ -239,6 +349,8 @@ def test_blocklist(evaluator, policy_doc, snapshot_from, blocklist, principal, r
     assert result.reason_code is reason
 
 
+@ALLOW
+@DENY
 def test_agent_principals_list_restricts_delegation(evaluator, policy_doc, snapshot_from):
     policy_doc["agents"]["databot"]["principals"] = ["anna@demo"]
     snapshot = snapshot_from(policy_doc)
@@ -259,6 +371,7 @@ DENIED_EVERYWHERE = [
 ]
 
 
+@DENY
 @pytest.mark.parametrize("profile", ["strict", "balanced", "permissive"])
 @pytest.mark.parametrize(("principal", "action", "resource"), DENIED_EVERYWHERE)
 def test_default_deny_holds_in_every_profile(
@@ -269,6 +382,7 @@ def test_default_deny_holds_in_every_profile(
     assert not evaluator.authorize(snapshot_from(policy_doc), principal, action, resource).allowed
 
 
+@DENY
 def test_policy_without_agents_or_roles_denies_everything(evaluator, policy_doc, snapshot_from):
     policy_doc["agents"] = {}
     policy_doc["roles"] = {}
@@ -280,12 +394,13 @@ def test_policy_without_agents_or_roles_denies_everything(evaluator, policy_doc,
 @pytest.mark.parametrize(
     ("agent", "principals", "principal", "allowed"),
     [
-        ("nightly_etl", None, ETL, True),  # absent: the default rule (svc:<agent>)
-        ("nightly_etl", ["svc:nightly_etl"], ETL, True),
-        ("nightly_etl", [], ETL, False),  # empty: nobody, not "default"
-        ("databot", None, ANNA, True),
-        ("databot", [], ANNA, False),
-        ("databot", ["bartek@demo"], ANNA, False),
+        # absent: the default rule (svc:<agent>)
+        pytest.param("nightly_etl", None, ETL, True, marks=ALLOW),
+        pytest.param("nightly_etl", ["svc:nightly_etl"], ETL, True, marks=ALLOW),
+        pytest.param("nightly_etl", [], ETL, False, marks=DENY),  # empty: nobody, not "default"
+        pytest.param("databot", None, ANNA, True, marks=ALLOW),
+        pytest.param("databot", [], ANNA, False, marks=DENY),
+        pytest.param("databot", ["bartek@demo"], ANNA, False, marks=DENY),
     ],
 )
 def test_explicit_principals_list_applies_to_both_agent_types(

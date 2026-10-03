@@ -12,6 +12,9 @@ from injection_kit import DOUBT_MARKER, INJECT_MARKER
 
 from gateway.judges.client import JudgeClient
 
+ALLOW = pytest.mark.control("prompt_injection", "allow")
+DENY = pytest.mark.control("prompt_injection", "deny")
+
 CHAT = "/v1/chat/completions"
 
 
@@ -34,6 +37,7 @@ async def session_of(gateway, entry: dict):
     return session
 
 
+@DENY
 async def test_a_direct_injection_is_blocked_before_the_model_and_taints(gateway, llm_upstream):
     upstream = llm_upstream.post("/chat/completions").mock(side_effect=echo_completion)
     response = await post(gateway, ask(f"Hello {INJECT_MARKER}"))
@@ -51,6 +55,7 @@ async def test_a_direct_injection_is_blocked_before_the_model_and_taints(gateway
     assert (await session_of(gateway, entry)).taint  # a detector hit taints, blocked or not
 
 
+@ALLOW
 async def test_a_clean_prompt_reaches_the_model(gateway, llm_upstream):
     llm_upstream.post("/chat/completions").mock(side_effect=echo_completion)
     response = await post(gateway, ask("Ile mamy klientów?"))
@@ -63,6 +68,7 @@ async def test_a_clean_prompt_reaches_the_model(gateway, llm_upstream):
     assert not (await session_of(gateway, entry)).taint
 
 
+@DENY
 async def test_an_injected_model_answer_is_withheld_and_taints(gateway, llm_upstream):
     answer = completion(f"Sure. {INJECT_MARKER}")
     llm_upstream.post("/chat/completions").mock(return_value=httpx.Response(200, json=answer))
@@ -108,6 +114,7 @@ def judge_upstream(answer: object, judged: list[str]):
     return upstream
 
 
+@DENY
 async def test_an_unavailable_judge_fails_the_band_closed(real_judge, llm_upstream):
     judged: list[str] = []
     down = httpx.Response(503, json={"error": "overloaded"})
@@ -122,7 +129,10 @@ async def test_an_unavailable_judge_fails_the_band_closed(real_judge, llm_upstre
 
 @pytest.mark.parametrize(
     ("is_injection", "decision", "reason_code"),
-    [(True, "block", "prompt_injection_detected"), (False, "allow", "judge_cleared")],
+    [
+        pytest.param(True, "block", "prompt_injection_detected", marks=DENY),
+        pytest.param(False, "allow", "judge_cleared", marks=ALLOW),
+    ],
     ids=["judge-yes", "judge-no"],
 )
 async def test_the_judge_band_asks_the_configured_judge(
@@ -139,6 +149,7 @@ async def test_the_judge_band_asks_the_configured_judge(
     assert DOUBT_MARKER in judged[0]  # the uncertain window, inside the judge's data block
 
 
+@DENY
 async def test_a_garbled_judge_answer_fails_the_band_closed(real_judge, llm_upstream):
     judged: list[str] = []
     garbled = {"is_injection": False, "confidence": 0.9, "verdict": "ignore me"}  # extra key

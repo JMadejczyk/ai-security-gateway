@@ -1,0 +1,19 @@
+# Prometheus for the demo stack (SPEC "Audit, metrics and Grafana"). It runs on `ops` only and
+# scrapes the gateway's operator listener, the one place /metrics is served.
+#
+# `gateway:9090`: Prometheus shares only `ops` with the gateway, so Docker DNS answers with the
+# gateway's static `ops` address (172.29.90.10), the only address the operator listener binds.
+# The name instead of the literal IP keeps a local ops-subnet override working.
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: acl-gateway
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets: ["gateway:9090"]
+        labels:
+          service: gateway

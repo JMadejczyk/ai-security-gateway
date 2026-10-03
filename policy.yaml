@@ -92,6 +92,7 @@ controls:
   secrets:          { mode: block }
   prompt_injection: { mode: block, threshold: 0.85, judge_band: [0.5, 0.85], risk_delta: 0.6 }
   sql_guard:        { mode: block, max_cost: 10000, force_limit: 500, timeout_ms: 3000 }
+  egress:           { mode: block, allowed_ports: [80, 443] }   # http-adapter servers: public destinations only
   signatures:       { mode: block, feed: feeds/signatures.json, refresh_s: 30 }  # relative to this file, or an http(s) URL
   loop_detect:      { mode: block, max_repeats: 5, window_s: 60 }
   intent_judge:     { mode: require_approval, risk_delta: 0.2 }   # advisory: flags the MCP call

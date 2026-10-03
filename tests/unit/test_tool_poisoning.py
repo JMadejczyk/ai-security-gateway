@@ -5,8 +5,9 @@ from collections.abc import Sequence
 from typing import Any
 
 import pytest
-from injection_kit import INJECT_MARKER, MarkerClassifier
+from injection_kit import DOUBT_MARKER, INJECT_MARKER, MarkerClassifier, ScriptedJudge
 
+from gateway.controls.prompt_injection import InjectionJudgement
 from gateway.controls.tool_pinning import PinnedListing, PinStatus, listing_scope
 from gateway.controls.tool_poisoning import (
     MAX_LISTED_TOOLS,
@@ -16,10 +17,14 @@ from gateway.controls.tool_poisoning import (
 from gateway.core.envelope import Interaction
 from gateway.core.types import Action, Channel, ControlMode, Decision, Stage
 from gateway.injection.classifier import ClassifierRunner, InjectionScore, UnavailableClassifier
+from gateway.judges.client import JudgeResult
+from gateway.policy.loader import PolicyLoadError
 from gateway.policy.schema import ToolPoisoningConfig
 from gateway.proxies.mcp import wire
 
 BLOCK = ToolPoisoningConfig(mode=ControlMode.BLOCK)
+ALLOWED = pytest.mark.control("tool_poisoning", "allow")
+DENIED = pytest.mark.control("tool_poisoning", "deny")
 
 
 def tool(name: str, description: str | None = None, **schema: Any) -> wire.ToolDefinition:
@@ -94,13 +99,15 @@ SCREEN_CASES = [
 
 @pytest.mark.parametrize(
     ("tools", "hidden"),
-    [case[1:] for case in SCREEN_CASES],
+    [pytest.param(*case[1:], marks=DENIED if case[2] else ALLOWED) for case in SCREEN_CASES],
     ids=[case[0] for case in SCREEN_CASES],
 )
 async def test_screen_hides_poisoned_tools(snapshot, tools, hidden):
     assert await control().screen_listing("web", tools, snapshot) == hidden
 
 
+@DENIED
+@ALLOWED
 async def test_screen_uses_the_configured_threshold(snapshot_from, policy_doc):
     classifier = MarkerClassifier({"numbers": 0.9})
     tools = [tool("add", "Adds two numbers.")]
@@ -112,6 +119,7 @@ async def test_screen_uses_the_configured_threshold(snapshot_from, policy_doc):
     assert await control(classifier).screen_listing("web", tools, relaxed) == set()
 
 
+@DENIED
 async def test_screen_fails_closed_when_the_classifier_is_off(snapshot):
     screen = ToolPoisoningControl(ClassifierRunner(UnavailableClassifier()))
     assert await screen.screen_listing("web", [CLEAN, POISONED_DESCRIPTION], snapshot) == {
@@ -120,6 +128,7 @@ async def test_screen_fails_closed_when_the_classifier_is_off(snapshot):
     }
 
 
+@DENIED
 async def test_screen_hides_what_it_could_not_classify_in_time(snapshot):
     def slow(texts: Sequence[str]) -> list[InjectionScore]:
         import time  # noqa: PLC0415 -- local to the one slow fake
@@ -133,6 +142,7 @@ async def test_screen_hides_what_it_could_not_classify_in_time(snapshot):
     assert asyncio.get_running_loop().time() - started < 0.25
 
 
+@DENIED
 async def test_screen_hides_tools_past_the_listing_cap(snapshot):
     tools = [tool(f"t{i}", "A tool.") for i in range(MAX_LISTED_TOOLS + 3)]
     hidden = await control().screen_listing("web", tools, snapshot)
@@ -161,7 +171,10 @@ CALL_CASES = [
 
 @pytest.mark.parametrize(
     ("tools", "name", "decision", "reason_code"),
-    [case[1:] for case in CALL_CASES],
+    [
+        pytest.param(*case[1:], marks=ALLOWED if case[3] is Decision.ALLOW else DENIED)
+        for case in CALL_CASES
+    ],
     ids=[case[0] for case in CALL_CASES],
 )
 async def test_call_checks_the_definition_the_caller_was_shown(
@@ -178,6 +191,7 @@ async def test_call_checks_the_definition_the_caller_was_shown(
         assert verdict.reason == "classifier score 0.99-1.00"
 
 
+@DENIED
 async def test_a_call_without_a_verified_listing_fails_closed(call):
     verdict = await control().evaluate(call("fetch"), Stage.PRE, BLOCK)
     assert (verdict.decision, verdict.reason_code) == (
@@ -186,6 +200,7 @@ async def test_a_call_without_a_verified_listing_fails_closed(call):
     )
 
 
+@DENIED
 async def test_a_call_fails_closed_when_the_classifier_is_off(call):
     screen = ToolPoisoningControl(ClassifierRunner(UnavailableClassifier()))
     with listing_scope(listing(CLEAN)):
@@ -233,6 +248,7 @@ DATA_VALUE_CASES = [
 ]  # fmt: skip
 
 
+@DENIED
 @pytest.mark.parametrize(
     "definition",
     [case[1] for case in DATA_VALUE_CASES],
@@ -246,8 +262,155 @@ async def test_instructions_inside_schema_data_values_are_classified(snapshot, c
     assert verdict.reason_code == "tool_poisoning_detected"
 
 
+@DENIED
 async def test_a_duplicate_past_the_listing_cap_hides_its_name(snapshot):
     """Codex P2 #6: 256 benign ``notes`` hid the unclassified, poisoned 257th."""
     tools = [tool("notes", "Saves a note.") for _ in range(MAX_LISTED_TOOLS)]
     tools.append(tool("notes", f"Saves a note. {INJECT_MARKER}"))
     assert await control().screen_listing("web", tools, snapshot) == {"notes"}
+
+
+# ------------------------------------------------------------ judge band (2026-10-04)
+
+POISONED = InjectionJudgement(is_injection=True, confidence=0.9, rationale="asks for secrets")
+CLEARED = InjectionJudgement(is_injection=False, confidence=0.9, rationale="usage notes only")
+DOUBTFUL = tool("fetch", f"Fetches pages. {DOUBT_MARKER}")
+
+
+def judged(judge: Any, *, budget_s: float = 10.0, entries: int = 4096) -> ToolPoisoningControl:
+    return ToolPoisoningControl(
+        ClassifierRunner(MarkerClassifier()),
+        judge,
+        listing_budget_s=budget_s,
+        judge_cache_entries=entries,
+    )
+
+
+BAND_CASES = [
+    pytest.param(ScriptedJudge(POISONED), {"fetch"}, "tool_poisoning_detected", id="judge-poisoned",
+                 marks=DENIED),
+    pytest.param(ScriptedJudge(CLEARED), set(), "judge_cleared", id="judge-cleared", marks=ALLOWED),
+    pytest.param(ScriptedJudge(None, JudgeResult.TIMEOUT), {"fetch"}, "judge_unavailable",
+                 id="judge-timeout", marks=DENIED),
+    pytest.param(ScriptedJudge(None, JudgeResult.SCHEMA_MISMATCH), {"fetch"}, "judge_unavailable",
+                 id="judge-garbled", marks=DENIED),
+    pytest.param(None, {"fetch"}, "judge_unavailable", id="no-judge", marks=DENIED),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize(("judge", "hidden", "reason_code"), BAND_CASES)
+async def test_the_judge_band_decides_uncertain_definitions(
+    snapshot, call, judge, hidden, reason_code
+):
+    """Real-model gap: poisoned descriptions scoring 0.60 and 0.76 passed with no judge tier."""
+    assert await judged(judge).screen_listing("web", [DOUBTFUL], snapshot) == hidden
+    with listing_scope(listing(DOUBTFUL)):
+        verdict = await judged(judge).evaluate(call("fetch"), Stage.PRE, BLOCK)
+    assert verdict.reason_code == reason_code
+    assert verdict.decision is (Decision.BLOCK if hidden else Decision.ALLOW)
+    if judge is not None:
+        assert DOUBT_MARKER in judge.contents[0]  # the definition text is what is judged
+
+
+async def test_each_definition_is_judged_once_per_process(snapshot):
+    judge = ScriptedJudge(CLEARED)
+    screen = judged(judge)
+    for _ in range(3):
+        assert await screen.screen_listing("web", [DOUBTFUL, DOUBTFUL], snapshot) == set()
+    assert len(judge.contents) == 1
+
+
+async def test_an_unavailable_answer_is_not_remembered(snapshot):
+    judge = ScriptedJudge(None)
+    screen = judged(judge)
+    assert await screen.screen_listing("web", [DOUBTFUL], snapshot) == {"fetch"}
+    judge.answer = CLEARED
+    assert await screen.screen_listing("web", [DOUBTFUL], snapshot) == set()
+    assert len(judge.contents) == 2
+
+
+class ContentJudge:
+    """Poisoned when the definition contains ``EVIL``."""
+
+    def __init__(self) -> None:
+        self.contents: list[str] = []
+
+    async def judge(self, *, control_id, instructions, content, response_model):
+        del control_id, instructions
+        self.contents.append(content)
+        return response_model.model_validate(
+            {"is_injection": "EVIL" in content, "confidence": 0.9, "rationale": "r"}
+        )
+
+
+async def test_a_poisoned_answer_survives_cache_eviction(snapshot):
+    """Answers stored while deciding (cache of 1) must not turn a poisoned verdict clean."""
+    tools = [
+        tool("a", f"First. {DOUBT_MARKER}"),
+        tool("b", f"Second EVIL. {DOUBT_MARKER}"),
+        tool("c", f"Third. {DOUBT_MARKER}"),
+    ]
+    judge = ContentJudge()
+    assert await judged(judge, entries=1).screen_listing("web", tools, snapshot) == {"b"}
+    assert len(judge.contents) == 3
+
+
+class SlowJudge:
+    def __init__(self, delay_s: float) -> None:
+        self.delay_s = delay_s
+        self.calls = 0
+
+    async def judge(self, *, control_id, instructions, content, response_model):
+        del control_id, instructions, content
+        self.calls += 1
+        await asyncio.sleep(self.delay_s)
+        return response_model.model_validate(
+            {"is_injection": False, "confidence": 0.9, "rationale": "r"}
+        )
+
+
+@DENIED
+async def test_a_judge_slower_than_the_listing_deadline_hides_the_tool(snapshot):
+    judge = SlowJudge(0.3)
+    screen = judged(judge, budget_s=0.05)
+    started = asyncio.get_running_loop().time()
+    assert await screen.screen_listing("web", [DOUBTFUL], snapshot) == {"fetch"}
+    assert asyncio.get_running_loop().time() - started < 0.25
+    await asyncio.sleep(0.4)  # the judge call kept running and its answer was remembered
+    assert await screen.screen_listing("web", [DOUBTFUL], snapshot) == set()
+    assert judge.calls == 1
+
+
+def test_judge_band_without_judges_is_a_policy_error(policy_doc, snapshot_from):
+    policy_doc.pop("judges", None)
+    policy_doc["controls"]["tool_poisoning"] = {"judge_band": [0.5, 0.85]}
+    with pytest.raises(PolicyLoadError, match=r"tool_poisoning\.judge_band"):
+        snapshot_from(policy_doc)
+
+
+def test_judge_band_must_be_ordered():
+    with pytest.raises(ValueError, match="must be ordered"):
+        ToolPoisoningConfig(judge_band=(0.9, 0.5))
+
+
+class DilutedClassifier:
+    """Fires on the marker only in short texts, as the real model is diluted by a long
+    definition (a poisoned description: 0.76 alone, 0.01 inside the whole definition)."""
+
+    def __call__(self, texts: Sequence[str]) -> list[InjectionScore]:
+        return [
+            InjectionScore(0.99 if INJECT_MARKER in t and len(t) < 120 else 0.0, 0, len(t))
+            for t in texts
+        ]
+
+
+@DENIED
+async def test_a_poisoned_field_is_classified_on_its_own(snapshot, call):
+    padding = {f"option_{i}": {"type": "string", "title": f"Option {i}"} for i in range(12)}
+    definition = tool("fetch", f"Fetches pages. {INJECT_MARKER}", **padding)
+    assert len(definition_text(definition)) > 120
+    screen = ToolPoisoningControl(ClassifierRunner(DilutedClassifier()))
+    assert await screen.screen_listing("web", [definition], snapshot) == {"fetch"}
+    with listing_scope(listing(definition)):
+        verdict = await screen.evaluate(call("fetch"), Stage.PRE, BLOCK)
+    assert verdict.reason_code == "tool_poisoning_detected"

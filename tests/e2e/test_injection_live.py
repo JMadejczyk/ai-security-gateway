@@ -28,6 +28,7 @@ def ask(live_stack: LiveStack, text: str) -> httpx.Response:
     )
 
 
+@pytest.mark.control("prompt_injection", "deny")
 def test_an_injection_is_blocked_by_the_real_classifier(live_stack: LiveStack):
     response = ask(
         live_stack,
@@ -38,6 +39,7 @@ def test_an_injection_is_blocked_by_the_real_classifier(live_stack: LiveStack):
     assert response.json()["error"]["code"] == "prompt_injection_detected"
 
 
+@pytest.mark.control("prompt_injection", "allow")
 def test_a_business_question_is_not_flagged(live_stack: LiveStack):
     response = ask(live_stack, "Ile mamy klientów w województwie mazowieckim?")
     error = response.json().get("error") if response.status_code != 200 else None

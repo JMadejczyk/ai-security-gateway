@@ -269,6 +269,7 @@ async def test_taint_survives_a_gateway_restart(shared):
     assert await after.tainted_count() == 1
 
 
+@pytest.mark.control("authn", "deny")
 async def test_an_ended_session_never_revives_on_another_gateway(shared):
     one, two = shared.store(), shared.store()
     await one.open("s-1", ANNA, LIMITS)

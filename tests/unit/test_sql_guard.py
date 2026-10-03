@@ -17,6 +17,8 @@ from gateway.policy.schema import SqlGuardConfig
 
 CFG = SqlGuardConfig(mode=ControlMode.BLOCK, max_cost=10_000, force_limit=500, timeout_ms=100)
 COUNT = "SELECT COUNT(*) FROM sales.customers"
+ALLOWED = pytest.mark.control("sql_guard", "allow")
+DENIED = pytest.mark.control("sql_guard", "deny")
 
 
 @dataclass
@@ -65,6 +67,7 @@ def interaction(make_ctx):
     return build
 
 
+@ALLOWED
 async def test_cheap_query_is_allowed_with_the_limited_rewrite(interaction, scope):
     planner = FakePlanner(cost=12.5)
     verdict = await SqlGuardControl(planner).evaluate(interaction(), Stage.PRE, CFG)
@@ -78,6 +81,7 @@ async def test_cheap_query_is_allowed_with_the_limited_rewrite(interaction, scop
     ]
 
 
+@DENIED
 async def test_outside_a_call_scope_nothing_is_priced(interaction, scope):
     planner = FakePlanner()
     with call_scope(None):  # type: ignore[arg-type] -- no admitted call
@@ -93,6 +97,7 @@ async def test_rewrite_keeps_the_other_arguments(interaction):
     assert verdict.rewrite["arguments"] == {"sql": f"{COUNT} LIMIT 500", "note": "kept"}
 
 
+@ALLOWED
 async def test_already_canonical_and_capped_query_needs_no_rewrite(interaction):
     sql = "SELECT * FROM sales.customers LIMIT 10"
     planner = FakePlanner()
@@ -101,12 +106,14 @@ async def test_already_canonical_and_capped_query_needs_no_rewrite(interaction):
     assert [r.sql for r in planner.requests] == [sql]
 
 
+@ALLOWED
 @pytest.mark.parametrize("cost", [0.0, 9_999.9, 10_000.0])
 async def test_cost_at_or_under_the_threshold_is_allowed(interaction, cost):
     verdict = await SqlGuardControl(FakePlanner(cost=cost)).evaluate(interaction(), Stage.PRE, CFG)
     assert verdict.decision is Decision.ALLOW
 
 
+@DENIED
 async def test_cost_over_the_threshold_blocks_with_numbers_only(interaction):
     sql = "SELECT COUNT(*) FROM sales.customers c CROSS JOIN sales.orders o"
     verdict = await SqlGuardControl(FakePlanner(cost=123_456.78)).evaluate(
@@ -118,6 +125,7 @@ async def test_cost_over_the_threshold_blocks_with_numbers_only(interaction):
     assert "customers" not in verdict.reason
 
 
+@DENIED
 @pytest.mark.parametrize(
     "planner",
     [
@@ -141,6 +149,7 @@ async def test_an_unexpected_planner_failure_propagates_to_the_pipeline(interact
         )
 
 
+@DENIED
 @pytest.mark.parametrize(
     "sql",
     [
@@ -157,6 +166,7 @@ async def test_statements_outside_the_subset_are_blocked_before_planning(interac
     assert planner.requests == []
 
 
+@DENIED
 async def test_a_sql_call_without_a_server_cannot_be_priced(interaction):
     verdict = await SqlGuardControl(FakePlanner()).evaluate(
         interaction(server=None), Stage.PRE, CFG
@@ -164,6 +174,7 @@ async def test_a_sql_call_without_a_server_cannot_be_priced(interaction):
     assert (verdict.decision, verdict.reason_code) == (Decision.BLOCK, "sql_plan_unavailable")
 
 
+@ALLOWED
 async def test_calls_without_sql_are_not_its_business(interaction, make_ctx):
     planner = FakePlanner()
     control = SqlGuardControl(planner)
@@ -190,6 +201,7 @@ async def test_calls_without_sql_are_not_its_business(interaction, make_ctx):
     assert planner.requests == []
 
 
+@DENIED
 async def test_defaults_apply_to_a_plain_config(interaction):
     verdict = await SqlGuardControl(FakePlanner(cost=10_001)).evaluate(
         interaction(), Stage.PRE, ControlConfig()

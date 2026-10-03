@@ -9,8 +9,10 @@ ONNX Runtime and ``tokenizers``:
 - each text is tokenized whole (no truncation), then cut into windows of the model's size
   (``max_tokens`` minus the two special tokens) that overlap by `WINDOW_OVERLAP` tokens, so a
   phrase cut by one window edge is whole in the next; a text's score is its best window's;
-- windows of all texts are sorted by length and run in batches of `BATCH_SIZE`, padded to
-  the longest window of their batch;
+- windows of all texts are sorted by length and run in batches of at most `BATCH_SIZE`,
+  padded to the longest window of their batch; a batch only holds windows within
+  `BATCH_SPREAD` of its shortest, since padding a short window to a long one costs a full
+  long inference (a 1 KB and a 200 B text: 345 ms in one batch, 204 ms apart, on 4 threads);
 - the model is warmed up once at construction, so a graph that does not run fails at
   startup, not on the first agent call.
 
@@ -47,6 +49,7 @@ logger = logging.getLogger(__name__)
 
 WINDOW_OVERLAP: Final = 64  # tokens two consecutive windows share
 BATCH_SIZE: Final = 8
+BATCH_SPREAD: Final = 1.25  # longest / shortest window length within one batch
 DEFAULT_THREADS: Final = 4  # intra-op threads of one inference (8 gains nothing on 8 cores)
 DEFAULT_WORKERS: Final = 2  # classifier calls running at once
 CACHE_ENTRIES: Final = 8192
@@ -115,6 +118,20 @@ def _open_session(path: Path, threads: int) -> tuple[_Session, frozenset[str]]:
     return cast("_Session", session), inputs
 
 
+def _batches(windows: Sequence[_Window]) -> Iterator[list[_Window]]:
+    """Runs of the length-sorted ``windows``: at most `BATCH_SIZE` each, and none whose
+    longest window exceeds `BATCH_SPREAD` times its shortest (the first)."""
+    batch: list[_Window] = []
+    for window in windows:
+        full = len(batch) == BATCH_SIZE
+        if batch and (full or len(window.ids) > BATCH_SPREAD * len(batch[0].ids)):
+            yield batch
+            batch = []
+        batch.append(window)
+    if batch:
+        yield batch
+
+
 class OnnxInjectionClassifier:
     """`InjectionClassifier` over a verified ONNX sequence-classification model."""
 
@@ -152,8 +169,7 @@ class OnnxInjectionClassifier:
     def __call__(self, texts: Sequence[str]) -> list[InjectionScore]:
         best = [SAFE] * len(texts)
         windows = sorted(self._windows(texts), key=lambda w: len(w.ids))
-        for begin in range(0, len(windows), BATCH_SIZE):
-            batch = windows[begin : begin + BATCH_SIZE]
+        for batch in _batches(windows):
             for window, score in zip(batch, self._infer(batch), strict=True):
                 if score > best[window.text].score:
                     best[window.text] = InjectionScore(score, window.start, window.end)

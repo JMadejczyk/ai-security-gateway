@@ -4,6 +4,9 @@ import httpx
 import pytest
 from gateway_testkit import bearer, chat, echo_completion
 
+ALLOW = pytest.mark.control("authz", "allow")
+DENY = pytest.mark.control("authz", "deny")
+
 CHAT = "/v1/chat/completions"
 GRANT_LLAMA = (
     '"generate:model:qwen3:8b"]',
@@ -27,6 +30,8 @@ async def reload(gateway, sub: str = "root@demo") -> httpx.Response:
     return await gateway.operator.post("/admin/reload", headers=bearer(token))
 
 
+@ALLOW
+@DENY
 async def test_reload_grants_the_model_without_restart(gateway, upstream):
     bartek = await gateway.token("bartek@demo")
     before = await gateway.agent.post(CHAT, json=chat("llama3:70b"), headers=bearer(bartek))
@@ -49,6 +54,8 @@ async def test_reload_grants_the_model_without_restart(gateway, upstream):
     )
 
 
+@ALLOW
+@DENY
 async def test_broken_file_keeps_the_previous_policy(gateway, upstream):
     bartek = await gateway.token("bartek@demo")
     edit(gateway, "default: deny", "default: allow")
@@ -74,6 +81,7 @@ async def test_reload_needs_the_admin_role(gateway):
     assert gateway.container.policy_store.current.revision == revision
 
 
+@pytest.mark.control("authn", "deny")
 @pytest.mark.parametrize("sub", ["root@demo", "anna@demo", "svc:nightly_etl"])
 async def test_reload_refuses_agent_tokens(gateway, sub):
     edit(gateway, *GRANT_LLAMA)

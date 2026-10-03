@@ -23,6 +23,9 @@ from gateway.sessions import MAX_GOAL_CHARS
 ENFORCING = ControlConfig(mode=ControlMode.REQUIRE_APPROVAL, risk_delta=0.3)
 LOG_ONLY = ControlConfig(mode=ControlMode.LOG_ONLY, risk_delta=0.3)
 UNAVAILABLE = object()
+ALLOWED = pytest.mark.control("intent_judge", "allow")
+HELD = pytest.mark.control("intent_judge", "require_approval")
+LOGGED = pytest.mark.control("intent_judge", "log_only")
 
 
 class FakeJudge(JudgeClient):
@@ -74,6 +77,7 @@ async def run(judge, item, cfg=ENFORCING):
     return await IntentJudgeControl(judge).evaluate(item, Stage.POST, cfg)
 
 
+@ALLOWED
 async def test_not_configured_is_off(make_ctx):
     judge = FakeJudge({"query": False}, configured=False)
     verdict = await run(judge, interaction(make_ctx, call("query")))
@@ -81,6 +85,7 @@ async def test_not_configured_is_off(make_ctx):
     assert judge.contents == []
 
 
+@ALLOWED
 async def test_no_tool_calls_needs_no_judge(make_ctx):
     judge = FakeJudge()
     verdict = await run(judge, interaction(make_ctx))
@@ -91,8 +96,17 @@ async def test_no_tool_calls_needs_no_judge(make_ctx):
 @pytest.mark.parametrize(
     ("answers", "cfg", "decision", "reason", "enforced", "risk", "flagged"),
     [
-        ({"query": True}, ENFORCING, Decision.ALLOW, "tool_calls_aligned", True, 0.0, []),
-        (
+        pytest.param(
+            {"query": True},
+            ENFORCING,
+            Decision.ALLOW,
+            "tool_calls_aligned",
+            True,
+            0.0,
+            [],
+            marks=ALLOWED,
+        ),
+        pytest.param(
             {"query": False},
             ENFORCING,
             Decision.REQUIRE_APPROVAL,
@@ -100,8 +114,9 @@ async def test_no_tool_calls_needs_no_judge(make_ctx):
             True,
             0.3,
             ["query"],
+            marks=HELD,
         ),
-        (
+        pytest.param(
             {"query": False},
             LOG_ONLY,
             Decision.REQUIRE_APPROVAL,
@@ -109,8 +124,9 @@ async def test_no_tool_calls_needs_no_judge(make_ctx):
             False,
             0.3,
             ["query"],
+            marks=LOGGED,
         ),
-        (
+        pytest.param(
             {"query": UNAVAILABLE},
             ENFORCING,
             Decision.REQUIRE_APPROVAL,
@@ -118,8 +134,9 @@ async def test_no_tool_calls_needs_no_judge(make_ctx):
             True,
             0.0,  # nothing was detected: fail closed without adding risk
             ["query"],
+            marks=HELD,
         ),
-        (
+        pytest.param(
             {"query": UNAVAILABLE},
             LOG_ONLY,
             Decision.REQUIRE_APPROVAL,
@@ -127,8 +144,9 @@ async def test_no_tool_calls_needs_no_judge(make_ctx):
             False,
             0.0,
             ["query"],
+            marks=LOGGED,
         ),
-        (
+        pytest.param(
             {"query": True, "write_report": False},
             ENFORCING,
             Decision.REQUIRE_APPROVAL,
@@ -136,8 +154,9 @@ async def test_no_tool_calls_needs_no_judge(make_ctx):
             True,
             0.3,
             ["write_report"],
+            marks=HELD,
         ),
-        (
+        pytest.param(
             {"query": UNAVAILABLE, "write_report": False},
             ENFORCING,
             Decision.REQUIRE_APPROVAL,
@@ -145,6 +164,7 @@ async def test_no_tool_calls_needs_no_judge(make_ctx):
             True,
             0.3,
             ["query", "write_report"],  # unjudged calls are flagged too
+            marks=HELD,
         ),
     ],
 )
@@ -197,6 +217,7 @@ async def test_first_call_uses_this_requests_first_user_message(make_ctx):
     ]
 
 
+@HELD
 async def test_no_user_message_flags_every_call(make_ctx):
     judge = FakeJudge()
     payload = {"model": "qwen3:8b", "messages": [{"role": "system", "content": "s"}]}
@@ -215,6 +236,7 @@ async def test_identical_calls_are_judged_once(make_ctx):
     assert len(verdict.flags) == 1
 
 
+@HELD
 async def test_calls_beyond_the_cap_are_flagged_unjudged(make_ctx):
     judge = FakeJudge()
     calls = [call("query", json.dumps({"n": i}), i) for i in range(MAX_JUDGED_CALLS + 3)]

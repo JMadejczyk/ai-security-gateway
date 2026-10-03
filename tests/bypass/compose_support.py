@@ -21,6 +21,7 @@ _PLACEHOLDER_SECRETS = {
     "POSTGRES_PASSWORD": "placeholder-postgres",
     "ACL_APP_DB_PASSWORD": "placeholder-app",
     "ACL_REDIS_PASSWORD": "placeholder-redis",
+    "ACL_GRAFANA_ADMIN_PASSWORD": "placeholder-grafana",
 }
 
 

@@ -11,6 +11,12 @@ from judge_kit import FakeJudgeClient
 
 from gateway.judges.client import JudgeResult, JudgeUnavailableError
 
+OUTPUT_DENY = pytest.mark.control("output_policy", "deny")
+OUTPUT_REDACT = pytest.mark.control("output_policy", "redact")
+ALLOW_PI = pytest.mark.control("prompt_injection", "allow")
+ALLOW_INTENT = pytest.mark.control("intent_judge", "allow")
+ALLOW_OUTPUT = pytest.mark.control("output_policy", "allow")
+
 CHAT = "/v1/chat/completions"
 TOOL_CALL = {
     "id": "c1",
@@ -44,6 +50,9 @@ def test_root_policy_configures_the_judges(snapshot):
     assert snapshot.policy.resolved_control_mode("intent_judge") == "require_approval"
 
 
+@ALLOW_PI
+@ALLOW_INTENT
+@ALLOW_OUTPUT
 async def test_default_judge_clears_every_judge_control(gateway, llm_upstream):
     llm_upstream.post("/chat/completions").mock(
         return_value=httpx.Response(200, json=completion(None, tool_calls=[TOOL_CALL]))
@@ -60,6 +69,7 @@ async def test_default_judge_clears_every_judge_control(gateway, llm_upstream):
     assert len(llm_upstream.calls) == 1  # judges never reach the (mocked) upstream
 
 
+@OUTPUT_REDACT
 async def test_one_answer_can_be_overridden_per_test(gateway, llm_upstream):
     llm_upstream.post("/chat/completions").mock(
         return_value=httpx.Response(200, json=completion("Olga's card is 4111."))
@@ -74,6 +84,7 @@ async def test_one_answer_can_be_overridden_per_test(gateway, llm_upstream):
     )
 
 
+@OUTPUT_DENY
 @pytest.mark.parametrize(
     "answer",
     [

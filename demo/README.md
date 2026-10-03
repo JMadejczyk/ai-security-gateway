@@ -23,8 +23,9 @@ temporary `bootstrap` network, which has internet access. The `ollama` service i
 `llm_backend` only, so it has no way out. Pull the model before `up`, or stop `ollama` while
 pulling, so two processes don't write the volume at once.
 
-If 9090 or 8080 is already taken on your machine, set `ACL_OPERATOR_HOST_PORT` or
-`ACL_AGENT_HOST_PORT` in `.env`. Both ports are always published on `127.0.0.1` only.
+If 9090, 8080 or 3300 is already taken on your machine, set `ACL_OPERATOR_HOST_PORT`,
+`ACL_AGENT_HOST_PORT` or `ACL_GRAFANA_HOST_PORT` in `.env`. All three are published on
+`127.0.0.1` only.
 
 ## Network topology
 
@@ -39,12 +40,17 @@ flowchart LR
     gw8080 -- mcp_backend --> mcpfiles[mcp-files]
     gw8080 -- mcp_untrusted --> mcpfetch[mcp-fetch] -- fetch_egress --> internet((internet))
     gw8080 -- state --> redis[(redis)]
+    prometheus -- ops: scrape /metrics --> gw9090
+    gw9090 -. audit.jsonl on audit_log volume .-> alloy -- ops --> loki
+    grafana -- ops --> prometheus
+    grafana -- ops --> loki
+    host --> grafana[grafana :3000<br/>127.0.0.1:3300]
 ```
 
 | Network | Internal | Members |
 | --- | --- | --- |
 | `edge` | yes | agent, gateway |
-| `ops` | no | gateway (static `172.29.90.10`); later Prometheus, Loki, Grafana |
+| `ops` | no | gateway (static `172.29.90.10`), prometheus, loki, alloy, grafana |
 | `llm_backend` | yes | gateway, ollama |
 | `mcp_backend` | yes | gateway, mcp-postgres, mcp-files, postgres |
 | `mcp_untrusted` | yes | gateway, mcp-fetch |
@@ -75,6 +81,30 @@ positive controls from the gateway. They also call the `fetch` tool with interna
 pytest tests/bypass -m "not docker"         # static, needs only the docker CLI
 ACL_DOCKER_TESTS=1 pytest tests/bypass      # also the live probes (stack must be up)
 ```
+
+## Observability (`prometheus`, `loki`, `alloy`, `grafana`)
+
+All four join `ops` and nothing else, so neither the agent (`edge`) nor mcp-fetch
+(`mcp_untrusted`, `fetch_egress`) can resolve or reach them. They run as their images'
+non-root users (Alloy as its `alloy` user, uid 473, instead of the image default root), with a
+read-only root filesystem, `cap_drop: ALL` and `no-new-privileges`. Their images are pinned to
+exact versions (`LICENSES.md` records them; Grafana and Loki are AGPLv3, used unmodified).
+
+- `prometheus` scrapes `gateway:9090/metrics`. It shares only `ops` with the gateway, so the
+  name resolves to the operator listener's static address.
+- The gateway writes its audit JSONL to the `audit_log` volume. `alloy` mounts that volume
+  read-only, tails `audit.jsonl` and pushes to `loki`. Alloy gets no Docker socket, and its
+  own HTTP server listens on 127.0.0.1 inside its container.
+- `grafana` is the only one that publishes a port (`127.0.0.1:3300`). It is provisioned
+  read-only from `grafana/`, and it is the only service holding `ACL_GRAFANA_ADMIN_PASSWORD`.
+  The password applies when the `grafana_data` volume is first created.
+- Grafana's analytics, update checks, news feed and plugin preinstall are off, and so are
+  Loki's usage reports and Alloy's reporting. `ops` has an internet route because it carries
+  the published ports, so these services never phone home.
+
+`tests/bypass/` checks this too. Statically: networks, hardening, volumes, no socket, which
+service holds which secret. Live: probes from the agent and mcp-fetch to every observability
+address and name, with positive controls from the gateway.
 
 ## Budget counters (`redis`)
 

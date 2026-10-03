@@ -15,6 +15,9 @@ from gateway.policy.loader import PolicyLoadError
 
 SCANNER = SecretScanner()
 CONTROL = SecretsControl()
+ALLOW = pytest.mark.control("secrets", "allow")
+DENY = pytest.mark.control("secrets", "deny")
+REDACT = pytest.mark.control("secrets", "redact")
 
 
 def _b64url(document: dict[str, str]) -> str:
@@ -144,6 +147,7 @@ def mcp_result(make_ctx, text: str) -> Interaction:
     )
 
 
+@REDACT
 async def test_redact_masks_only_the_secret(make_ctx):
     text = "Zażółć: postgres://app:S3cr3tPw@db/sales"
     verdict = await CONTROL.evaluate(
@@ -159,11 +163,14 @@ async def test_redact_masks_only_the_secret(make_ctx):
 @pytest.mark.parametrize(
     ("mode", "text", "decision", "reason_code", "risk"),
     [
-        (ControlMode.BLOCK, f"key {STRIPE}", Decision.BLOCK, DETECTED, 0.3),
-        (ControlMode.BLOCK, "nothing to see", Decision.ALLOW, CLEAN, 0.0),
-        (ControlMode.REDACT, f"key {STRIPE}", Decision.REDACT, DETECTED, 0.3),
-        (ControlMode.REDACT, "nothing to see", Decision.ALLOW, CLEAN, 0.0),
-        (None, f"key {STRIPE}", Decision.BLOCK, DETECTED, 0.3),  # unresolved: most enforcing
+        pytest.param(ControlMode.BLOCK, f"key {STRIPE}", Decision.BLOCK, DETECTED, 0.3, marks=DENY),
+        pytest.param(ControlMode.BLOCK, "nothing to see", Decision.ALLOW, CLEAN, 0.0, marks=ALLOW),
+        pytest.param(
+            ControlMode.REDACT, f"key {STRIPE}", Decision.REDACT, DETECTED, 0.3, marks=REDACT
+        ),
+        pytest.param(ControlMode.REDACT, "nothing to see", Decision.ALLOW, CLEAN, 0.0, marks=ALLOW),
+        # unresolved: most enforcing
+        pytest.param(None, f"key {STRIPE}", Decision.BLOCK, DETECTED, 0.3, marks=DENY),
     ],
 )
 async def test_modes(make_ctx, mode, text, decision, reason_code, risk):
@@ -178,6 +185,7 @@ async def test_modes(make_ctx, mode, text, decision, reason_code, risk):
     assert verdict.risk_delta == pytest.approx(risk)
 
 
+@DENY
 async def test_reason_names_kinds_never_values(make_ctx):
     verdict = await CONTROL.evaluate(
         mcp_result(make_ctx, f"{STRIPE} and {PEM}"), Stage.POST, ControlConfig()

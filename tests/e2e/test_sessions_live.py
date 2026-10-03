@@ -87,6 +87,7 @@ def wait_healthy(stack: LiveStack, timeout_s: float = 90) -> None:
     pytest.fail("the gateway did not come back")
 
 
+@pytest.mark.control("authz", "deny")
 def test_taint_survives_a_gateway_restart(live_stack: LiveStack):
     token = live_stack.token("anna@demo")  # one gateway session for every call below
     fetched = call(live_stack, token, "web", "fetch", url="https://example.com/")

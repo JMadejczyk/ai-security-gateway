@@ -16,6 +16,14 @@ from mcp_harness import MCPStack, connect, connect_all, error_text
 from pin_kit import capture_pins, write_pins
 from upstreams import running_upstreams
 
+PI_ALLOW = pytest.mark.control("prompt_injection", "allow")
+PI_DENY = pytest.mark.control("prompt_injection", "deny")
+PI_LOG = pytest.mark.control("prompt_injection", "log_only")
+POISON_ALLOW = pytest.mark.control("tool_poisoning", "allow")
+POISON_DENY = pytest.mark.control("tool_poisoning", "deny")
+AUTHZ_DENY = pytest.mark.control("authz", "deny")
+AUTHZ_HOLD = pytest.mark.control("authz", "require_approval")
+
 ANNA, ETL = "anna@demo", "svc:nightly_etl"
 HIDDEN_PAGE = (
     "<html><body><h1>Supplier price list</h1><p>Cables from 4.20 PLN/m.</p>"
@@ -60,6 +68,8 @@ def pi_verdict(entry: dict, stage: str) -> dict:
     return verdict
 
 
+@PI_DENY
+@AUTHZ_DENY
 async def test_demo_step_2_hidden_injection_taints_databot_and_blocks_the_report(stack):
     """Anna's DataBot may write a report; after reading a poisoned page it may not."""
     web, reports = await connect_all(stack, ANNA, "web", "reports")
@@ -81,6 +91,8 @@ async def test_demo_step_2_hidden_injection_taints_databot_and_blocks_the_report
     assert len(stack.log.of("write_report")) == 1  # the second write never ran
 
 
+@PI_DENY
+@AUTHZ_HOLD
 async def test_demo_step_3_nightly_etl_is_held_for_approval_not_stopped(stack):
     """The same page in the autonomous agent: the write needs approval, reads keep working."""
     web, reports = await connect_all(stack, ETL, "web", "reports")
@@ -98,6 +110,7 @@ async def test_demo_step_3_nightly_etl_is_held_for_approval_not_stopped(stack):
     assert stack.log.of("write_report") == []
 
 
+@PI_DENY
 async def test_an_injection_in_tool_arguments_is_blocked_before_the_upstream_and_taints(stack):
     """A trusted server: the taint comes from the detector itself, at the pre stage."""
     reports = await connect(stack, ANNA, "reports")
@@ -111,6 +124,7 @@ async def test_an_injection_in_tool_arguments_is_blocked_before_the_upstream_and
     assert clean["isError"] is True  # tainted: write is removed for the interactive session
 
 
+@PI_LOG
 async def test_log_only_records_and_taints_but_releases(stack):
     path = stack.gateway.policy_path
     path.write_text(
@@ -130,6 +144,7 @@ async def test_log_only_records_and_taints_but_releases(stack):
     assert session.risk >= 0.6
 
 
+@PI_ALLOW
 async def test_a_clean_page_passes(stack):
     web = await connect(stack, ANNA, "web")
     stack.log.fetch_page = "<html><body>Cables from 4.20 PLN/m.</body></html>"
@@ -139,6 +154,7 @@ async def test_a_clean_page_passes(stack):
     assert pi_verdict(entry, "post")["reason_code"] == "no_prompt_injection"
 
 
+@POISON_DENY
 async def test_a_poisoned_tool_is_hidden_and_blocked_when_called_by_name(poisoned_stack):
     web = await connect(poisoned_stack, ANNA, "web")
     assert await web.tools() == []  # hidden from tools/list
@@ -150,6 +166,7 @@ async def test_a_poisoned_tool_is_hidden_and_blocked_when_called_by_name(poisone
             "reason_code": "tool_poisoning_detected"} in entry["verdicts"]  # fmt: skip
 
 
+@POISON_ALLOW
 async def test_clean_tools_stay_listed_and_callable(stack):
     web = await connect(stack, ANNA, "web")
     assert await web.tools() == ["fetch"]

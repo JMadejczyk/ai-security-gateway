@@ -32,6 +32,16 @@ BLOCK = PromptInjectionConfig(mode=ControlMode.BLOCK, risk_delta=0.6)
 LOG_ONLY = PromptInjectionConfig(mode=ControlMode.LOG_ONLY, risk_delta=0.6)
 YES = InjectionJudgement(is_injection=True, confidence=0.9, rationale="tells the agent to act")
 NO = InjectionJudgement(is_injection=False, confidence=0.8, rationale="an ordinary question")
+ALLOWED = pytest.mark.control("prompt_injection", "allow")
+DENIED = pytest.mark.control("prompt_injection", "deny")
+LOGGED = pytest.mark.control("prompt_injection", "log_only")
+
+
+def outcome(decision: Decision, enforced: bool = True) -> pytest.MarkDecorator:
+    """What a table row asserts: allowed, blocked, or a block recorded but not enforced."""
+    if decision is Decision.ALLOW:
+        return ALLOWED
+    return DENIED if enforced else LOGGED
 
 
 @pytest.fixture
@@ -193,7 +203,7 @@ MODE_CASES = [
 
 @pytest.mark.parametrize(
     ("channel", "stage", "payload", "result", "cfg", "decision", "enforced", "reason_code"),
-    [case[1:] for case in MODE_CASES],
+    [pytest.param(*case[1:], marks=outcome(case[6], case[7])) for case in MODE_CASES],
     ids=[case[0] for case in MODE_CASES],
 )
 async def test_modes_channels_and_stages(
@@ -215,9 +225,12 @@ async def test_modes_channels_and_stages(
 @pytest.mark.parametrize(
     ("score", "threshold", "decision", "reason_code"),
     [
-        (0.84, 0.85, Decision.ALLOW, "no_prompt_injection"),  # below: no judge configured
-        (0.85, 0.85, Decision.BLOCK, "prompt_injection_detected"),  # at threshold: detected
-        (0.95, 0.97, Decision.ALLOW, "no_prompt_injection"),  # above band, below threshold
+        # below: no judge configured
+        pytest.param(0.84, 0.85, Decision.ALLOW, "no_prompt_injection", marks=ALLOWED),
+        # at threshold: detected
+        pytest.param(0.85, 0.85, Decision.BLOCK, "prompt_injection_detected", marks=DENIED),
+        # above band, below threshold
+        pytest.param(0.95, 0.97, Decision.ALLOW, "no_prompt_injection", marks=ALLOWED),
     ],
     ids=["below-threshold", "at-threshold", "configured-threshold"],
 )
@@ -261,7 +274,7 @@ JUDGE_CASES = [
 
 @pytest.mark.parametrize(
     ("judge", "decision", "reason_code", "risk"),
-    [case[1:] for case in JUDGE_CASES],
+    [pytest.param(*case[1:], marks=outcome(case[2])) for case in JUDGE_CASES],
     ids=[case[0] for case in JUDGE_CASES],
 )
 async def test_judge_band(interaction, judge, decision, reason_code, risk):
@@ -280,6 +293,7 @@ async def test_judge_band(interaction, judge, decision, reason_code, risk):
         assert DOUBT_MARKER in judge.contents[0]  # the window around the best score
 
 
+@LOGGED
 async def test_judge_unavailable_is_recorded_not_applied_under_log_only(interaction):
     verdict = await control(judge=ScriptedJudge(None)).evaluate(
         interaction(Channel.LLM, prompt(DOUBT_MARKER)), Stage.PRE, LOG_ONLY
@@ -291,6 +305,7 @@ async def test_judge_unavailable_is_recorded_not_applied_under_log_only(interact
     )
 
 
+@ALLOWED
 async def test_judge_verdicts_are_remembered(interaction):
     judge = ScriptedJudge(NO)
     pi = control(judge=judge)
@@ -302,6 +317,7 @@ async def test_judge_verdicts_are_remembered(interaction):
     assert len(judge.contents) == 1
 
 
+@DENIED
 async def test_too_many_uncertain_texts_fail_closed(interaction):
     texts = [f"text {i} {DOUBT_MARKER}" for i in range(MAX_JUDGED + 1)]
     judge = ScriptedJudge(NO)
@@ -312,6 +328,7 @@ async def test_too_many_uncertain_texts_fail_closed(interaction):
     assert judge.contents == []
 
 
+@DENIED
 async def test_a_clear_detection_never_asks_the_judge(interaction):
     judge = ScriptedJudge(NO)
     verdict = await control(judge=judge).evaluate(
@@ -324,8 +341,8 @@ async def test_a_clear_detection_never_asks_the_judge(interaction):
 @pytest.mark.parametrize(
     ("max_chars", "decision", "reason_code"),
     [
-        (5000, Decision.ALLOW, "no_prompt_injection"),
-        (100, Decision.BLOCK, "content_too_large_to_classify"),
+        pytest.param(5000, Decision.ALLOW, "no_prompt_injection", marks=ALLOWED),
+        pytest.param(100, Decision.BLOCK, "content_too_large_to_classify", marks=DENIED),
     ],
     ids=["under-cap", "over-cap"],
 )
@@ -344,6 +361,7 @@ async def test_character_cap(interaction, max_chars, decision, reason_code):
     assert bool(classifier.calls) == (decision is Decision.ALLOW)  # over the cap: nothing ran
 
 
+@ALLOWED
 async def test_the_cap_counts_only_text_not_classified_before(interaction):
     """A chat re-sends its history every turn: only the new turn counts against the cap."""
     pi = control()
@@ -363,6 +381,7 @@ async def test_history_is_classified_once(interaction):
     assert classifier.classified.count(first) == 1
 
 
+@DENIED
 async def test_an_instruction_split_across_messages_is_seen_whole(interaction):
     """The fake fires only on the whole marker: the boundary join is what finds it."""
     half = len(INJECT_MARKER) // 2
@@ -376,6 +395,7 @@ async def test_an_instruction_split_across_messages_is_seen_whole(interaction):
     assert verdict.reason_code == "prompt_injection_detected"
 
 
+@DENIED
 async def test_the_classifier_being_off_fails_closed(interaction):
     pi = PromptInjectionControl(ClassifierRunner(UnavailableClassifier()), None)
     verdict = await pi.evaluate(
@@ -388,6 +408,7 @@ async def test_the_classifier_being_off_fails_closed(interaction):
     )
 
 
+@DENIED
 async def test_an_unscannable_segment_fails_closed(interaction):
     payload = {
         "model": "qwen3:8b",
@@ -402,6 +423,7 @@ async def test_an_unscannable_segment_fails_closed(interaction):
     assert (verdict.decision, verdict.reason_code) == (Decision.BLOCK, "content_unscannable")
 
 
+@ALLOWED
 async def test_nothing_to_classify_is_clean_and_runs_no_model(interaction):
     classifier = MarkerClassifier()
     verdict = await control(classifier).evaluate(
@@ -464,6 +486,7 @@ DATA_FIELD_CASES = [
 ]  # fmt: skip
 
 
+@DENIED
 @pytest.mark.parametrize(
     "result", [case[1] for case in DATA_FIELD_CASES], ids=[case[0] for case in DATA_FIELD_CASES]
 )
@@ -473,6 +496,7 @@ async def test_data_fields_named_like_protocol_fields_are_classified(interaction
     assert (verdict.decision, verdict.reason_code) == (Decision.BLOCK, "prompt_injection_detected")
 
 
+@DENIED
 async def test_tool_arguments_named_like_protocol_fields_are_classified(interaction):
     payload = {"name": "write_report", "arguments": {"name": INJECT_MARKER, "type": "x"}}
     verdict = await control().evaluate(interaction(Channel.MCP, payload), Stage.PRE, BLOCK)
@@ -515,6 +539,7 @@ class PerWindowJudge:
         )
 
 
+@DENIED
 async def test_a_confirmed_injection_survives_judge_cache_eviction(interaction):
     """Codex P1 #2: storing the clean answers evicted the one injection answer, and the
     missing answer then read as clean."""
@@ -537,6 +562,7 @@ def one_char_parts(text: str) -> dict[str, Any]:
     return {"model": "qwen3:8b", "messages": [{"role": "user", "content": parts}]}
 
 
+@DENIED
 async def test_an_instruction_cut_into_one_character_parts_is_seen_whole(interaction):
     """Codex P1 #3: pairwise joins never rebuild a text cut into many parts."""
     payload = one_char_parts(f"Note: {INJECT_MARKER} ok")
@@ -544,6 +570,7 @@ async def test_an_instruction_cut_into_one_character_parts_is_seen_whole(interac
     assert verdict.reason_code == "prompt_injection_detected"
 
 
+@DENIED
 async def test_an_instruction_cut_across_mcp_content_items_is_seen_whole(interaction):
     items = [{"type": "text", "text": char} for char in INJECT_MARKER]
     verdict = await control().evaluate(
@@ -561,6 +588,8 @@ def test_rolling_windows_overlap_and_cover_the_whole_text():
     assert rolling_windows("short") == ["short"]
 
 
+@ALLOWED
+@DENIED
 async def test_split_windows_count_against_the_character_cap(interaction):
     def parts(*texts: str) -> dict[str, Any]:
         content = [{"type": "text", "text": text} for text in texts]
@@ -704,6 +733,7 @@ def orders_result(rows: int = 500) -> dict[str, Any]:
     }
 
 
+@ALLOWED
 async def test_a_500_row_structured_result_is_not_too_large(interaction):
     """Live finding 1: 500 rows of ids, dates and amounts used to blow the 50k cap."""
     classifier = MarkerClassifier()
@@ -714,6 +744,7 @@ async def test_a_500_row_structured_result_is_not_too_large(interaction):
     assert sum(len(text) for text in classifier.classified) < 1000
 
 
+@DENIED
 async def test_an_injection_in_a_row_field_is_still_found(interaction):
     result = orders_result(50)
     result["structuredContent"]["result"][7]["note"] = f"Thanks! {INJECT_MARKER}"
@@ -722,6 +753,7 @@ async def test_an_injection_in_a_row_field_is_still_found(interaction):
     assert verdict.reason_code == "prompt_injection_detected"
 
 
+@DENIED
 async def test_huge_prose_still_fails_closed(interaction):
     page = " ".join(f"Paragraph {i} explains our shipping and returns policy." for i in range(2000))
     verdict = await control().evaluate(
@@ -735,6 +767,7 @@ async def test_huge_prose_still_fails_closed(interaction):
     )
 
 
+@DENIED
 async def test_an_instruction_split_one_character_per_message_is_seen(interaction):
     """Codex regression P1: windows stayed inside one message; one character per message
     left nothing longer than two characters to classify."""
@@ -746,6 +779,7 @@ async def test_an_instruction_split_one_character_per_message_is_seen(interactio
     assert verdict.reason_code == "prompt_injection_detected"
 
 
+@DENIED
 async def test_an_instruction_split_across_tool_results_in_history_is_seen(interaction):
     half = len(INJECT_MARKER) // 3
     pieces = [INJECT_MARKER[:half], INJECT_MARKER[half : 2 * half], INJECT_MARKER[2 * half :]]
@@ -768,10 +802,16 @@ PAGE = (
 @pytest.mark.parametrize(
     ("hidden", "reason_code"),
     [
-        ("", "no_prompt_injection"),
-        (f"<div style='display:none'>{INJECT_MARKER} now</div>", "prompt_injection_detected"),
-        (f"<!-- {INJECT_MARKER} now -->", "prompt_injection_detected"),
-        (f"<img alt='{INJECT_MARKER} now' src=x.png>", "prompt_injection_detected"),
+        pytest.param("", "no_prompt_injection", marks=ALLOWED),
+        pytest.param(
+            f"<div style='display:none'>{INJECT_MARKER} now</div>",
+            "prompt_injection_detected",
+            marks=DENIED,
+        ),
+        pytest.param(f"<!-- {INJECT_MARKER} now -->", "prompt_injection_detected", marks=DENIED),
+        pytest.param(
+            f"<img alt='{INJECT_MARKER} now' src=x.png>", "prompt_injection_detected", marks=DENIED
+        ),
     ],
     ids=["clean-page", "hidden-div", "comment", "alt-text"],
 )
@@ -792,6 +832,7 @@ async def test_html_pages_are_classified_as_readable_text(interaction, hidden, r
     assert "Cables from 4.20 PLN per metre" in classified
 
 
+@ALLOWED
 async def test_redaction_markers_are_neutral_text(interaction):
     """A redacted answer re-sent as history: the gateway's own marker is not an attack."""
     classifier = MarkerClassifier({"[REDACTED:": 0.99})

@@ -34,7 +34,12 @@ from gateway.feed.schema import (
 from gateway.feed.sources import FeedSource, resolve_source
 from gateway.policy.loader import PolicySnapshot
 from gateway.policy.schema import SignaturesConfig
-from gateway.telemetry import FeedReloadResult, record_feed_reload, set_active_feed_version
+from gateway.telemetry import (
+    FeedReloadResult,
+    initialize_signature_series,
+    record_feed_reload,
+    set_active_feed_version,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +153,7 @@ class FeedStore:
     def _swap(self, feed: SignatureFeed) -> None:
         self._current = feed
         set_active_feed_version(feed.version)
+        initialize_signature_series(feed.signature_ids)
 
     def _finish(self, result: FeedReloadResult, *, error: str | None = None) -> FeedRefresh:
         record_feed_reload(result)

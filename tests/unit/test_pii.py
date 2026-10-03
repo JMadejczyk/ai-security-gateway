@@ -15,6 +15,10 @@ from gateway.policy.schema import PiiConfig, PiiEntity
 
 CONTROL = PiiControl()
 ALL = tuple(PiiEntity)
+ALLOW = pytest.mark.control("pii", "allow")
+DENY = pytest.mark.control("pii", "deny")
+REDACT = pytest.mark.control("pii", "redact")
+LOG_ONLY = pytest.mark.control("pii", "log_only")
 
 PESEL = "44051401359"  # 1944-05-14
 IBAN = "PL61 1090 1014 0000 0712 1981 2874"
@@ -133,6 +137,7 @@ def test_dates_and_amounts_are_not_phone_numbers():
     ]
 
 
+@REDACT
 @pytest.mark.parametrize(("repeat", "threaded"), [(10, False), (400, True)])
 async def test_only_long_text_is_scanned_off_the_event_loop(
     make_ctx, monkeypatch, repeat, threaded
@@ -167,6 +172,7 @@ def test_only_configured_entities_are_reported():
     assert found(text, entities=()) == []
 
 
+@REDACT
 async def test_spans_are_json_pointers_with_code_point_offsets(make_ctx):
     content = f"Zażółć gęślą jaźń: {PESEL}, mail jan@firma.pl"
     verdict = await CONTROL.evaluate(
@@ -181,6 +187,7 @@ async def test_spans_are_json_pointers_with_code_point_offsets(make_ctx):
     )
 
 
+@ALLOW
 async def test_post_stage_scans_the_answer_not_the_prompt(make_ctx):
     item = chat(make_ctx, f"my PESEL is {PESEL}").model_copy(
         update={"result": {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}}
@@ -192,14 +199,20 @@ async def test_post_stage_scans_the_answer_not_the_prompt(make_ctx):
 @pytest.mark.parametrize(
     ("mode", "content", "decision", "enforced", "reason_code", "risk"),
     [
-        (ControlMode.REDACT, f"PESEL {PESEL}", Decision.REDACT, True, PII_DETECTED, 0.1),
-        (ControlMode.REDACT, "no personal data", Decision.ALLOW, True, NO_PII, 0.0),
-        (ControlMode.BLOCK, f"PESEL {PESEL}", Decision.BLOCK, True, PII_DETECTED, 0.1),
-        (ControlMode.BLOCK, "no personal data", Decision.ALLOW, True, NO_PII, 0.0),
-        (ControlMode.LOG_ONLY, f"PESEL {PESEL}", Decision.REDACT, False, PII_DETECTED, 0.1),
-        (ControlMode.LOG_ONLY, "no personal data", Decision.ALLOW, True, NO_PII, 0.0),
+        pytest.param(ControlMode.REDACT, f"PESEL {PESEL}", Decision.REDACT, True, PII_DETECTED,
+                     0.1, marks=REDACT),
+        pytest.param(ControlMode.REDACT, "no personal data", Decision.ALLOW, True, NO_PII, 0.0,
+                     marks=ALLOW),
+        pytest.param(ControlMode.BLOCK, f"PESEL {PESEL}", Decision.BLOCK, True, PII_DETECTED,
+                     0.1, marks=DENY),
+        pytest.param(ControlMode.BLOCK, "no personal data", Decision.ALLOW, True, NO_PII, 0.0,
+                     marks=ALLOW),
+        pytest.param(ControlMode.LOG_ONLY, f"PESEL {PESEL}", Decision.REDACT, False,
+                     PII_DETECTED, 0.1, marks=LOG_ONLY),
+        pytest.param(ControlMode.LOG_ONLY, "no personal data", Decision.ALLOW, True, NO_PII,
+                     0.0, marks=ALLOW),
     ],
-)
+)  # fmt: skip
 async def test_modes(make_ctx, mode, content, decision, enforced, reason_code, risk):
     verdict = await CONTROL.evaluate(chat(make_ctx, content), Stage.PRE, PiiConfig(mode=mode))
     assert (verdict.decision, verdict.enforced, verdict.reason_code) == (
@@ -210,6 +223,7 @@ async def test_modes(make_ctx, mode, content, decision, enforced, reason_code, r
     assert verdict.risk_delta == pytest.approx(risk)  # the catalog default when unset
 
 
+@DENY
 async def test_reason_names_entities_never_values_and_risk_comes_from_config(make_ctx):
     content = f"{PESEL}, {IBAN}, jan@firma.pl"
     cfg = PiiConfig(mode=ControlMode.BLOCK, risk_delta=0.25)
@@ -220,6 +234,7 @@ async def test_reason_names_entities_never_values_and_risk_comes_from_config(mak
     assert not any(v in str(dumped) for v in (PESEL, "1090", "jan@firma.pl"))
 
 
+@REDACT
 async def test_a_plain_control_config_gets_pii_defaults(make_ctx):
     verdict = await CONTROL.evaluate(
         chat(make_ctx, f"PESEL {PESEL}"), Stage.PRE, ControlConfig(mode=ControlMode.REDACT)

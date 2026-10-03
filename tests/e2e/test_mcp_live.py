@@ -58,6 +58,7 @@ def customer_count(result: dict) -> int:
     return row["count"]
 
 
+@pytest.mark.control("authz", "allow")
 def test_same_count_query_sees_different_rows_per_principal(live_stack: LiveStack):
     sql = "SELECT COUNT(*) AS count FROM sales.customers"
     anna = customer_count(call_tool(live_stack, "anna@demo", "query", sql=sql))
@@ -65,6 +66,7 @@ def test_same_count_query_sees_different_rows_per_principal(live_stack: LiveStac
     assert (anna, bartek) == (40, 7)
 
 
+@pytest.mark.control("authz", "deny")
 def test_intern_is_refused_the_payments_table(live_stack: LiveStack):
     result = call_tool(
         live_stack, "bartek@demo", "query", sql="SELECT COUNT(*) FROM sales.payments"

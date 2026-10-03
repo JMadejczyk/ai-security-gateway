@@ -378,6 +378,14 @@ class PiiConfig(ControlConfig):
         return value
 
 
+def _ordered_band(value: tuple[float, float]) -> tuple[float, float]:
+    low, high = value
+    if low > high:
+        msg = f"judge_band {list(value)} must be ordered [low, high]"
+        raise ValueError(msg)
+    return value
+
+
 class PromptInjectionConfig(ControlConfig):
     threshold: Threshold = 0.85
     judge_band: tuple[Threshold, Threshold] = (0.5, 0.85)
@@ -388,15 +396,17 @@ class PromptInjectionConfig(ControlConfig):
     @field_validator("judge_band")
     @classmethod
     def _ordered(cls, value: tuple[float, float]) -> tuple[float, float]:
-        low, high = value
-        if low > high:
-            msg = f"judge_band {list(value)} must be ordered [low, high]"
-            raise ValueError(msg)
-        return value
+        return _ordered_band(value)
 
 
 class ToolPoisoningConfig(ControlConfig):
     threshold: Threshold = 0.85  # classifier score at which a tool definition is poisoned
+    judge_band: tuple[Threshold, Threshold] = (0.5, 0.85)  # scores the LLM judge decides
+
+    @field_validator("judge_band")
+    @classmethod
+    def _ordered(cls, value: tuple[float, float]) -> tuple[float, float]:
+        return _ordered_band(value)
 
 
 class SqlGuardConfig(ControlConfig):
@@ -409,6 +419,26 @@ class SqlGuardConfig(ControlConfig):
 class SignaturesConfig(ControlConfig):
     feed: str | None = Field(default=None, min_length=1)  # URL or file path
     refresh_s: Duration = 30.0
+
+
+# A destination host glob for ``egress.allow_hosts``: lower case, ``*`` the only wildcard
+# (it crosses dots, as in permissions), e.g. ``*.example.com`` or ``api.stripe.com``.
+type HostPattern = Annotated[
+    str, StringConstraints(pattern=r"^[a-z0-9*][a-z0-9.*-]*$", max_length=253)
+]
+type Port = Annotated[int, Field(gt=0, le=65_535)]
+
+
+class EgressConfig(ControlConfig):
+    """``egress`` on MCP servers with ``adapter: http``: which destinations a call may reach.
+
+    ``allow_hosts`` absent means no host restriction beyond ``authz``; non-public addresses
+    (literal or resolved) are refused either way.
+    """
+
+    allowed_ports: tuple[Port, ...] = Field(default=(80, 443), min_length=1)
+    allow_hosts: tuple[HostPattern, ...] | None = None
+    resolve_timeout_s: Annotated[float, Field(gt=0.0, le=30.0)] = 2.0
 
 
 class LoopDetectConfig(ControlConfig):
@@ -439,7 +469,8 @@ class Judges(FrozenModel):
     model needs no grant and no ``pricing`` entry, and judge tokens are never charged to an
     agent's budget. Without this section the judge-backed controls are off (``intent_judge``
     and ``output_policy`` allow with ``judge_not_configured``), and configuring any of them
-    explicitly (or ``prompt_injection.judge_band``) is a validation error. With it, a judge
+    explicitly (or ``prompt_injection``'s or ``tool_poisoning``'s ``judge_band``) is a
+    validation error. With it, a judge
     that cannot answer in time fails its control closed.
     """
 
@@ -460,7 +491,7 @@ class Controls(FrozenModel):
     pii: PiiConfig | None = None
     secrets: ControlConfig | None = None
     sql_guard: SqlGuardConfig | None = None
-    egress: ControlConfig | None = None
+    egress: EgressConfig | None = None
     signatures: SignaturesConfig | None = None
     tool_pinning: ControlConfig | None = None
     budget: ControlConfig | None = None
@@ -482,6 +513,7 @@ _CONFIG_TYPES: Mapping[str, type[ControlConfig]] = MappingProxyType(
         "model_allowlist": ModelAllowlistConfig,
         "pii": PiiConfig,
         "sql_guard": SqlGuardConfig,
+        "egress": EgressConfig,
         "signatures": SignaturesConfig,
         "loop_detect": LoopDetectConfig,
         "prompt_injection": PromptInjectionConfig,
@@ -563,6 +595,9 @@ class Policy(FrozenModel):
         injection = controls.prompt_injection
         if injection is not None and "judge_band" in injection.model_fields_set:
             configured.append("prompt_injection.judge_band")
+        poisoning = controls.tool_poisoning
+        if poisoning is not None and "judge_band" in poisoning.model_fields_set:
+            configured.append("tool_poisoning.judge_band")
         if configured:
             msg = f"{configured} need an LLM judge: add a `judges:` section (judges.model)"
             raise ValueError(msg)

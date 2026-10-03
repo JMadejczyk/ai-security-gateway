@@ -29,6 +29,8 @@ from gateway.proxies.mcp.pins import (
 )
 
 NOW = datetime(2026, 10, 4, 10, 0, tzinfo=UTC)
+ALLOWED = pytest.mark.control("tool_pinning", "allow")
+DENIED = pytest.mark.control("tool_pinning", "deny")
 QUERY = {
     "name": "query",
     "description": "Run one read-only SQL SELECT.",
@@ -209,6 +211,7 @@ def pinning(tmp_path: Path) -> ToolPinningControl:
     return ToolPinningControl(PinStore(tmp_path), InMemoryToolQuarantine())
 
 
+@DENIED
 def test_a_second_entry_cannot_stand_in_for_a_changed_one(pinning, snapshot):
     config = snapshot.policy.upstreams.mcp["sales_db"]
     listing = pinning.verify("sales_db", config, [tool(description="evil"), tool()])
@@ -216,6 +219,8 @@ def test_a_second_entry_cannot_stand_in_for_a_changed_one(pinning, snapshot):
     assert listing.definitions == ()
 
 
+@ALLOWED
+@DENIED
 def test_unknown_names_are_not_pinned(pinning, snapshot):
     config = snapshot.policy.upstreams.mcp["sales_db"]
     listing = pinning.verify("sales_db", config, [tool()])
@@ -223,6 +228,7 @@ def test_unknown_names_are_not_pinned(pinning, snapshot):
     assert listing.status("drop_everything") is PinStatus.NOT_PINNED
 
 
+@DENIED
 async def test_a_call_without_a_verified_listing_is_blocked(pinning, make_ctx):
     call = Interaction(
         session_id="s-test",
@@ -247,6 +253,8 @@ async def test_a_call_without_a_verified_listing_is_blocked(pinning, make_ctx):
     assert verdict.reason_code == "tool_pin_unverified"
 
 
+@DENIED
+@ALLOWED
 async def test_a_drift_seen_by_one_gateway_blocks_the_tool_on_another(tmp_path, snapshot):
     (tmp_path / "sales_db.json").write_text(pin(tool()).to_json())
     client = fakeredis.FakeAsyncRedis()
@@ -266,6 +274,7 @@ async def test_a_drift_seen_by_one_gateway_blocks_the_tool_on_another(tmp_path, 
     await client.aclose()
 
 
+@DENIED
 async def test_a_drift_right_after_a_re_approval_is_not_lost(tmp_path, snapshot):
     """Codex P1 (regression): a quarantine for baseline A exists, the operator installs B,
     the next listing advertises a malicious C. C's drift against B must be recorded (not

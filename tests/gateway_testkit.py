@@ -17,6 +17,7 @@ from typing import Any
 
 import httpx
 import jwt
+from egress_kit import FakeResolver
 from injection_kit import MarkerClassifier
 from judge_kit import FakeJudgeClient
 
@@ -149,6 +150,7 @@ class Harness:
     clock: MutableClock
     audit: io.StringIO
     policy_path: Path
+    resolver: FakeResolver  # egress DNS: every host public unless a test says otherwise
 
     async def token(self, sub: str, **request: Any) -> str:
         response = await self.operator.post("/auth/demo-token", json={"sub": sub, **request})
@@ -160,6 +162,14 @@ class Harness:
         return await self.token(sub, kind="operator")
 
     def audit_entries(self) -> list[dict[str, Any]]:
+        """Decision entries only; policy reload events are in `audit_events`."""
+        return [line for line in self._audit_lines() if "event" not in line]
+
+    def audit_events(self) -> list[dict[str, Any]]:
+        """Non-decision lines of the audit stream (``{"event": "policy_reload", ...}``)."""
+        return [line for line in self._audit_lines() if "event" in line]
+
+    def _audit_lines(self) -> list[dict[str, Any]]:
         return [json.loads(line) for line in self.audit.getvalue().splitlines() if line]
 
 
@@ -170,17 +180,20 @@ async def running_gateway(
     transport: httpx.AsyncBaseTransport | None = None,
     classifier: InjectionClassifier | None = None,
     judge_factory: JudgeFactory = FakeJudgeClient,
+    resolver: FakeResolver | None = None,
     **settings: Any,
 ) -> AsyncIterator[Harness]:
     """``transport`` carries every upstream call (LLM and MCP) when given. ``classifier`` is
     the prompt-injection classifier (default: `MarkerClassifier`, never the real model).
     ``judge_factory`` builds the LLM judge (default: the deterministic `FakeJudgeClient`;
-    ``JudgeClient`` for the real one over ``transport``)."""
+    ``JudgeClient`` for the real one over ``transport``). ``resolver`` answers ``egress``
+    DNS lookups (default: a `FakeResolver`; tests never query real DNS)."""
     policy_path = tmp_path / "policy.yaml"
     shutil.copy(ROOT_POLICY, policy_path)
     shutil.copytree(FEEDS, tmp_path / FEEDS.name, dirs_exist_ok=True)
     clock = MutableClock()
     audit = io.StringIO()
+    resolver = resolver if resolver is not None else FakeResolver()
     settings.setdefault("pins_dir", tmp_path / "pins")
     container = GatewayContainer.from_settings(
         make_settings(policy_path, **settings),
@@ -190,6 +203,7 @@ async def running_gateway(
         transport=transport,
         classifier=classifier if classifier is not None else MarkerClassifier(),
         judge_factory=judge_factory,
+        resolver=resolver,
     )
     agent_app, operator_app = create_agent_app(container), create_operator_app(container)
     async with (
@@ -201,4 +215,4 @@ async def running_gateway(
             transport=httpx.ASGITransport(app=operator_app), base_url="http://operator"
         ) as operator,
     ):
-        yield Harness(container, agent, operator, clock, audit, policy_path)
+        yield Harness(container, agent, operator, clock, audit, policy_path, resolver)

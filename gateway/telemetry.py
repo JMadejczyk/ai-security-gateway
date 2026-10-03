@@ -7,18 +7,22 @@ Audit entries (SPEC "Audit, metrics and Grafana" → "Audit entry") are JSON lin
 (→ Loki) and, when ``ACL_AUDIT_PATH`` is set, in a JSONL export file. They carry reason codes
 and metadata only: payloads, messages, SQL text, tool arguments and upstream errors are never
 written. A keyed HMAC of the payload lets an operator match an entry to a known payload.
+The export file rotates by size; Grafana Alloy tails it into Loki. Policy reloads go to the
+same stream as `PolicyReloadEvent` lines (``"event": "policy_reload"``) for dashboard
+annotations.
 """
 
 import hashlib
 import hmac
 import json
 import logging
+import logging.handlers
 import sys
 from collections.abc import Iterable
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Final, TextIO
+from typing import Final, Literal, TextIO
 
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 from pydantic import AwareDatetime, Field, field_serializer
@@ -42,6 +46,8 @@ POLICY_RELOADS = Counter(
     ["result"],
     registry=REGISTRY,
 )
+for _result in ReloadResult:  # every result at 0 (see `initialize_series`)
+    POLICY_RELOADS.labels(result=_result.value)
 POLICY_INFO = Gauge(
     "acl_policy_info",
     "Set to 1 for the active policy revision.",
@@ -130,6 +136,34 @@ SIGNATURE_HITS = Counter(
     ["signature"],
     registry=REGISTRY,
 )
+
+
+SERVED_CHANNELS: Final = (Channel.LLM, Channel.MCP)
+
+
+def initialize_series(*, agents: Iterable[str], controls: Iterable[str]) -> None:
+    """Create every bounded label set of the decision counters at 0.
+
+    Prometheus cannot see the increment that creates a series, so ``increase()`` over a
+    dashboard's time range would miss each label set's first call (the one block of a short
+    demo). Run at startup and after every policy reload (new agents); idempotent.
+    """
+    agent_labels = (*agents, OTHER_LABEL)
+    for channel in SERVED_CHANNELS:
+        for decision in Decision:
+            for agent in agent_labels:
+                REQUESTS.labels(channel=channel.value, decision=decision.value, agent=agent)
+    for control in controls:
+        for decision in Decision:
+            CONTROL_VERDICTS.labels(control=control, decision=decision.value)
+    for agent in agent_labels:
+        THROTTLED.labels(agent=agent)
+
+
+def initialize_signature_series(signature_ids: Iterable[str]) -> None:
+    """`acl_signature_hits_total` at 0 for every signature of a loaded feed (see above)."""
+    for signature_id in signature_ids:
+        SIGNATURE_HITS.labels(signature=signature_id)
 
 
 def record_policy_reload(result: ReloadResult) -> None:
@@ -306,22 +340,61 @@ class AuditEntry(FrozenModel):
         return ts.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-class AuditLogger:
-    """Writes each entry as one JSON line to stdout and, optionally, a JSONL export file."""
+class PolicyReloadEvent(FrozenModel):
+    """One policy reload attempt, written to the audit stream next to the decisions.
 
-    def __init__(self, *, stream: TextIO | None = None, path: Path | None = None) -> None:
+    Grafana draws these as annotations (Loki ``{job="acl", event="policy_reload"}``), so a
+    dashboard shows when a new revision took effect. The loader's error text stays in the
+    gateway log: the audit stream carries no free text.
+    """
+
+    ts: AwareDatetime
+    event: Literal["policy_reload"] = "policy_reload"
+    result: ReloadResult
+    revision: str  # in effect after the attempt
+    previous_revision: str
+
+    @field_serializer("ts")
+    def _utc_z(self, ts: datetime) -> str:
+        return ts.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+AUDIT_MAX_BYTES: Final = 50 * 1024 * 1024
+AUDIT_BACKUPS: Final = 4
+
+
+class AuditLogger:
+    """Writes each entry as one JSON line to stdout and, optionally, a JSONL export file.
+
+    The export file rotates by size (``audit.jsonl`` -> ``audit.jsonl.1`` ... ``.<backups>``,
+    the oldest dropped), so the operator volume holds at most ``max_bytes * (backups + 1)``.
+    The log shipper tails ``audit.jsonl`` by name and follows the rename.
+    """
+
+    def __init__(
+        self,
+        *,
+        stream: TextIO | None = None,
+        path: Path | None = None,
+        max_bytes: int = AUDIT_MAX_BYTES,
+        backups: int = AUDIT_BACKUPS,
+    ) -> None:
         # A private logger, not registered globally: handlers never leak between instances.
         self._logger = logging.Logger("gateway.audit", logging.INFO)
         formatter = logging.Formatter("%(message)s")
         sinks: list[logging.Handler] = [logging.StreamHandler(stream or sys.stdout)]
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
-            sinks.append(logging.FileHandler(path, encoding="utf-8"))
+            sinks.append(
+                logging.handlers.RotatingFileHandler(
+                    path, maxBytes=max_bytes, backupCount=backups, encoding="utf-8"
+                )
+            )
         for sink in sinks:
             sink.setFormatter(formatter)
             self._logger.addHandler(sink)
 
-    def write(self, entry: AuditEntry) -> None:
+    def write(self, entry: AuditEntry | PolicyReloadEvent) -> None:
         self._logger.info(entry.model_dump_json())
 
     def close(self) -> None:

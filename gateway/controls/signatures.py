@@ -5,9 +5,14 @@ Runs pre and post on every channel. What each pattern type is matched against
 
 - ``regex``: the free text of the payload (pre) or result (post), as `TextExtractor` yields it
   (messages and tool-call arguments for the LLM, arguments and tool results for MCP);
-- ``mcp_tool``: tool names and descriptions: the tool a ``tools/call`` names and the tools an
-  LLM request declares (pre), and every tool an MCP server advertises (`screen_listing`, which
-  the MCP proxy calls on ``tools/list``: ``tools/list`` does not run through the pipeline).
+- ``mcp_tool``: tool names and descriptions: the tools an LLM request declares (pre), every
+  tool an MCP server advertises (`screen_listing`, which the MCP proxy calls on
+  ``tools/list``: ``tools/list`` does not run through the pipeline), and, at ``tools/call``,
+  the called tool's name plus its definition from the caller's own verified listing
+  (``tool_pinning``'s `current_listing`, as ``tool_poisoning`` does). A tool hidden from the
+  listing for its description is therefore still refused when called by name. A call without
+  a published listing fails closed (``tool_definition_unavailable``); a name that listing does
+  not carry is checked by name only, and ``tool_pinning`` and the adapter refuse it.
   A listing is screened off the event loop under one deadline; a tool that could not be
   scanned in time, one past `MAX_LISTED_TOOLS`, or one whose name appears twice (a second,
   benign entry must not stand in for a poisoned one) is hidden like a matching one;
@@ -29,6 +34,7 @@ from typing import Any, ClassVar, Final, cast, override
 
 from gateway.controls.scope import current_scope
 from gateway.controls.text import TextExtractor, string_leaves
+from gateway.controls.tool_pinning import current_listing
 from gateway.core.catalog import control_spec
 from gateway.core.envelope import Interaction, Verdict
 from gateway.core.interfaces import Control, ControlConfig
@@ -49,6 +55,7 @@ SIGNATURE_MATCH: Final = "signature_match"
 SCAN_TIMEOUT: Final = "signature_scan_timeout"
 NO_MATCH: Final = "no_signature_match"
 DUPLICATE_TOOL: Final = "duplicate_tool_name"
+DEFINITION_UNAVAILABLE: Final = "tool_definition_unavailable"
 LISTING_TOO_LARGE: Final = "tool_listing_too_large"
 MAX_REASON_IDS: Final = 10
 MAX_LISTED_TOOLS: Final = 256  # tools screened per listing; any beyond are hidden
@@ -66,20 +73,29 @@ def _items(value: object) -> list[Any]:
 
 
 def declared_tools(interaction: Interaction) -> Iterator[str]:
-    """Tool names and descriptions a request names: the MCP tool it calls, or the function
-    tools an LLM request declares to the model."""
+    """Names and descriptions of the function tools an LLM request declares to the model."""
     payload = _mapping(interaction.payload)
-    if interaction.channel is Channel.MCP:
-        name = payload.get("name")
-        if isinstance(name, str):
-            yield name
-        return
     for tool in _items(payload.get("tools")):
         function = _mapping(_mapping(tool).get("function"))
         for field in ("name", "description"):
             text = function.get(field)
             if isinstance(text, str):
                 yield text
+
+
+def called_tool(interaction: Interaction) -> tuple[list[str], bool]:
+    """Name and description(s) of the MCP tool a ``tools/call`` names, from the caller's
+    verified listing; the flag is False when no listing was published for the call."""
+    name = _mapping(interaction.payload).get("name")
+    texts = [name] if isinstance(name, str) else []
+    listing = current_listing()
+    if listing is None:
+        return texts, False
+    for tool in listing.definitions:  # every entry of that name: duplicates included
+        description = (tool.model_extra or {}).get("description")
+        if tool.name == name and isinstance(description, str):
+            texts.append(description)
+    return texts, True
 
 
 def path_arguments(payload: object) -> Iterator[str]:
@@ -133,11 +149,23 @@ class SignaturesControl(Control):
         scan = feed.scan(interaction.channel)
         segments = self._extractor.segments(interaction, stage)
         scan.check(PatternType.REGEX, (segment.text for segment in segments))
-        if stage is Stage.PRE:
+        listed = True
+        if stage is Stage.PRE and interaction.channel is Channel.MCP:
+            tool_texts, listed = called_tool(interaction)
+            scan.check(PatternType.MCP_TOOL, tool_texts)
+            scan.check(PatternType.PATH_GLOB, path_arguments(interaction.payload))
+        elif stage is Stage.PRE:
             scan.check(PatternType.MCP_TOOL, declared_tools(interaction))
-            if interaction.channel is Channel.MCP:
-                scan.check(PatternType.PATH_GLOB, path_arguments(interaction.payload))
-        return self._verdict(scan.result(), cfg)
+        result = scan.result()
+        if not listed and not result.matched:
+            return Verdict(
+                decision=Decision.BLOCK,
+                control_id=self.id,
+                reason_code=DEFINITION_UNAVAILABLE,
+                reason="no verified listing for this call",
+                enforced=cfg.mode is not ControlMode.LOG_ONLY,
+            )
+        return self._verdict(result, cfg)
 
     async def screen_listing(self, tools: AdvertisedTools, snapshot: PolicySnapshot) -> set[str]:
         """Names of advertised MCP tools to hide from ``tools/list`` (see the module docstring).

@@ -8,6 +8,10 @@ from gateway_testkit import bearer, chat, claims, completion, echo_completion, s
 
 from gateway.telemetry import REGISTRY
 
+AUTHZ_ALLOW = pytest.mark.control("authz", "allow")
+AUTHZ_DENY = pytest.mark.control("authz", "deny")
+AUTHN_DENY = pytest.mark.control("authn", "deny")
+
 CHAT = "/v1/chat/completions"
 TOOL_CALLS = [
     {
@@ -40,6 +44,7 @@ def upstream_ok(llm_upstream):
     return llm_upstream.post("/chat/completions").mock(side_effect=echo_completion)
 
 
+@AUTHZ_ALLOW
 async def test_anna_can_generate(gateway, upstream_ok):
     token = await gateway.token("anna@demo")
     response = await gateway.agent.post(CHAT, json=chat(), headers=bearer(token))
@@ -48,6 +53,7 @@ async def test_anna_can_generate(gateway, upstream_ok):
     assert upstream_ok.call_count == 1
 
 
+@AUTHZ_DENY
 async def test_bartek_denied_a_model_outside_his_role(gateway, upstream_ok):
     token = await gateway.token("bartek@demo")
     response = await gateway.agent.post(CHAT, json=chat("llama3:70b"), headers=bearer(token))
@@ -57,6 +63,8 @@ async def test_bartek_denied_a_model_outside_his_role(gateway, upstream_ok):
     assert not upstream_ok.called
 
 
+@AUTHZ_ALLOW
+@AUTHZ_DENY
 async def test_same_request_different_user_different_result(gateway, upstream_ok):
     anna, bartek = await gateway.token("anna@demo"), await gateway.token("bartek@demo")
     body = chat("llama3:70b")
@@ -64,6 +72,7 @@ async def test_same_request_different_user_different_result(gateway, upstream_ok
     assert (await gateway.agent.post(CHAT, json=body, headers=bearer(bartek))).status_code == 403
 
 
+@AUTHN_DENY
 async def test_no_token_is_401(gateway, upstream_ok):
     response = await gateway.agent.post(CHAT, json=chat())
     assert response.status_code == 401
@@ -72,6 +81,7 @@ async def test_no_token_is_401(gateway, upstream_ok):
     assert not upstream_ok.called
 
 
+@AUTHN_DENY
 async def test_garbage_token_is_401(gateway, upstream_ok):
     response = await gateway.agent.post(CHAT, json=chat(), headers=bearer("not.a.jwt"))
     assert (response.status_code, response.json()["error"]["code"]) == (401, "token_invalid")
@@ -255,6 +265,7 @@ async def test_models_are_filtered_per_user(gateway, llm_upstream):
     assert unauthenticated.status_code == 401
 
 
+@AUTHN_DENY
 async def test_deleted_session_cannot_be_reused(gateway, upstream_ok):
     token = await gateway.token("anna@demo")
     assert (await gateway.agent.post(CHAT, json=chat(), headers=bearer(token))).status_code == 200
@@ -276,6 +287,7 @@ async def test_deleted_session_cannot_be_reused(gateway, upstream_ok):
     assert upstream_ok.call_count == 1
 
 
+@AUTHN_DENY
 async def test_session_reuse_by_another_principal_is_refused(gateway, upstream_ok):
     anna = sign(claims(gateway.clock, session_id="s-shared"))
     bartek = sign(claims(gateway.clock, sub="bartek@demo", roles=["intern"], session_id="s-shared"))
@@ -287,6 +299,7 @@ async def test_session_reuse_by_another_principal_is_refused(gateway, upstream_o
     )
 
 
+@AUTHZ_DENY
 async def test_audit_entry_has_revision_and_no_content(gateway, upstream_ok):
     sensitive_prompt = "Customer PESEL 44051401359 and the merger plan"
     token = await gateway.token("bartek@demo")
@@ -328,6 +341,7 @@ async def test_audit_entry_has_revision_and_no_content(gateway, upstream_ok):
         assert leaked not in raw
 
 
+@AUTHN_DENY
 async def test_unauthenticated_call_is_audited_without_identity(gateway, upstream_ok):
     await gateway.agent.post(CHAT, json=chat())
     (entry,) = gateway.audit_entries()

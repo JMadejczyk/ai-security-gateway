@@ -27,6 +27,12 @@ from gateway.judges.intent import flag_for
 from gateway.sessions import MAX_FLAGGED_TOOL_CALLS, SessionUpdate
 from gateway.telemetry import REGISTRY, ReloadResult
 
+INTENT_ALLOW = pytest.mark.control("intent_judge", "allow")
+INTENT_HOLD = pytest.mark.control("intent_judge", "require_approval")
+INTENT_LOG = pytest.mark.control("intent_judge", "log_only")
+OUTPUT_DENY = pytest.mark.control("output_policy", "deny")
+OUTPUT_REDACT = pytest.mark.control("output_policy", "redact")
+
 CHAT = "/v1/chat/completions"
 JUDGE_MODEL = "judge-model"
 ANNA = "anna@demo"
@@ -146,6 +152,7 @@ async def test_goal_is_the_first_user_message_and_never_changes(stack: MCPStack,
     assert "export payments" not in stack.gateway.audit.getvalue()
 
 
+@INTENT_HOLD
 async def test_misaligned_tool_call_is_released_and_its_mcp_call_needs_approval(
     stack: MCPStack, llm: ScriptedLLM
 ):
@@ -181,6 +188,7 @@ async def test_misaligned_tool_call_is_released_and_its_mcp_call_needs_approval(
     assert len(stack.log.of("query")) == 1
 
 
+@INTENT_ALLOW
 async def test_aligned_tool_call_flags_nothing(stack: MCPStack, llm: ScriptedLLM):
     llm.agent_answer = completion(None, tool_calls=[tool_call("query", {"sql": COUNT_CUSTOMERS})])
     (db,) = await connect_all(stack, ANNA, "sales_db")
@@ -192,6 +200,7 @@ async def test_aligned_tool_call_flags_nothing(stack: MCPStack, llm: ScriptedLLM
     assert (await db.call("query", sql=COUNT_CUSTOMERS))["isError"] is False
 
 
+@INTENT_LOG
 async def test_log_only_intent_judge_records_but_flags_nothing(stack: MCPStack, llm: ScriptedLLM):
     enable_judges(stack.gateway, intent_judge={"mode": "log_only"})
     llm.aligned = lambda _call: False
@@ -204,6 +213,8 @@ async def test_log_only_intent_judge_records_but_flags_nothing(stack: MCPStack, 
     assert (await db.call("query", sql=DUMP_PAYMENTS))["isError"] is False
 
 
+@INTENT_HOLD
+@OUTPUT_DENY
 async def test_unavailable_judge_flags_the_call(stack: MCPStack, llm: ScriptedLLM):
     def broken(_call: dict[str, Any]) -> bool:
         raise AssertionError  # never reached: the judge answer below is malformed
@@ -229,6 +240,7 @@ async def test_unavailable_judge_flags_the_call(stack: MCPStack, llm: ScriptedLL
     assert error_text(await db.call("query", sql=DUMP_PAYMENTS)).startswith("approval_required")
 
 
+@OUTPUT_REDACT
 @pytest.mark.parametrize("stream", [False, True])
 async def test_output_policy_redacts_out_of_scope_quotes(
     stack: MCPStack, llm: ScriptedLLM, stream: bool
@@ -256,6 +268,7 @@ async def test_output_policy_redacts_out_of_scope_quotes(
     assert "4111" not in stack.gateway.audit.getvalue()
 
 
+@OUTPUT_DENY
 async def test_output_policy_block_mode_blocks(stack: MCPStack, llm: ScriptedLLM):
     enable_judges(stack.gateway, output_policy={"mode": "block"})
     llm.agent_answer = completion("Olga paid with card 4111-1111.")
@@ -304,6 +317,7 @@ async def test_judge_calls_are_not_audited_or_charged(stack: MCPStack, llm: Scri
     assert "authorization" not in json.dumps(llm.judge_requests[0]).lower()
 
 
+@INTENT_HOLD
 async def test_flag_overflow_holds_every_mcp_call(stack: MCPStack, llm: ScriptedLLM):
     """Codex P2: evicted flags were pending approvals; past the cap, every MCP call waits."""
     (db,) = await connect_all(stack, ANNA, "sales_db")

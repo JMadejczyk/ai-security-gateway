@@ -44,8 +44,10 @@ RUN groupadd --system --gid 10001 acl \
 COPY --from=trim /opt/venv /opt/venv
 WORKDIR /app
 COPY gateway ./gateway
+# An empty named volume copies its owner: /app/models (classifier, read-only at runtime) and
+# /var/log/acl (the audit JSONL export, ACL_AUDIT_PATH; Grafana Alloy tails it read-only).
 RUN python -m compileall -q gateway \
-    && install -d -o acl -g acl -m 0755 /app/models  # an empty named volume copies its owner
+    && install -d -o acl -g acl -m 0755 /app/models /var/log/acl
 USER acl
 EXPOSE 8080 9090
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \

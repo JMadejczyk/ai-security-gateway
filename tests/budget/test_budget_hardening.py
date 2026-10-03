@@ -32,6 +32,9 @@ from gateway.budget.store import BudgetStore, InMemoryBudgetStore
 from gateway.core.types import Channel
 from gateway.telemetry import ReloadResult
 
+ALLOW = pytest.mark.control("budget", "allow")
+DENY = pytest.mark.control("budget", "deny")
+
 CHAT = "/v1/chat/completions"
 GPU_PRICED = {"qwen3:8b": {"gpu_second": 1.0}}  # $1 per GPU second
 TOKEN_PRICED = {"qwen3:8b": {"prompt_per_1k": 1.0, "completion_per_1k": 1.0}}
@@ -81,6 +84,8 @@ def code(response: httpx.Response) -> tuple[int, str]:
 # ------------------------------------------------------------ 1. GPU allowance (P1)
 
 
+@ALLOW
+@DENY
 @pytest.mark.parametrize(
     ("budgets", "pricing", "meter", "limit"),
     [
@@ -107,6 +112,7 @@ async def test_concurrent_sessions_cannot_overspend_gpu_time(
         assert spent >= limit * 0.25  # the admitted call's 0.3 s were charged, the rest refunded
 
 
+@DENY
 async def test_the_gpu_allowance_bounds_the_upstream_call(tmp_path, monkeypatch):
     llm = ScriptedLLM(delay_s=2.0)
     async with gateway_with(
@@ -135,6 +141,7 @@ async def test_multiple_completions_are_refused(tmp_path, monkeypatch, extra):
         assert llm.calls == 0
 
 
+@ALLOW
 async def test_n_of_one_is_fine_and_both_caps_carry_the_held_value(tmp_path, monkeypatch):
     llm = ScriptedLLM()
     async with gateway_with(
@@ -174,6 +181,7 @@ async def test_an_answer_without_usage_keeps_the_estimated_token_cost(tmp_path, 
 # ------------------------------------------------------- 4. failed settlement (P1)
 
 
+@DENY
 async def test_a_failed_token_settlement_blocks_then_lands(tmp_path, monkeypatch):
     llm = ScriptedLLM(usage={"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25})
     flaky = FlakyStore(InMemoryBudgetStore())
@@ -191,6 +199,7 @@ async def test_a_failed_token_settlement_blocks_then_lands(tmp_path, monkeypatch
         assert llm.calls == 1
 
 
+@DENY
 async def test_a_long_call_whose_settlement_failed_cannot_be_followed(tmp_path, monkeypatch):
     """The codex reproduction: a 2 s call under a 1 s GPU budget, then a settlement error."""
     llm = ScriptedLLM(delay_s=2.0)

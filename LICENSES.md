@@ -11,8 +11,12 @@ Third-party terms for what the gateway ships and what `docker compose` runs. Ver
 | `ollama/ollama` | 0.35.1 | MIT | Runtime only. Model weights are licensed separately: `qwen3:8b` is Apache-2.0. |
 | `python` (base of our images) | 3.12.15-slim | PSF-2.0 plus Debian package licenses | |
 | `ghcr.io/astral-sh/uv` (build stage only) | see `Dockerfile` | MIT OR Apache-2.0 | Not in the runtime image. |
+| `grafana/grafana:12.4.12` | 12.4.12 (OSS) | AGPL-3.0-only | The OSS build, not Enterprise. Image based on Alpine (package licenses vary). |
+| `grafana/loki:3.7.8` | 3.7.8 | AGPL-3.0-only | Loki's server code is AGPLv3; some client libraries in its repository are Apache-2.0. |
+| `grafana/alloy:v1.20.1` | 1.20.1 | Apache-2.0 | Replaces Promtail (EOL) as the log shipper. Runs with `--disable-reporting`. |
+| `prom/prometheus:v3.15.0` | 3.15.0 | Apache-2.0 | Busybox-based image (GPL-2.0 busybox binary, unmodified). |
 
-Grafana and Loki (stage 14–18) are AGPLv3. Running them unmodified as separate services carries no obligation for this code; modifying and offering them over a network would.
+**Grafana and Loki are AGPLv3.** We run the upstream images unmodified as separate services and talk to them only over their network APIs (provisioning files, HTTP queries, Loki push), so the AGPL places no obligation on this repository's code. Obligations would arise only if we modified Grafana or Loki and offered the modified version to users over a network; then the modified source would have to be offered to them. The dashboards and provisioning files in `grafana/` are our own content, loaded as data. Phone-home features are off: Grafana analytics, update checks, news feed and plugin preinstall (`GF_*` in `docker-compose.yml`), Loki `analytics.reporting_enabled: false`, Alloy `--disable-reporting`.
 
 ## Python runtime dependencies (gateway image)
 

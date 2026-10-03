@@ -26,6 +26,9 @@ from gateway.identity import (
     mint_principal_assertion,
 )
 
+ALLOW = pytest.mark.control("authn", "allow")
+DENY = pytest.mark.control("authn", "deny")
+
 
 @pytest.fixture
 def clock() -> MutableClock:
@@ -53,6 +56,7 @@ def refusal(verifier, snapshot, token: str | None) -> TokenError:
     return caught.value
 
 
+@ALLOW
 def test_valid_token(verifier, snapshot, clock):
     verified = verifier.verify(sign(claims(clock, scope=["generate:model:*"])), snapshot)
     assert (verified.sub, verified.agent, verified.mode) == (
@@ -65,16 +69,19 @@ def test_valid_token(verifier, snapshot, clock):
     assert verified.principal_context().task_scope == verified.scope
 
 
+@DENY
 def test_missing_token_is_401(verifier, snapshot):
     error = refusal(verifier, snapshot, None)
     assert (error.reason, error.status_code) == (TokenReason.MISSING, 401)
 
 
+@DENY
 def test_forged_signature(verifier, snapshot, clock):
     forged = sign(claims(clock), key="another-secret-of-the-same-length-0123456789")
     assert refusal(verifier, snapshot, forged).reason is TokenReason.INVALID
 
 
+@DENY
 @pytest.mark.parametrize(
     ("header", "signature"),
     [
@@ -90,17 +97,20 @@ def test_algorithm_is_pinned(verifier, snapshot, clock, header, signature):
     assert (error.reason, error.status_code) == (TokenReason.ALG_NOT_ALLOWED, 401)
 
 
+@DENY
 def test_hs512_with_the_right_key_is_still_refused(verifier, snapshot, clock):
     token = sign(claims(clock), algorithm="HS512")
     assert refusal(verifier, snapshot, token).reason is TokenReason.ALG_NOT_ALLOWED
 
 
+@DENY
 def test_expired(verifier, snapshot, clock):
     now = int(clock().timestamp())
     token = sign(claims(clock, iat=now - 600, exp=now - 1))
     assert refusal(verifier, snapshot, token).reason is TokenReason.EXPIRED
 
 
+@DENY
 def test_expires_with_the_clock(verifier, snapshot, clock):
     token = sign(claims(clock))
     verifier.verify(token, snapshot)
@@ -108,6 +118,8 @@ def test_expires_with_the_clock(verifier, snapshot, clock):
     assert refusal(verifier, snapshot, token).reason is TokenReason.EXPIRED
 
 
+@ALLOW
+@DENY
 def test_a_token_names_a_session_only_while_it_could_be_alive(verifier, snapshot, clock):
     """``sid_iat`` (when the id was minted) bounds every later token naming the id: past
     ``sessions.max_lifetime_s`` it is refused, so no token outlives a retired id's tombstone."""
@@ -121,6 +133,7 @@ def test_a_token_names_a_session_only_while_it_could_be_alive(verifier, snapshot
     assert refusal(verifier, snapshot, late).reason is TokenReason.SESSION_TOO_OLD
 
 
+@DENY
 @pytest.mark.parametrize(
     "override",
     [{"sid_iat": None}, {"sid_iat": "x"}],
@@ -132,18 +145,21 @@ def test_sid_iat_is_required(verifier, snapshot, clock, override):
     )
 
 
+@DENY
 def test_sid_iat_after_iat_is_refused(verifier, snapshot, clock):
     now = int(clock().timestamp())
     token = sign(claims(clock, sid_iat=now + 1))
     assert refusal(verifier, snapshot, token).reason is TokenReason.INVALID
 
 
+@DENY
 def test_issued_in_the_future(verifier, snapshot, clock):
     now = int(clock().timestamp())
     token = sign(claims(clock, iat=now + 60, exp=now + 600))
     assert refusal(verifier, snapshot, token).reason is TokenReason.INVALID
 
 
+@DENY
 @pytest.mark.parametrize(
     ("override", "reason"),
     [
@@ -162,6 +178,7 @@ def test_claim_checks(verifier, snapshot, clock, override, reason):
     assert refusal(verifier, snapshot, sign(claims(clock, **override))).reason is reason
 
 
+@DENY
 def test_lifetime_over_one_hour(verifier, snapshot, clock):
     now = int(clock().timestamp())
     token = sign(claims(clock, iat=now, exp=now + 3601))
@@ -169,6 +186,7 @@ def test_lifetime_over_one_hour(verifier, snapshot, clock):
     assert (error.reason, error.status_code) == (TokenReason.LIFETIME_EXCEEDED, 401)
 
 
+@DENY
 @pytest.mark.parametrize(
     ("override", "reason"),
     [
@@ -199,6 +217,7 @@ def test_delegation_checks(verifier, snapshot, clock, override, reason):
     assert (error.reason, error.status_code) == (reason, 403)
 
 
+@ALLOW
 def test_autonomous_service_principal_is_accepted(verifier, snapshot, clock):
     token = sign(
         claims(
@@ -208,6 +227,8 @@ def test_autonomous_service_principal_is_accepted(verifier, snapshot, clock):
     assert verifier.verify(token, snapshot).mode is SessionMode.AUTONOMOUS
 
 
+@ALLOW
+@DENY
 def test_agent_principals_list_is_enforced(verifier, snapshot_from, policy_doc, clock):
     policy_doc["agents"]["databot"]["principals"] = ["bartek@demo"]
     restricted = snapshot_from(policy_doc)

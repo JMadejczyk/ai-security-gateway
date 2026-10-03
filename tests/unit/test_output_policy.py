@@ -26,6 +26,9 @@ from gateway.redaction import apply_redactions
 REDACT = ControlConfig(mode=ControlMode.REDACT, risk_delta=0.2)
 BLOCK = ControlConfig(mode=ControlMode.BLOCK, risk_delta=0.2)
 CONTENT = "/choices/0/message/content"
+ALLOWED = pytest.mark.control("output_policy", "allow")
+DENIED = pytest.mark.control("output_policy", "deny")
+REDACTED = pytest.mark.control("output_policy", "redact")
 
 
 class FakeJudge(JudgeClient):
@@ -76,6 +79,7 @@ async def run(judge, item, cfg=REDACT, *, snapshot=None, who=None):
         return await control.evaluate(item, Stage.POST, cfg)
 
 
+@ALLOWED
 async def test_not_configured_is_off(make_ctx, snapshot):
     judge = FakeJudge(["40"], configured=False)
     verdict = await run(judge, interaction(make_ctx, completion()), snapshot=snapshot)
@@ -83,6 +87,7 @@ async def test_not_configured_is_off(make_ctx, snapshot):
     assert judge.calls == []
 
 
+@ALLOWED
 async def test_empty_answer_needs_no_judge(make_ctx, snapshot):
     judge = FakeJudge()
     verdict = await run(judge, interaction(make_ctx, completion(None)), snapshot=snapshot)
@@ -93,18 +98,30 @@ async def test_empty_answer_needs_no_judge(make_ctx, snapshot):
 @pytest.mark.parametrize(
     ("quotes", "cfg", "decision", "reason", "risk"),
     [
-        ([], REDACT, Decision.ALLOW, "answer_in_scope", 0.0),
-        ([], BLOCK, Decision.ALLOW, "answer_in_scope", 0.0),
-        (["card 4111 ending"], REDACT, Decision.REDACT, "out_of_scope_data", 0.2),
-        (["card 4111 ending"], BLOCK, Decision.BLOCK, "out_of_scope_data", 0.2),
-        (
+        pytest.param([], REDACT, Decision.ALLOW, "answer_in_scope", 0.0, marks=ALLOWED),
+        pytest.param([], BLOCK, Decision.ALLOW, "answer_in_scope", 0.0, marks=ALLOWED),
+        pytest.param(
+            ["card 4111 ending"], REDACT, Decision.REDACT, "out_of_scope_data", 0.2, marks=REDACTED
+        ),
+        pytest.param(
+            ["card 4111 ending"], BLOCK, Decision.BLOCK, "out_of_scope_data", 0.2, marks=DENIED
+        ),
+        pytest.param(
             ["a sentence the answer never had"],
             REDACT,
             Decision.ALLOW,
             "judge_quotes_unmatched",
             0.0,
+            marks=ALLOWED,
         ),
-        (["a sentence the answer never had"], BLOCK, Decision.ALLOW, "judge_quotes_unmatched", 0.0),
+        pytest.param(
+            ["a sentence the answer never had"],
+            BLOCK,
+            Decision.ALLOW,
+            "judge_quotes_unmatched",
+            0.0,
+            marks=ALLOWED,
+        ),
     ],
 )
 async def test_verdicts(make_ctx, snapshot, quotes, cfg, decision, reason, risk):
@@ -119,6 +136,7 @@ async def test_verdicts(make_ctx, snapshot, quotes, cfg, decision, reason, risk)
         assert verdict.redactions == ()
 
 
+@DENIED
 @pytest.mark.parametrize("cfg", [REDACT, BLOCK])
 async def test_unavailable_blocks_in_both_modes(make_ctx, snapshot, cfg):
     item = interaction(make_ctx, completion("anything"))
@@ -127,6 +145,7 @@ async def test_unavailable_blocks_in_both_modes(make_ctx, snapshot, cfg):
     assert verdict.enforced is True
 
 
+@DENIED
 async def test_no_call_scope_blocks(make_ctx):
     judge = FakeJudge()
     verdict = await run(judge, interaction(make_ctx, completion("anything")))
@@ -134,6 +153,7 @@ async def test_no_call_scope_blocks(make_ctx):
     assert judge.calls == []
 
 
+@REDACTED
 async def test_non_ascii_and_every_occurrence(make_ctx, snapshot):
     text = "Zażółć: płaci 9 999 zł. Powtarzam — Zażółć: płaci 9 999 zł."
     item = interaction(make_ctx, completion(text))
@@ -147,6 +167,7 @@ async def test_non_ascii_and_every_occurrence(make_ctx, snapshot):
     )
 
 
+@REDACTED
 async def test_quote_inside_tool_call_arguments(make_ctx, snapshot):
     result = completion(
         "Writing it down.",
@@ -211,6 +232,7 @@ def arguments_answer(arguments: dict[str, Any]) -> dict[str, Any]:
 ARGS = "/choices/0/message/tool_calls/0/function/arguments"
 
 
+@REDACTED
 async def test_numbers_and_metadata_named_keys_in_arguments_are_judged(make_ctx, snapshot):
     """Codex P1: numbers and argument keys like name/id/uri were never shown to the judge."""
     judge = FakeJudge(["4111111111111111", "Olga Kowalska", "pay-889"])
@@ -257,6 +279,7 @@ async def test_protocol_fields_are_excluded_by_location_only(make_ctx, snapshot)
     assert "write_report" in content  # the tool name the model chose is judged too
 
 
+@DENIED
 async def test_hit_in_decoded_base64_blocks_even_in_redact_mode(make_ctx, snapshot):
     blob = base64.b64encode(b"Olga's salary is 31000").decode()
     item = interaction(make_ctx, arguments_answer({"attachment": f"data:text/plain;base64,{blob}"}))
@@ -264,6 +287,7 @@ async def test_hit_in_decoded_base64_blocks_even_in_redact_mode(make_ctx, snapsh
     assert (verdict.decision, verdict.reason_code) == (Decision.BLOCK, "out_of_scope_data")
 
 
+@DENIED
 async def test_unscannable_arguments_block_unjudged(make_ctx, snapshot):
     judge = FakeJudge()
     item = interaction(
@@ -284,6 +308,7 @@ async def test_unscannable_arguments_block_unjudged(make_ctx, snapshot):
     assert judge.calls == []
 
 
+@REDACTED
 async def test_quote_copied_from_escaped_text_maps_back_exactly(make_ctx, snapshot):
     """Codex P2: a quote spanning a literal entity and an escaped delimiter matched neither
     the original nor a globally unescaped variant."""
@@ -299,6 +324,7 @@ async def test_quote_copied_from_escaped_text_maps_back_exactly(make_ctx, snapsh
     assert redacted["choices"][0]["message"]["content"] == "Use [REDACTED:OUT_OF_SCOPE] here."
 
 
+@REDACTED
 async def test_literal_entities_stay_intact(make_ctx, snapshot):
     text = "Row: a &lt; b, see <untrusted_data> x"
     verdict = await run(

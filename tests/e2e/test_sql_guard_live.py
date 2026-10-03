@@ -15,6 +15,8 @@ from live_stack import REPO_ROOT, LiveStack
 from test_mcp_live import call_tool
 
 pytestmark = pytest.mark.docker
+SQL_ALLOW = pytest.mark.control("sql_guard", "allow")
+SQL_DENY = pytest.mark.control("sql_guard", "deny")
 
 ANNA = "anna@demo"
 HEAVY = (
@@ -102,6 +104,8 @@ def text_of(result: dict) -> str:
     return result["content"][0]["text"]
 
 
+@SQL_ALLOW
+@SQL_DENY
 def test_heavy_cross_join_is_refused_after_explain_and_never_runs(live_stack: LiveStack):
     # Positive control: an allowed statement on sales.payments does move the counter.
     before = payment_scans(live_stack)
@@ -116,6 +120,7 @@ def test_heavy_cross_join_is_refused_after_explain_and_never_runs(live_stack: Li
     assert payment_scans(live_stack) == settled
 
 
+@SQL_ALLOW
 def test_select_star_returns_at_most_force_limit_rows(live_stack: LiveStack):
     result = call_tool(live_stack, ANNA, "query", sql="SELECT * FROM sales.orders")
     assert result["isError"] is False, result

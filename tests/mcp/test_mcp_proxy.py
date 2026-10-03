@@ -18,6 +18,13 @@ from upstreams import RoutingTransport, running_upstreams
 from gateway.sessions import SessionUpdate
 from gateway.telemetry import REGISTRY
 
+AUTHN_DENY = pytest.mark.control("authn", "deny")
+AUTHZ_ALLOW = pytest.mark.control("authz", "allow")
+AUTHZ_DENY = pytest.mark.control("authz", "deny")
+AUTHZ_HOLD = pytest.mark.control("authz", "require_approval")
+SIG_DENY = pytest.mark.control("signatures", "deny")
+PIN_DENY = pytest.mark.control("tool_pinning", "deny")
+
 ANNA, BARTEK, ETL = "anna@demo", "bartek@demo", "svc:nightly_etl"
 COUNT_CUSTOMERS = "SELECT COUNT(*) FROM sales.customers"
 
@@ -128,6 +135,7 @@ async def test_get_is_405_and_foreign_origins_are_refused(stack: MCPStack):
     assert response.json()["error"]["data"]["reason_code"] == "origin_not_allowed"
 
 
+@AUTHN_DENY
 async def test_no_token_is_401_and_servers_stay_hidden(stack: MCPStack):
     anonymous = MCPClient(stack.gateway.agent, None, "sales_db")
     response = await anonymous.initialize()
@@ -174,6 +182,7 @@ async def test_autonomous_session_keeps_listing_write_after_taint(stack: MCPStac
 # ----------------------------------------------------------------------- tools/call
 
 
+@AUTHZ_ALLOW
 async def test_same_query_different_principal_different_rows(stack: MCPStack):
     anna, bartek = await connect(stack, ANNA, "sales_db"), await connect(stack, BARTEK, "sales_db")
     assert rows(await anna.call("query", sql=COUNT_CUSTOMERS)) == [{"count": 40}]
@@ -208,6 +217,7 @@ async def test_trusted_upstream_gets_a_signed_principal_never_the_bearer(stack: 
     assert requests_total("allow", "databot") == before + 1
 
 
+@SIG_DENY
 async def test_untrusted_upstream_gets_no_principal_assertion(stack: MCPStack):
     web = await connect(stack, ANNA, "web")
     result = await web.call("fetch", url="https://example.com/outlook")
@@ -217,6 +227,7 @@ async def test_untrusted_upstream_gets_no_principal_assertion(stack: MCPStack):
     assert all("x-acl-principal" not in r.headers for r in stack.transport.sent("mcp-fetch"))
 
 
+@AUTHZ_DENY
 async def test_table_outside_the_role_is_denied_before_the_upstream(stack: MCPStack):
     bartek = await connect(stack, BARTEK, "sales_db")
     before = requests_total("block", "databot")
@@ -234,6 +245,7 @@ async def test_table_outside_the_role_is_denied_before_the_upstream(stack: MCPSt
     )
 
 
+@AUTHZ_DENY
 async def test_join_needs_every_table(stack: MCPStack):
     bartek = await connect(stack, BARTEK, "sales_db")
     sql = "SELECT COUNT(*) FROM sales.customers c JOIN sales.payments p ON p.cid = c.id"
@@ -241,6 +253,8 @@ async def test_join_needs_every_table(stack: MCPStack):
     assert stack.log.of("query") == []
 
 
+@AUTHZ_ALLOW
+@AUTHZ_DENY
 async def test_the_demo_story_taint_blocks_the_second_report(stack: MCPStack):
     """Write allowed → untrusted fetch taints → the same write is now refused."""
     web, reports = await connect_all(stack, ANNA, "web", "reports")
@@ -264,6 +278,7 @@ async def test_the_demo_story_taint_blocks_the_second_report(stack: MCPStack):
     assert not any(scope.startswith("write:") for scope in entry["effective_scope"])
 
 
+@AUTHZ_HOLD
 async def test_autonomous_write_after_taint_waits_for_approval(stack: MCPStack):
     web, reports = await connect_all(stack, ETL, "web", "reports")
     await web.call("fetch", url="https://example.com/outlook")
@@ -316,6 +331,7 @@ async def test_malformed_call_params_are_a_protocol_error(stack: MCPStack):
     assert response.json()["error"]["code"] == -32602
 
 
+@PIN_DENY
 async def test_arguments_are_validated_against_the_pinned_schema(stack: MCPStack, tmp_path):
     """The stack's pins are the servers' own listings (`pin_kit`); a pin that differs from
     what the upstream advertises is a rug pull (tests/mcp/test_tool_pinning.py)."""
@@ -381,6 +397,7 @@ async def test_deleting_the_downstream_session_ends_the_upstream_one(stack: MCPS
     assert len(stack.gateway.container.mcp.registry) == 0
 
 
+@AUTHN_DENY
 async def test_ending_the_gateway_session_ends_its_mcp_sessions(stack: MCPStack):
     sales = await connect(stack, ANNA, "sales_db")
     await sales.call("query", sql=COUNT_CUSTOMERS)
@@ -433,6 +450,7 @@ async def test_unreachable_upstream_is_a_generic_error(stack: MCPStack, tmp_path
     assert listing.json()["error"]["data"]["reason_code"] == "upstream_unreachable"
 
 
+@AUTHZ_DENY
 async def test_untrusted_upstream_error_still_taints(stack: MCPStack):
     """The request reached the untrusted server; its answer (here an error) reached us."""
     web, reports = await connect_all(stack, ANNA, "web", "reports")
@@ -450,6 +468,7 @@ async def test_untrusted_upstream_error_still_taints(stack: MCPStack):
     assert stack.log.of("write_report") == []
 
 
+@AUTHZ_ALLOW
 async def test_trusted_upstream_error_does_not_taint(stack: MCPStack):
     sales, reports = await connect_all(stack, ANNA, "sales_db", "reports")
     stack.transport.rpc_error_tool_calls.add("mcp-postgres")

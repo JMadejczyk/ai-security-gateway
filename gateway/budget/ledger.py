@@ -71,7 +71,7 @@ from gateway.clock import Clock, utc_now
 from gateway.policy.loader import PolicySnapshot
 from gateway.policy.schema import Policy
 from gateway.telemetry import (
-    OTHER_LABEL,
+    bounded,
     record_budget_store_error,
     record_cost,
     set_budget_store_up,
@@ -333,9 +333,9 @@ class BudgetLedger:
             wall_s=wall_s,
         )
         if spent.cost_nano_usd:
-            record_cost(
-                call.user_label, call.agent_label, call.model or OTHER_LABEL, spent.cost_usd
-            )
+            # Models outside the pricing table share `other` (bounded label set).
+            model = bounded(call.model, reservation.pricing)
+            record_cost(call.user_label, call.agent_label, model, spent.cost_usd)
         if not reservation.scopes:
             return
         overrun = any(spent[meter] > held[meter] for meter in Meter)

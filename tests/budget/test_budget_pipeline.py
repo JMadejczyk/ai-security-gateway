@@ -24,6 +24,9 @@ from gateway_testkit import Harness, bearer, chat, running_gateway
 from gateway.budget.model import ScopeKind, Spend
 from gateway.telemetry import REGISTRY, ReloadResult
 
+ALLOW = pytest.mark.control("budget", "allow")
+DENY = pytest.mark.control("budget", "deny")
+
 CHAT = "/v1/chat/completions"
 DEAD_REDIS = "redis://127.0.0.1:1/0"  # nothing listens on port 1
 
@@ -78,6 +81,8 @@ def metric(name: str, **labels: str) -> float:
 # ------------------------------------------------------------------------------ tokens
 
 
+@ALLOW
+@DENY
 async def test_daily_token_budget_blocks_before_the_upstream(tmp_path):
     llm = ScriptedLLM()
     async with llm_gateway(tmp_path, llm, {"per_user": {"daily_tokens": 30}}) as gateway:
@@ -103,6 +108,8 @@ async def test_a_request_without_a_cap_is_sent_with_the_default_one(tmp_path):
         assert llm.bodies[0]["max_tokens"] == 4096  # limits.default_max_tokens
 
 
+@ALLOW
+@DENY
 async def test_an_autonomous_agent_is_its_own_user(tmp_path):
     llm = ScriptedLLM()
     async with llm_gateway(tmp_path, llm, {"per_user": {"daily_tokens": 30}}) as gateway:
@@ -117,6 +124,7 @@ async def test_an_autonomous_agent_is_its_own_user(tmp_path):
 # -------------------------------------------------------------------------------- cost
 
 
+@DENY
 async def test_daily_cost_budget_uses_the_pricing_table(tmp_path):
     llm = ScriptedLLM()
     pricing = {"qwen3:8b": {"prompt_per_1k": 1.0, "completion_per_1k": 1.0}}
@@ -150,6 +158,7 @@ async def test_tokens_metric_matches_the_settled_usage(tmp_path):
 # ----------------------------------------------------------------------- GPU wall time
 
 
+@DENY
 async def test_gpu_seconds_are_charged_from_upstream_wall_time(tmp_path):
     llm = ScriptedLLM(delay_s=0.15)
     async with llm_gateway(tmp_path, llm, {"per_session": {"gpu_seconds": 0.5}}) as gateway:
@@ -214,6 +223,7 @@ async def test_a_client_disconnect_mid_call_releases_the_hold(tmp_path):
 # ---------------------------------------------------------------------------- soft limit
 
 
+@DENY
 async def test_soft_limit_warns_once_and_tracks_the_usage_ratio(tmp_path, caplog):
     caplog.set_level(logging.WARNING, logger="gateway.alerts")
     llm = ScriptedLLM()
@@ -238,6 +248,7 @@ async def test_soft_limit_warns_once_and_tracks_the_usage_ratio(tmp_path, caplog
 # ------------------------------------------------------------------------ store failure
 
 
+@DENY
 async def test_redis_down_fails_closed_with_503(tmp_path):
     llm = ScriptedLLM()
     # Session state stays in memory: this is the budget store alone going down.
@@ -261,6 +272,7 @@ async def test_redis_down_fails_closed_with_503(tmp_path):
 # -------------------------------------------------------------------------------- privacy
 
 
+@DENY
 async def test_refusals_name_the_limit_never_anyone_s_usage(tmp_path):
     llm = ScriptedLLM()
     async with llm_gateway(tmp_path, llm, {"per_agent": {"daily_tokens": 30}}) as gateway:

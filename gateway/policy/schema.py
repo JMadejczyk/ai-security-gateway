@@ -479,7 +479,14 @@ class Judges(FrozenModel):
     # Content longer than this is not judged at all: the judge is unavailable for it (fail
     # closed), never handed a truncated view that could hide the part that matters.
     max_content_chars: Annotated[int, Field(gt=0, le=1_000_000)] = 16_000
+    # Caps the verdict, not the wall time: `timeout_s` is a total deadline on the whole call,
+    # so a model that keeps generating (thinking) is cut off there and the judge is
+    # unavailable, never late. Verdicts are a few dozen tokens.
     max_output_tokens: Annotated[int, Field(gt=0, le=32_768)] = 1024
+    # Sent as `reasoning_effort`. "none" turns thinking off on reasoning models (qwen3 on
+    # Ollama's OpenAI endpoint thinks by default and, on CPU, spends the whole deadline doing
+    # it); null omits the field for an upstream that rejects it.
+    reasoning_effort: Literal["none", "low", "medium", "high"] | None = "none"
 
 
 class Controls(FrozenModel):

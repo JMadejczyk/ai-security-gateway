@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -19,6 +19,7 @@ from gateway.judges.client import (
     JudgeClient,
     JudgeResult,
     JudgeUnavailableError,
+    compact_schema,
     escape_delimiters,
     forbids_extra,
 )
@@ -83,6 +84,22 @@ async def client(judge_snapshot) -> AsyncIterator[JudgeClient]:
 
 
 @pytest.fixture
+async def make_client() -> AsyncIterator[Callable[..., Awaitable[JudgeClient]]]:
+    """Builds started clients over a given snapshot; closes them all afterwards."""
+    proxies: list[LLMProxy] = []
+
+    async def build(snapshot) -> JudgeClient:
+        proxy = LLMProxy(env={})
+        await proxy.start()
+        proxies.append(proxy)
+        return JudgeClient(proxy, lambda: snapshot)
+
+    yield build
+    for proxy in proxies:
+        await proxy.aclose()
+
+
+@pytest.fixture
 def upstream():
     with respx.mock(base_url=LLM, assert_all_called=False) as router:
         yield router
@@ -111,6 +128,7 @@ async def test_valid_json_becomes_the_model(client, upstream):
     assert body["response_format"] == {"type": "json_object"}
     assert body["stream"] is False
     assert body["max_tokens"] == 1024
+    assert body["reasoning_effort"] == "none"  # thinking off by default (qwen3 on Ollama)
     assert route.calls.last.request.headers["accept-encoding"] == "identity"
     assert "authorization" not in route.calls.last.request.headers  # never agent credentials
 
@@ -404,3 +422,125 @@ def test_without_judges_and_unconfigured_controls_the_policy_loads(policy_doc, s
     assert policy.judges is None
     assert policy.controls.intent_judge is None
     assert policy.controls.output_policy is None
+
+
+def thinking_answer(content: str | None, field: str = "reasoning") -> httpx.Response:
+    message = {"role": "assistant", "content": content, field: "Okay, the user wants..."}
+    return httpx.Response(
+        200,
+        json={
+            "id": "j-1",
+            "model": "qwen3:8b",
+            "choices": [{"index": 0, "message": message, "finish_reason": "length"}],
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        thinking_answer(""),
+        thinking_answer(None),
+        thinking_answer("   \n"),
+        thinking_answer("", field="reasoning_content"),
+    ],
+    ids=["empty", "null", "blank", "reasoning_content"],
+)
+async def test_reasoning_without_an_answer_is_judge_no_answer(client, upstream, response):
+    upstream.post("/chat/completions").mock(return_value=response)
+    before = judged("intent_judge", "judge_no_answer")
+    with pytest.raises(JudgeUnavailableError) as raised:
+        await ask(client)
+    assert raised.value.reason is JudgeResult.NO_ANSWER
+    assert judged("intent_judge", "judge_no_answer") == before + 1
+
+
+async def test_reasoning_next_to_an_answer_is_fine(client, upstream):
+    upstream.post("/chat/completions").mock(return_value=thinking_answer('{"aligned": true}'))
+    assert (await ask(client)).aligned is True
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high"])
+async def test_reasoning_effort_is_configurable(
+    judge_policy, snapshot_from, upstream, make_client, effort
+):
+    judge_policy["judges"]["reasoning_effort"] = effort
+    route = upstream.post("/chat/completions").mock(return_value=answer('{"aligned": true}'))
+    await ask(await make_client(snapshot_from(judge_policy)))
+    assert json.loads(route.calls.last.request.content)["reasoning_effort"] == effort
+
+
+async def test_null_reasoning_effort_omits_the_field(
+    judge_policy, snapshot_from, upstream, make_client
+):
+    judge_policy["judges"]["reasoning_effort"] = None
+    route = upstream.post("/chat/completions").mock(return_value=answer('{"aligned": true}'))
+    await ask(await make_client(snapshot_from(judge_policy)))
+    assert "reasoning_effort" not in json.loads(route.calls.last.request.content)
+
+
+@pytest.mark.parametrize("effort", ["off", "minimal", "", 0, False])
+def test_unknown_reasoning_effort_is_invalid(policy_doc, snapshot_from, effort):
+    policy_doc["judges"]["reasoning_effort"] = effort
+    with pytest.raises(PolicyLoadError):
+        snapshot_from(policy_doc)
+
+
+async def test_a_thinking_model_never_outlasts_the_deadline(client, upstream):
+    """max_output_tokens does not bound wall time: the total deadline does."""
+
+    async def thinking(_request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(5)  # still generating tokens it was allowed
+        return thinking_answer("")
+
+    upstream.post("/chat/completions").mock(side_effect=thinking)
+    started_at = asyncio.get_running_loop().time()
+    with pytest.raises(JudgeUnavailableError) as raised:
+        await ask(client)
+    assert raised.value.reason is JudgeResult.TIMEOUT
+    assert asyncio.get_running_loop().time() - started_at < 2  # judge_policy: timeout_s 0.5
+
+
+async def test_system_message_is_identical_across_calls(judge_snapshot, upstream, make_client):
+    """Cacheable: the nonce lives only in the user message's markers, so an upstream with
+    prompt caching reuses the whole system message (2.5 s instead of 12-18 s on CPU)."""
+    route = upstream.post("/chat/completions").mock(return_value=answer('{"aligned": true}'))
+    client = await make_client(judge_snapshot)
+    await ask(client, "first")
+    await ask(client, "second")
+    (system_1, user_1), (system_2, user_2) = (
+        json.loads(call.request.content)["messages"] for call in route.calls
+    )
+    assert system_1 == system_2
+    nonce_1 = user_1["content"].split('"')[1]
+    nonce_2 = user_2["content"].split('"')[1]
+    assert nonce_1 != nonce_2
+    assert nonce_1 not in system_1["content"]
+    assert user_1["content"].count(nonce_1) == 2  # the opening and the closing marker
+
+
+def test_schema_sent_to_the_judge_has_no_docstrings():
+    class Strict(BaseModel):
+        """Developer prose that must not reach the judge."""
+
+        model_config = ConfigDict(extra="forbid")
+
+        title: str  # a property *named* title is kept
+        description: list[Verdict]
+
+    compact = compact_schema(Strict.model_json_schema())
+    text = json.dumps(compact)
+    assert "Developer prose" not in text
+    assert '"title": "' not in text
+    assert set(compact["properties"]) == {"title", "description"}
+    assert compact["additionalProperties"] is False
+    assert compact["$defs"]["Verdict"]["additionalProperties"] is False
+    assert compact["required"] == ["title", "description"]
+
+
+async def test_the_request_carries_the_compact_schema(client, upstream):
+    route = upstream.post("/chat/completions").mock(return_value=answer('{"aligned": true}'))
+    await ask(client)
+    system = json.loads(route.calls.last.request.content)["messages"][0]["content"]
+    assert '"title"' not in system
+    assert '"additionalProperties":false' in system

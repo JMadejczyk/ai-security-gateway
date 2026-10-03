@@ -114,6 +114,10 @@ budgets:
 # this section the judge controls are off, and configuring one of them is an error.
 judges:
   model: "qwen3:8b"
-  timeout_s: 20              # total deadline per judge call (CPU inference is slow)
+  # Total deadline per judge call. Measured on qwen3:8b, CPU, thinking off: 6-8 s with the
+  # judge prompt cached, 17-19 s cold (prompt prefill ~45 tok/s; the agent's own calls to
+  # the same Ollama evict the cache), more while Ollama is busy with another request.
+  timeout_s: 40
   max_content_chars: 16000   # longer content is not judged: fail closed
-  max_output_tokens: 1024
+  max_output_tokens: 1024     # caps the verdict; timeout_s bounds the wall time
+  reasoning_effort: "none"   # qwen3 thinks by default: on CPU that eats the whole deadline

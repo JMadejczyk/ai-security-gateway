@@ -195,31 +195,51 @@ and every container has a private one. That is the SSRF defence. The options wer
 | Host the page on the internet | The demo would depend on a site that can change, vanish or be blocked at a venue, and it would publish attack text. |
 | Use a public page with injection-like text | Same dependency. A false positive (the example.com page scores 0.94) isn't a hidden injection, and claiming it is would mislead. |
 | Give `demo-web` a "public" IP on a Docker network | It would lie to our own SSRF check. |
-| **A demo overlay with one named exception (chosen)** | It is off by default, explicit, and visible in every audit entry. |
+| **A demo overlay with one exception bound to a name, an address and an origin (chosen)** | It is off by default, explicit, refuses any other answer, and is visible in every audit entry. |
 
 The overlay [`demo/compose.demo.yml`](../demo/compose.demo.yml) is applied only when it's named
 on the command line (`make demo-up`). It adds three things:
 
 1. **`demo-web`**, a static `python -m http.server` with `nobody` as its user, a read-only root
    filesystem, `cap_drop: ALL`, `no-new-privileges` and `demo/web/` mounted read-only. It sits
-   alone on the internal `demo_web` network with mcp-fetch. The agent, the gateway and the
-   other upstreams share no network with it, so it models "a site on the internet" reachable
-   only through the fetch server.
-2. **mcp-fetch** joins `demo_web` and gets `ACL_FETCH_DEMO_HOSTS=demo-web`. For that exact host
-   name, the public-address rule is lifted. Ports (80/443), resolution, pinning the connection
-   to the validated IP and the no-redirects rule all still apply. IP literals and every other
-   name, including `demo-web.<anything>`, are still refused.
-3. **The gateway** gets `ACL_EGRESS_DEMO_HOSTS=["demo-web"]`. The `egress` control passes that
-   exact name after the scheme, port and `allow_hosts` checks. It answers with its own reason
-   code, `egress_demo_host`, so every use shows in the audit log. It skips resolution because
-   it shares no network with `demo-web` and couldn't resolve the name anyway.
+   alone on the internal `demo_web` network with mcp-fetch, at the static address
+   `10.218.97.10` (subnet `10.218.97.0/28`, outside Docker's default address pools and the
+   stack's own networks). The agent, the gateway and the other upstreams share no network with
+   it, so it models "a site on the internet" reachable only through the fetch server.
+2. **mcp-fetch** joins `demo_web` and gets `ACL_FETCH_DEMO_HOSTS=demo-web=10.218.97.10`.
+3. **The gateway** gets the same binding: `ACL_EGRESS_DEMO_HOSTS=["demo-web=10.218.97.10"]`.
 
-Both switches are needed. Each defaults to empty, and the unit tests pin that default: without
-the overlay, `http://demo-web/` is `egress_private_address` at the gateway and
-`DisallowedDestinationError` at mcp-fetch (`tests/unit/test_egress_demo_hosts.py`,
-`demo/mcp_servers/tests/test_fetch_server.py`). Nothing else changes. The page goes through
-the `untrusted` server like any web page: its result taints the session, and the classifier
-reads hidden elements because it keeps them on purpose.
+Each binding ties together a name, an address and an origin. A fetch is exempt from the
+public-address rule only when all four of these hold:
+
+- the scheme is `http` and the port is 80;
+- the host is exactly `demo-web`, never an IP literal and never `demo-web.<anything>`;
+- every DNS answer for the name is exactly `10.218.97.10`;
+- mcp-fetch pins its connection to that validated address, as it does for every fetch.
+
+The binding exists because of a review finding against the first version, which exempted the
+name alone. That version trusted whatever `demo-web` resolved to. A conflicting alias on another
+network the fetcher joins, a poisoned answer or an `/etc/hosts` override could then point
+`http://demo-web/` at `127.0.0.1`, `169.254.169.254` or another internal service, and both
+layers would accept it. Now any other answer falls back to the normal rule and is refused,
+and so do https and port 443.
+
+The two layers differ in one respect. The gateway shares no network with `demo-web`, so in
+compose the name has no answer there. The gateway therefore checks that no answer contradicts
+the binding, and it audits each use as `egress_demo_host`. mcp-fetch is the one that connects,
+so it requires the answer to be exactly the bound address before it opens the connection.
+
+Both switches are needed. Each defaults to empty, a malformed or unbound entry (for example a
+bare `demo-web`) stops the service at startup, and the unit tests pin all of this. Without the
+overlay, `http://demo-web/` is `egress_private_address` at the gateway and
+`DisallowedDestinationError` at mcp-fetch. With it, an injected resolver answering `127.0.0.1`,
+`169.254.169.254` or a different private address is refused at both layers, and https or
+`:443` is refused too. See `tests/unit/test_egress_demo_hosts.py` and
+`demo/mcp_servers/tests/test_fetch_server.py`.
+
+Nothing else changes. The page goes through the `untrusted` server like any web page: its
+result taints the session, and the classifier reads hidden elements because it keeps them on
+purpose.
 
 ## Resetting between runs
 

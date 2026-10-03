@@ -4,10 +4,11 @@ Secrets are required and length-checked here, so a gateway with a missing or wea
 key refuses to start instead of issuing forgeable tokens.
 """
 
+from ipaddress import IPv4Address, IPv6Address
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, Field, SecretStr
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 MIN_SECRET_BYTES = 32
@@ -23,9 +24,39 @@ def _strong_secret(value: SecretStr) -> SecretStr:
 type Secret = Annotated[SecretStr, AfterValidator(_strong_secret)]
 type Port = Annotated[int, Field(ge=1, le=65535)]
 # A single lower-case DNS name with a letter in its first label: never an IP literal or a glob.
-type DemoHost = Annotated[
+type DemoHostName = Annotated[
     str, Field(pattern=r"^[a-z][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*$", max_length=253)
 ]
+
+
+class DemoHost(BaseModel):
+    """One ``egress`` demo binding: a host name and the one address it may resolve to.
+
+    Written ``name=address`` in ``ACL_EGRESS_DEMO_HOSTS`` (a JSON list of such strings)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    host: DemoHostName
+    address: IPv4Address | IPv6Address
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_binding(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        host, sep, address = value.partition("=")
+        if not sep:
+            msg = "a demo host is written name=address"
+            raise ValueError(msg)
+        return {"host": host, "address": address}
+
+
+def _unique_hosts(bindings: tuple[DemoHost, ...]) -> tuple[DemoHost, ...]:
+    hosts = [binding.host for binding in bindings]
+    if len(set(hosts)) != len(hosts):
+        msg = "each demo host may be bound to one address only"
+        raise ValueError(msg)
+    return bindings
 
 
 class Settings(BaseSettings):
@@ -72,11 +103,16 @@ class Settings(BaseSettings):
     injection_classifier: Literal["onnx", "disabled"] = "onnx"
     classifier_threads: int = Field(default=4, ge=1, le=64)  # intra-op threads per inference
     classifier_workers: int = Field(default=2, ge=1, le=64)  # inferences running at once
-    # Exact host names `egress` lets through without the public-address check (reason code
-    # `egress_demo_host`). Empty by default; only the demo overlay (demo/compose.demo.yml) sets
-    # it, as a JSON list: ACL_EGRESS_DEMO_HOSTS='["demo-web"]'.
-    egress_demo_hosts: tuple[DemoHost, ...] = ()
+    # `egress` demo bindings (reason code `egress_demo_host`): http://<host>:80 passes the
+    # address check while no resolved answer differs from the bound address. Empty by default;
+    # only the demo overlay (demo/compose.demo.yml) sets it, as a JSON list of name=address:
+    # ACL_EGRESS_DEMO_HOSTS='["demo-web=10.218.97.10"]'.
+    egress_demo_hosts: Annotated[tuple[DemoHost, ...], AfterValidator(_unique_hosts)] = ()
     log_level: str = "info"
+
+    def demo_host_bindings(self) -> dict[str, IPv4Address | IPv6Address]:
+        """``egress_demo_hosts`` as host -> address."""
+        return {binding.host: binding.address for binding in self.egress_demo_hosts}
 
     @property
     def jwt_key(self) -> bytes:

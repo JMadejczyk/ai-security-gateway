@@ -14,16 +14,21 @@ SSRF defence at connect time, independent of the gateway's egress control:
 Redirects are not followed: the gateway's egress control validates every destination, so a
 redirect is reported back and the agent must fetch the new URL explicitly (through the gateway).
 
-**Demo hosts** (``ACL_FETCH_DEMO_HOSTS``, unset by default): exact host names that may resolve
-to non-public addresses. Only the demo overlay (``demo/compose.demo.yml``) sets it, to the one
-``demo-web`` container that serves the demo's injection page on a network shared with nothing
-but this server. Everything else still applies to them (ports, resolution, IP pinning, no
-redirects); every other host keeps the public-address rule.
+**Demo hosts** (``ACL_FETCH_DEMO_HOSTS``, unset by default): ``name=address`` bindings, e.g.
+``demo-web=10.218.97.10``. Only the demo overlay (``demo/compose.demo.yml``) sets it, for the
+``demo-web`` container (static address) that serves the demo's injection page on a network
+shared with nothing but this server. A URL is exempt from the public-address rule only when
+all of these hold: scheme ``http``, port 80, the host is exactly a bound name (never an IP
+literal), and **every** resolved answer equals that name's bound address. Anything else (an
+alias, a poisoned or overridden answer pointing at 127.0.0.1, the metadata address or another
+internal service; https or port 443) falls back to the normal rule and is refused. The
+connection is pinned to the validated address as always.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import socket
 from collections.abc import Mapping, Sequence
 from ipaddress import IPv4Address, IPv6Address, ip_address
@@ -99,6 +104,34 @@ class RedirectNotFollowedError(ToolError):
         super().__init__(f"HTTP {status} redirect to {location!r}; not followed")
 
 
+class InvalidDemoHostsError(ValueError):
+    """``ACL_FETCH_DEMO_HOSTS`` is malformed: the server refuses to start."""
+
+    def __init__(self, entry: str) -> None:
+        super().__init__(
+            f"{DEMO_HOSTS_ENV}: {entry!r} is not a unique lower-case name=ip-address binding"
+        )
+
+
+_DEMO_NAME = re.compile(r"^[a-z][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*$")
+
+
+def parse_demo_hosts(raw: str) -> dict[str, IPv4Address | IPv6Address]:
+    """``name=address[,name=address...]``; empty = none. Raises `InvalidDemoHostsError`."""
+    if not raw.strip():
+        return {}
+    bindings: dict[str, IPv4Address | IPv6Address] = {}
+    for entry in raw.split(","):
+        name, sep, address = (part.strip() for part in entry.partition("="))
+        if not sep or not _DEMO_NAME.fullmatch(name) or name in bindings:
+            raise InvalidDemoHostsError(entry)
+        try:
+            bindings[name] = ip_address(address)
+        except ValueError:
+            raise InvalidDemoHostsError(entry) from None
+    return bindings
+
+
 class UpstreamHTTPError(ToolError):
     def __init__(self, status: int, snippet: str) -> None:
         super().__init__(f"HTTP {status}: {snippet}")
@@ -109,15 +142,16 @@ class FetchSettings(BaseModel):
 
     max_bytes: int = Field(default=256 * 1024, gt=0)
     timeout_s: float = Field(default=10.0, gt=0)
-    # Exact host names exempt from the public-address rule (demo overlay only; see module doc).
-    demo_hosts: frozenset[str] = frozenset()
+    # name -> the one address it may resolve to (demo overlay only; see the module docstring).
+    demo_hosts: dict[str, IPv4Address | IPv6Address] = Field(
+        default_factory=dict[str, IPv4Address | IPv6Address]
+    )
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> FetchSettings:
-        """``ACL_FETCH_DEMO_HOSTS``: comma-separated host names (lower-cased); unset = none."""
+        """``ACL_FETCH_DEMO_HOSTS``: ``name=address`` bindings, comma-separated; unset = none."""
         raw = (os.environ if env is None else env).get(DEMO_HOSTS_ENV, "")
-        hosts = frozenset(name.strip().lower() for name in raw.split(",") if name.strip())
-        return cls(demo_hosts=hosts)
+        return cls(demo_hosts=parse_demo_hosts(raw))
 
 
 class Fetcher:
@@ -172,13 +206,22 @@ class Fetcher:
             literal = False
         if not addresses:
             raise UnresolvableHostError(host)
-        exempt = not literal and host.lower() in self._settings.demo_hosts
+        exempt = self._bound_demo_origin(parsed.scheme, host, port, addresses, literal=literal)
         if not exempt and not all(is_public_address(address) for address in addresses):
             raise DisallowedDestinationError(host)
         pinned = parsed.copy_with(host=str(addresses[0]))
         headers = {"Host": parsed.netloc.decode("ascii")}
         extensions = {} if literal else {"sni_hostname": host}
         return pinned, headers, extensions
+
+    def _bound_demo_origin(
+        self, scheme: str, host: str, port: int, addresses: Sequence[IPAddress], *, literal: bool
+    ) -> bool:
+        """True only for ``http://<bound name>:80`` whose every answer is the bound address."""
+        bound = self._settings.demo_hosts.get(host)
+        if literal or bound is None or scheme != "http" or port != _DEFAULT_PORTS["http"]:
+            return False
+        return all(address == bound for address in addresses)
 
     async def _read_capped(self, response: httpx.Response) -> bytes:
         limit = self._settings.max_bytes

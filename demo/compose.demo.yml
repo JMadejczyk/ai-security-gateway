@@ -10,13 +10,21 @@
 # adds three things, all off unless the overlay is named on the command line:
 #
 #   1. `demo-web`: a static server for demo/web/, alone on the internal `demo_web` network with
-#      mcp-fetch. The agent, the gateway and every other upstream share no network with it.
-#   2. mcp-fetch joins `demo_web` and gets ACL_FETCH_DEMO_HOSTS=demo-web: that one exact name
-#      may resolve to a private address. Ports, IP pinning and no-redirects still apply; IP
-#      literals and every other name keep the public-address rule.
-#   3. The gateway gets ACL_EGRESS_DEMO_HOSTS=["demo-web"]: `egress` passes that exact name
-#      with reason code `egress_demo_host` (visible in every audit entry) instead of resolving
-#      it, which it could not do anyway since it shares no network with `demo-web`.
+#      mcp-fetch, at the static address 10.218.97.10 (subnet 10.218.97.0/28, outside Docker's
+#      default pools and the stack's own networks). The agent, the gateway and every other
+#      upstream share no network with it.
+#   2. mcp-fetch joins `demo_web` and gets ACL_FETCH_DEMO_HOSTS=demo-web=10.218.97.10: a binding
+#      of name AND address AND origin. Only http://demo-web:80 is exempt from the public-address
+#      rule, and only when every answer for `demo-web` is exactly 10.218.97.10; the connection is
+#      pinned to it. Another answer (an alias on another network, a poisoned or overridden one
+#      pointing at 127.0.0.1, 169.254.169.254 or another service), https, port 443 or an IP
+#      literal falls back to the normal rule and is refused.
+#   3. The gateway gets the same binding, ACL_EGRESS_DEMO_HOSTS=["demo-web=10.218.97.10"]:
+#      `egress` passes http://demo-web:80 with reason code `egress_demo_host` (visible in every
+#      audit entry) while no answer differs from the bound address. It shares no network with
+#      `demo-web`, so the name has no answer there; mcp-fetch, which connects, enforces it.
+#
+#   If you change the address, change it in all three places below.
 #
 # What the demo shows is unchanged by this: the page is untrusted content on an `untrusted`
 # server, so the fetch result taints the session and the injection classifier runs on it, as
@@ -25,6 +33,9 @@
 networks:
   demo_web:
     internal: true
+    ipam:
+      config:
+        - subnet: 10.218.97.0/28
 
 services:
   demo-web:
@@ -45,7 +56,9 @@ services:
         target: /srv
         read_only: true
         bind: { create_host_path: false }
-    networks: [demo_web]
+    networks:
+      demo_web:
+        ipv4_address: 10.218.97.10
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1/', timeout=2)"]
       interval: 10s
@@ -55,10 +68,10 @@ services:
 
   mcp-fetch:
     environment:
-      ACL_FETCH_DEMO_HOSTS: demo-web
+      ACL_FETCH_DEMO_HOSTS: demo-web=10.218.97.10
     networks:
       demo_web: {}
 
   gateway:
     environment:
-      ACL_EGRESS_DEMO_HOSTS: '["demo-web"]'
+      ACL_EGRESS_DEMO_HOSTS: '["demo-web=10.218.97.10"]'

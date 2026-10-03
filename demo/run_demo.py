@@ -78,10 +78,10 @@ def preflight(compose: Compose) -> str | None:
     if missing:
         return f"not running: {', '.join(sorted(missing))}. Start the stack with `make demo-up`."
     hosts = compose.run("exec", "-T", "gateway", "printenv", "ACL_EGRESS_DEMO_HOSTS", check=False)
-    if "demo-web" not in hosts.stdout:
+    if "demo-web=" not in hosts.stdout:
         return (
-            "the gateway runs without the demo overlay (ACL_EGRESS_DEMO_HOSTS unset), so it "
-            "refuses the demo page. Run `make demo-up`."
+            "the gateway runs without the demo overlay's demo-web binding "
+            "(ACL_EGRESS_DEMO_HOSTS), so it refuses the demo page. Run `make demo-up`."
         )
     return None
 

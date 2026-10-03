@@ -192,7 +192,10 @@ def test_preflight_names_what_is_missing():
     assert "make demo-up" in (run_demo.preflight(FakeCompose(frozenset({"gateway"}))) or "")
     everything = run_demo.REQUIRED_SERVICES
     assert "overlay" in (run_demo.preflight(FakeCompose(everything, demo_hosts="")) or "")
-    assert run_demo.preflight(FakeCompose(everything, demo_hosts='["demo-web"]\n')) is None
+    unbound = FakeCompose(everything, demo_hosts='["demo-web"]\n')  # the old, unbound format
+    assert "overlay" in (run_demo.preflight(unbound) or "")
+    bound = FakeCompose(everything, demo_hosts='["demo-web=10.218.97.10"]\n')
+    assert run_demo.preflight(bound) is None
 
 
 def test_main_exits_2_when_the_stack_is_not_ready(monkeypatch, capsys):

@@ -12,6 +12,7 @@ from acl_demo_mcp.fetch_server import (
     DisallowedDestinationError,
     Fetcher,
     FetchSettings,
+    InvalidDemoHostsError,
     UnresolvableHostError,
     UnsupportedUrlError,
     is_public_address,
@@ -204,51 +205,106 @@ def test_rejections_are_tool_errors() -> None:
 
 # ------------------------------------------------------------------ demo hosts (overlay only)
 
-DEMO_WEB_IP = "172.30.99.2"
+DEMO_WEB_IP = "10.218.97.10"
+DEMO = {"demo-web": ip_address(DEMO_WEB_IP)}
+PAGE = "http://demo-web/q3-market-notes.html"
 
 
 def test_demo_hosts_are_off_by_default() -> None:
-    assert FetchSettings().demo_hosts == frozenset()
-    assert FetchSettings.from_env({}).demo_hosts == frozenset()
+    assert FetchSettings().demo_hosts == {}
+    assert FetchSettings.from_env({}).demo_hosts == {}
+    assert FetchSettings.from_env({"ACL_FETCH_DEMO_HOSTS": ""}).demo_hosts == {}
 
 
-def test_demo_hosts_env_is_an_exact_lower_cased_list() -> None:
-    settings = FetchSettings.from_env({"ACL_FETCH_DEMO_HOSTS": " Demo-Web , ,other "})
-    assert settings.demo_hosts == frozenset({"demo-web", "other"})
+def test_demo_hosts_env_binds_each_name_to_one_address() -> None:
+    settings = FetchSettings.from_env(
+        {"ACL_FETCH_DEMO_HOSTS": " demo-web=10.218.97.10 , other=fd00::7 "}
+    )
+    assert settings.demo_hosts == {
+        "demo-web": ip_address("10.218.97.10"),
+        "other": ip_address("fd00::7"),
+    }
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "demo-web",  # a name without its address: the old, unbound format
+        "demo-web=",
+        "=10.218.97.10",
+        "demo-web=not-an-ip",
+        "Demo-Web=10.218.97.10",  # names are lower case
+        "10.0.0.1=10.218.97.10",  # an IP literal is not a name
+        "*.web=10.218.97.10",
+        "demo-web=10.218.97.10,demo-web=10.218.97.11",  # one name, two addresses
+        "demo-web=10.218.97.10,,",
+    ],
+)
+def test_malformed_demo_hosts_refuse_to_start(raw: str) -> None:
+    with pytest.raises(InvalidDemoHostsError):
+        FetchSettings.from_env({"ACL_FETCH_DEMO_HOSTS": raw})
 
 
 def test_without_the_overlay_the_demo_host_is_refused(transport: RecordingTransport) -> None:
     fetcher = Fetcher(FetchSettings(), resolver=FakeResolver([DEMO_WEB_IP]), transport=transport)
     with pytest.raises(DisallowedDestinationError):
-        _fetch(fetcher, "http://demo-web/q3-market-notes.html")
+        _fetch(fetcher, PAGE)
     assert transport.requests == []
 
 
-def test_a_listed_demo_host_is_fetched_pinned_to_its_address(
+def test_the_bound_address_on_http_80_is_fetched_pinned_to_it(
     transport: RecordingTransport,
 ) -> None:
-    settings = FetchSettings(demo_hosts=frozenset({"demo-web"}))
+    settings = FetchSettings(demo_hosts=DEMO)
     fetcher = Fetcher(settings, resolver=FakeResolver([DEMO_WEB_IP]), transport=transport)
-    assert _fetch(fetcher, "http://demo-web/q3-market-notes.html") == "hello"
-    [request] = transport.requests
-    assert request.url.host == DEMO_WEB_IP
-    assert request.headers["host"] == "demo-web"
+    assert _fetch(fetcher, PAGE) == "hello"
+    assert _fetch(fetcher, "http://demo-web:80/") == "hello"
+    first, second = transport.requests
+    assert (first.url.host, first.url.scheme, first.url.port) == (DEMO_WEB_IP, "http", None)
+    assert first.headers["host"] == "demo-web"
+    assert second.url.host == DEMO_WEB_IP
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        ["127.0.0.1"],  # loopback
+        ["169.254.169.254"],  # cloud metadata
+        ["10.218.97.11"],  # another private address, same subnet
+        ["172.28.0.4"],  # another internal service
+        [DEMO_WEB_IP, "127.0.0.1"],  # the bound address plus another one
+        ["::ffff:10.218.97.10"],  # same IPv4 wrapped in IPv6 is not the bound address
+    ],
+)
+def test_the_name_resolving_anywhere_else_is_refused(
+    transport: RecordingTransport, answer: list[str]
+) -> None:
+    fetcher = Fetcher(
+        FetchSettings(demo_hosts=DEMO), resolver=FakeResolver(answer), transport=transport
+    )
+    with pytest.raises(DisallowedDestinationError):
+        _fetch(fetcher, PAGE)
+    assert transport.requests == []
 
 
 @pytest.mark.parametrize(
     "url",
     [
+        "https://demo-web/",  # https: the exemption is http only
+        "http://demo-web:443/",  # port 443 over http
+        "https://demo-web:443/",
         "http://other-host/",  # another private name
         "http://demo-web.evil.example/",  # a suffix is not the host
-        "http://127.0.0.1/",  # IP literals are never exempt
-        "http://demo-web:8080/",  # ports still apply
+        "http://10.218.97.10/",  # the address as a literal is never exempt
+        "http://demo-web:8080/",  # ports outside 80/443 never pass
     ],
 )
-def test_the_exemption_covers_exactly_the_listed_names(
+def test_the_exemption_covers_exactly_the_bound_origin(
     transport: RecordingTransport, url: str
 ) -> None:
-    settings = FetchSettings(demo_hosts=frozenset({"demo-web"}))
-    fetcher = Fetcher(settings, resolver=FakeResolver([DEMO_WEB_IP]), transport=transport)
+    fetcher = Fetcher(
+        FetchSettings(demo_hosts=DEMO), resolver=FakeResolver([DEMO_WEB_IP]), transport=transport
+    )
     with pytest.raises(ToolError):
         _fetch(fetcher, url)
     assert transport.requests == []

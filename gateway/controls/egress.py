@@ -21,12 +21,16 @@ and pins its connection to the validated address, so DNS rebinding between the t
 resolutions is caught there. The gateway cannot pin the upstream server's connection itself.
 Taint is not this control's concern: ``risk_rules`` remove or hold egress per session mode.
 
-**Demo hosts** (``ACL_EGRESS_DEMO_HOSTS``, empty by default): exact host names that skip checks
-4 and 5 after passing 1 to 3, answered with their own reason code (``egress_demo_host``) so
-every use is visible in the audit. Only the demo overlay (``demo/compose.demo.yml``) sets it,
-for the ``demo-web`` container that serves the demo's injection page. The gateway shares no
-network with that container, so it could not resolve the name anyway; the fetch server needs
-its own, separate switch (``ACL_FETCH_DEMO_HOSTS``) before it connects to a non-public address.
+**Demo hosts** (``ACL_EGRESS_DEMO_HOSTS``, empty by default): ``name=address`` bindings. Only
+the demo overlay (``demo/compose.demo.yml``) sets one, for the ``demo-web`` container (static
+address) that serves the demo's injection page. ``http://<name>:80``, after passing checks 1
+to 3, skips check 4 only while no resolved answer differs from the bound address, and is
+answered with its own reason code (``egress_demo_host``) so every use is visible in the audit.
+An answer pointing anywhere else (an alias, a poisoned or overridden answer: loopback, the
+metadata address, another internal service), https, port 443, or an IP literal falls back to
+the normal checks and is refused. The gateway shares no network with ``demo-web``, so in
+compose the name has no answer here; the fetch server, which connects, enforces the same
+binding (``ACL_FETCH_DEMO_HOSTS``) and pins its connection to the bound address.
 """
 
 import asyncio
@@ -52,7 +56,9 @@ EGRESS_HOST_NOT_ALLOWED: Final = "egress_host_not_allowed"
 EGRESS_SCHEME_NOT_ALLOWED: Final = "egress_scheme_not_allowed"
 EGRESS_UNRESOLVABLE: Final = "egress_unresolvable"
 EGRESS_UNVERIFIABLE: Final = "egress_unverifiable"  # no call scope, or no URL to check
-EGRESS_DEMO_HOST: Final = "egress_demo_host"  # an ACL_EGRESS_DEMO_HOSTS name (demo overlay)
+EGRESS_DEMO_HOST: Final = "egress_demo_host"  # an ACL_EGRESS_DEMO_HOSTS binding (demo overlay)
+DEMO_SCHEME: Final = "http"
+DEMO_PORT: Final = 80
 
 _HOLDABLE: Final = frozenset(
     {EGRESS_PRIVATE_ADDRESS, EGRESS_PORT_NOT_ALLOWED, EGRESS_HOST_NOT_ALLOWED}
@@ -120,9 +126,9 @@ class _RefusedError(Exception):
         self.reason = reason
 
 
-def _destination(url: str, settings: EgressConfig) -> tuple[str, int]:
-    """The host and port ``url`` connects to; `_RefusedError` for a scheme, port or host the
-    settings do not allow (checks 1 to 3 of the module docstring)."""
+def _destination(url: str, settings: EgressConfig) -> tuple[str, str, int]:
+    """The scheme, host and port ``url`` connects to; `_RefusedError` for a scheme, port or host
+    the settings do not allow (checks 1 to 3 of the module docstring)."""
     try:
         parsed = httpx.URL(url)
         host = parsed.raw_host.decode("ascii")
@@ -138,7 +144,7 @@ def _destination(url: str, settings: EgressConfig) -> tuple[str, int]:
         glob_match(pattern, host) for pattern in settings.allow_hosts
     ):
         raise _RefusedError(EGRESS_HOST_NOT_ALLOWED, "the host is not allowlisted")
-    return host, port
+    return parsed.scheme, host, port
 
 
 class EgressControl(Control):
@@ -147,10 +153,13 @@ class EgressControl(Control):
     kind: ClassVar[ControlKind] = ControlKind.DETERMINISTIC
 
     def __init__(
-        self, resolver: HostResolver = system_resolver, *, demo_hosts: frozenset[str] = frozenset()
+        self,
+        resolver: HostResolver = system_resolver,
+        *,
+        demo_hosts: Mapping[str, IPAddress] | None = None,
     ) -> None:
         self._resolver = resolver
-        self._demo_hosts = demo_hosts
+        self._demo_hosts: Mapping[str, IPAddress] = dict(demo_hosts or {})
 
     @override
     async def evaluate(self, interaction: Interaction, stage: Stage, cfg: ControlConfig) -> Verdict:
@@ -172,22 +181,32 @@ class EgressControl(Control):
 
     async def _check(self, url: str, settings: EgressConfig, cfg: ControlConfig) -> Verdict:
         try:
-            host, port = _destination(url, settings)
+            scheme, host, port = _destination(url, settings)
         except _RefusedError as refused:
             return self._refuse(refused.reason_code, refused.reason, cfg)
-        if host in self._demo_hosts:
-            return Verdict(
-                decision=Decision.ALLOW, control_id=self.id, reason_code=EGRESS_DEMO_HOST
-            )
         try:
             addresses: Sequence[IPAddress] = [ip_address(host.strip("[]"))]
         except ValueError:
             addresses = await self._resolve(host, port, settings.resolve_timeout_s)
+            if self._bound_demo_origin(scheme, host, port, addresses):
+                return Verdict(
+                    decision=Decision.ALLOW, control_id=self.id, reason_code=EGRESS_DEMO_HOST
+                )
         if not addresses:
             return self._refuse(EGRESS_UNRESOLVABLE, "the host did not resolve in time", cfg)
         if not all(is_public_address(address) for address in addresses):
             return self._refuse(EGRESS_PRIVATE_ADDRESS, "a non-public destination", cfg)
         return Verdict(decision=Decision.ALLOW, control_id=self.id, reason_code=EGRESS_ALLOWED)
+
+    def _bound_demo_origin(
+        self, scheme: str, host: str, port: int, addresses: Sequence[IPAddress]
+    ) -> bool:
+        """``http://<bound name>:80`` with no answer other than the bound address. No answer at
+        all is the compose case (no shared network); the fetch server pins the bound address."""
+        bound = self._demo_hosts.get(host)
+        if bound is None or scheme != DEMO_SCHEME or port != DEMO_PORT:
+            return False
+        return all(address == bound for address in addresses)
 
     async def _resolve(self, host: str, port: int, timeout_s: float) -> Sequence[IPAddress]:
         try:

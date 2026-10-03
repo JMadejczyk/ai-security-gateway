@@ -16,6 +16,7 @@ import os
 import secrets
 import shutil
 import subprocess
+import time
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 
@@ -59,15 +60,26 @@ def _docker_redis() -> Iterator[RealRedis | None]:
         return
     container = run.stdout.strip()
     try:
-        port = subprocess.run(  # noqa: S603 -- fixed argv
-            [docker, "port", container, "6379/tcp"],
-            capture_output=True, text=True, check=True, timeout=30,
-        ).stdout.split()[0].rsplit(":", 1)[1]  # fmt: skip
-        yield RealRedis(url=f"redis://127.0.0.1:{port}/0", password=password)
+        port = _published_port(docker, container)
+        yield RealRedis(url=f"redis://127.0.0.1:{port}/0", password=password) if port else None
     finally:
         subprocess.run(  # noqa: S603 -- fixed argv
             [docker, "rm", "-f", container], capture_output=True, check=False, timeout=60
         )
+
+
+def _published_port(docker: str, container: str) -> str | None:
+    """The host port of 6379/tcp. Right after `docker run -d`, `docker port` can still print
+    nothing: the mapping appears a moment later, so poll for it."""
+    for _ in range(100):
+        mapped = subprocess.run(  # noqa: S603 -- fixed argv
+            [docker, "port", container, "6379/tcp"],
+            capture_output=True, text=True, check=False, timeout=30,
+        ).stdout.split()  # fmt: skip
+        if mapped:
+            return mapped[0].rsplit(":", 1)[1]
+        time.sleep(0.1)
+    return None
 
 
 @pytest.fixture(scope="session")

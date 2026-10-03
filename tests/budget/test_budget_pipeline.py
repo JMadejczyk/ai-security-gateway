@@ -21,7 +21,7 @@ import yaml
 from budget_kit import ScriptedLLM, scope
 from gateway_testkit import Harness, bearer, chat, running_gateway
 
-from gateway.budget.model import ScopeKind, Spend
+from gateway.budget.model import ScopeKind
 from gateway.telemetry import REGISTRY, ReloadResult
 
 ALLOW = pytest.mark.control("budget", "allow")
@@ -89,11 +89,16 @@ async def test_daily_token_budget_blocks_before_the_upstream(tmp_path):
         token = await gateway.token("anna@demo")
         first = await ask(gateway, token, max_tokens=10)  # holds 5 + 10, settles at 19
         assert first.status_code == 200, first.text
-        assert await usage(gateway) == Spend(tokens=19)
+        settled = await usage(gateway)
+        # GPU time is the real wall time of that upstream call (a few ms, sometimes 0), and its
+        # cost is that time at qwen3:8b's $0.0005 per GPU second (tokens are free).
+        assert (settled.tokens, settled.tool_calls) == (19, 0)
+        assert settled.cost_nano_usd == settled.gpu_ms * 500
 
         second = await ask(gateway, token, max_tokens=10)  # 19 + 15 > 30
         assert refusal(second) == (403, "budget_exceeded", "budget exceeded: per_user.daily_tokens")
         assert llm.calls == 1
+        assert await usage(gateway) == settled  # a refused call is charged nothing, GPU included
         assert [v["reason_code"] for v in budget_verdicts(gateway)] == [
             "within_budget",
             "budget_exceeded",

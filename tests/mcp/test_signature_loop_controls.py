@@ -1,0 +1,89 @@
+"""``signatures`` and ``loop_detect`` on ``/mcp/{server}``, against the in-process upstreams."""
+
+import json
+
+from mcp_harness import MCPStack, connect, error_text
+
+ANNA = "anna@demo"
+
+
+def feed_path(stack: MCPStack):
+    return stack.gateway.policy_path.parent / "feeds" / "signatures.json"
+
+
+async def add_signature(stack: MCPStack, version: str, **entry: object) -> None:
+    path = feed_path(stack)
+    feed = json.loads(path.read_text())
+    feed["version"] = version
+    feed["signatures"].append({"source": "test", "severity": "high", "channels": ["mcp"], **entry})
+    path.write_text(json.dumps(feed))
+    assert (await stack.gateway.container.feed_store.refresh()).version == version
+
+
+async def test_hidden_instruction_in_a_fetched_page_is_withheld_and_taints(stack: MCPStack):
+    web = await connect(stack, ANNA, "web")
+    result = await web.call("fetch", url="https://example.com/outlook")
+    assert error_text(result) == "signature_match"
+    assert "attacker@example.com" not in json.dumps(result)
+    assert len(stack.log.of("fetch")) == 1  # it ran; its result was caught at post
+    entry = stack.gateway.audit_entries()[-1]
+    assert {"control": "signatures", "stage": "post", "decision": "block", "enforced": True,
+            "reason_code": "signature_match"} in entry["verdicts"]  # fmt: skip
+    assert entry["feed_version"] == stack.gateway.container.feed_store.version is not None
+    session = await stack.gateway.container.sessions.get(entry["session_id"])
+    assert session is not None
+    assert session.taint  # untrusted server: taints even though the result was blocked
+    assert session.risk >= 0.4  # signatures' risk_delta (other detectors may add theirs)
+
+
+async def test_a_sensitive_path_argument_is_blocked_before_the_upstream(stack: MCPStack):
+    reports = await connect(stack, ANNA, "reports")
+    blocked = await reports.call("write_report", name=".env", content="KEY=1")
+    assert error_text(blocked) == "signature_match"
+    allowed = await reports.call("write_report", name="q3.md", content="Q3 summary")
+    assert allowed["isError"] is False
+    assert [c.arguments["name"] for c in stack.log.of("write_report")] == ["q3.md"]
+
+
+async def test_sixth_identical_call_in_the_window_is_a_loop(stack: MCPStack):
+    reports = await connect(stack, ANNA, "reports")
+    results = [
+        await reports.call("write_report", name="q3.md", content="Q3 summary") for _ in range(6)
+    ]
+    assert [r["isError"] for r in results] == [False] * 5 + [True]
+    assert error_text(results[-1]) == "loop_detected"
+    assert len(stack.log.of("write_report")) == 5  # the 6th never reached the upstream
+    other = await reports.call("write_report", name="q4.md", content="Q4 summary")
+    assert other["isError"] is False  # different arguments: a different call
+    stack.gateway.clock.advance(61)
+    again = await reports.call("write_report", name="q3.md", content="Q3 summary")
+    assert again["isError"] is False  # the window moved on
+
+
+async def test_poisoned_tool_description_is_hidden_from_tools_list(stack: MCPStack):
+    web = await connect(stack, ANNA, "web")
+    assert await web.tools() == ["fetch"]
+    await add_signature(
+        stack,
+        "t.poison",
+        id="test.fetch-description",
+        pattern_type="mcp_tool",
+        pattern="(?i)fetch a public web page",
+    )
+    assert await web.tools() == []
+    text = stack.gateway.policy_path.read_text().replace(
+        "signatures:       { mode: block,", "signatures:       { mode: log_only,", 1
+    )
+    stack.gateway.policy_path.write_text(text)
+    assert stack.gateway.container.policy_store.reload().error is None
+    assert await web.tools() == ["fetch"]  # log_only: flagged and counted, not hidden
+
+
+async def test_suspicious_tool_name_is_blocked_at_call_time(stack: MCPStack):
+    reports = await connect(stack, ANNA, "reports")
+    await add_signature(
+        stack, "t.name", id="test.report-name", pattern_type="mcp_tool", pattern="^write_report$"
+    )
+    result = await reports.call("write_report", name="q3.md", content="Q3 summary")
+    assert error_text(result) == "signature_match"
+    assert stack.log.of("write_report") == []

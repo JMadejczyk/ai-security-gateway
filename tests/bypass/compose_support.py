@@ -20,6 +20,7 @@ _PLACEHOLDER_SECRETS = {
     "ACL_INTERNAL_KEY": "placeholder-internal-key",
     "POSTGRES_PASSWORD": "placeholder-postgres",
     "ACL_APP_DB_PASSWORD": "placeholder-app",
+    "ACL_REDIS_PASSWORD": "placeholder-redis",
 }
 
 

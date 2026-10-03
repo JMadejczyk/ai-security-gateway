@@ -12,10 +12,10 @@ from typing import Any, cast
 import pytest
 from compose_support import REPO_ROOT, ComposeConfig
 
-INTERNAL_NETWORKS = ("edge", "llm_backend", "mcp_backend", "mcp_untrusted")
+INTERNAL_NETWORKS = ("edge", "llm_backend", "mcp_backend", "mcp_untrusted", "state")
 
 EXPECTED_NETWORKS = {
-    "gateway": {"edge", "ops", "llm_backend", "mcp_backend", "mcp_untrusted"},
+    "gateway": {"edge", "ops", "llm_backend", "mcp_backend", "mcp_untrusted", "state"},
     "agent": {"edge"},
     "ollama": {"llm_backend"},
     "ollama-init": {"bootstrap"},
@@ -23,6 +23,7 @@ EXPECTED_NETWORKS = {
     "mcp-files": {"mcp_backend"},
     "postgres": {"mcp_backend"},
     "mcp-fetch": {"mcp_untrusted", "fetch_egress"},
+    "redis": {"state"},
 }
 
 AGENT_FORBIDDEN_ENV = re.compile(r"JWT|SECRET|INTERNAL_KEY|PASSWORD|TOKEN", re.IGNORECASE)
@@ -84,7 +85,8 @@ def test_operator_listener_binds_the_gateway_ops_address(compose_config: Compose
 
 
 @pytest.mark.parametrize(
-    "service", ["gateway", "agent", "ollama", "mcp-postgres", "mcp-files", "mcp-fetch", "postgres"]
+    "service",
+    ["gateway", "agent", "ollama", "mcp-postgres", "mcp-files", "mcp-fetch", "postgres", "redis"],
 )
 def test_no_service_escapes_docker_isolation(compose_config: ComposeConfig, service: str) -> None:
     spec = compose_config.service(service)
@@ -146,3 +148,36 @@ def test_built_images_use_pinned_base_images(compose_config: ComposeConfig) -> N
                 assert tag not in {None, "latest"}, f"{name}: {image} in {dockerfile}"
             if alias:
                 stages.add(alias)
+
+
+def test_state_network_joins_only_gateway_and_redis(compose_config: ComposeConfig) -> None:
+    members = {s for s in compose_config.services if "state" in compose_config.networks_of(s)}
+    assert members == {"gateway", "redis"}
+
+
+def test_redis_password_reaches_only_redis_and_gateway(compose_config: ComposeConfig) -> None:
+    holders = {
+        s
+        for s in compose_config.services
+        if "ACL_REDIS_PASSWORD" in compose_config.environment_of(s)
+    }
+    assert holders == {"gateway", "redis"}
+
+
+def test_redis_is_hardened_and_on_the_bsd_licensed_line(compose_config: ComposeConfig) -> None:
+    redis = compose_config.service("redis")
+    assert str(redis["image"]).startswith("redis:7.2.")  # 7.4+ is RSALv2/SSPL, 8.x adds AGPL
+    assert redis.get("read_only") is True
+    assert redis.get("cap_drop") == ["ALL"]
+    assert "no-new-privileges:true" in redis.get("security_opt", [])
+    assert redis.get("user") == "redis"
+    assert not redis.get("ports")
+    command = " ".join(cast(list[str], redis["command"]))
+    assert "requirepass" in command
+    assert "placeholder-redis" not in command  # the secret is read at runtime, not interpolated
+
+
+def test_gateway_uses_redis_for_budgets(compose_config: ComposeConfig) -> None:
+    environment = compose_config.environment_of("gateway")
+    assert environment["ACL_BUDGET_STORE"] == "redis"
+    assert environment["ACL_REDIS_URL"] == "redis://redis:6379/0"

@@ -18,7 +18,7 @@ provider: a channel is an `Adapter` plus an `Upstream`.
 import json
 import logging
 import time
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -27,8 +27,12 @@ from typing import Any, Final, Literal, cast
 
 from pydantic import Field
 
+from gateway.budget.ledger import BudgetLedger
+from gateway.budget.metering import charged_tokens
+from gateway.budget.model import BudgetedCall, BudgetExceededError, BudgetStoreUnavailableError
 from gateway.clock import Clock, utc_now
 from gateway.controls.registry import ControlRegistry
+from gateway.controls.scope import CallScope, call_scope
 from gateway.core.envelope import (
     CallRecord,
     Cooldown,
@@ -72,6 +76,7 @@ logger = logging.getLogger(__name__)
 alert_logger = logging.getLogger("gateway.alerts")
 
 AUTHZ: Final = "authz"
+BUDGET: Final = "budget"  # a pipeline seam, not a registered control: see _execute_metered
 # Controls whose detections mean untrusted content reached the agent's context.
 TAINTING_CONTROLS: Final = frozenset({"prompt_injection"})
 APPROVAL_ID_CHARS: Final = 24
@@ -148,10 +153,21 @@ class SessionGate:
 class DecisionRecorder:
     """Turns finished calls into audit entries and metrics, with bounded label values."""
 
-    def __init__(self, audit: AuditLogger, hmac_key: bytes, known_users: frozenset[str]) -> None:
+    def __init__(
+        self,
+        audit: AuditLogger,
+        hmac_key: bytes,
+        known_users: frozenset[str],
+        feed_version: Callable[[], str | None] = lambda: None,
+    ) -> None:
         self._audit = audit
         self._key = hmac_key
         self._known_users = known_users
+        self._feed_version = feed_version
+
+    def feed_version(self) -> str | None:
+        """Signature feed version in effect now, recorded with every audit entry."""
+        return self._feed_version()
 
     def digest(self, payload: object) -> str:
         return payload_hmac(self._key, payload)
@@ -201,6 +217,7 @@ class _Trace:
     call: CallRequest
     snapshot: PolicySnapshot
     started: float
+    feed_version: str | None = None  # signature feed in effect when the call was admitted
     claims: TokenClaims | None = None
     context: SessionContext | None = None
     steps: list[_Step] = field(default_factory=list[_Step])
@@ -280,7 +297,7 @@ def _throttles(steps: Sequence[_Step]) -> list[Throttle]:
 class Pipeline:
     """Runs one call through every step and returns what the agent gets."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 -- the collaborators of the pipeline, wired once at startup
         self,
         gate: SessionGate,
         channels: Mapping[Channel, ChannelRoute],
@@ -288,12 +305,14 @@ class Pipeline:
         recorder: DecisionRecorder,
         *,
         clock: Clock = utc_now,
+        budgets: BudgetLedger | None = None,
     ) -> None:
         self._gate = gate
         self._channels = channels
         self._controls = controls
         self._recorder = recorder
         self._clock = clock
+        self._budgets = budgets
         self._evaluator = PolicyEvaluator()
         self._throttler = Throttler()
 
@@ -310,7 +329,12 @@ class Pipeline:
     ) -> PipelineOutcome:
         """Run ``call``; ``route`` overrides the channel's registered route for this call only
         (the MCP proxy binds the adapter to the call's server and the upstream to its session)."""
-        trace = _Trace(call=call, snapshot=snapshot, started=time.perf_counter())
+        trace = _Trace(
+            call=call,
+            snapshot=snapshot,
+            started=time.perf_counter(),
+            feed_version=self._recorder.feed_version(),
+        )
         try:
             claims = trace.claims = self._gate.authenticate(call.token, snapshot)
             async with self._gate.session(claims, snapshot) as ctx:
@@ -330,7 +354,12 @@ class Pipeline:
     ) -> PipelineOutcome:
         """Audit and count a call an entry point refused before it reached `handle`
         (e.g. a body over ``max_request_bytes``): with identity if the bearer verifies."""
-        trace = _Trace(call=call, snapshot=snapshot, started=time.perf_counter())
+        trace = _Trace(
+            call=call,
+            snapshot=snapshot,
+            started=time.perf_counter(),
+            feed_version=self._recorder.feed_version(),
+        )
         try:
             trace.claims = self._gate.authenticate(call.token, snapshot)
         except RejectionError:
@@ -356,11 +385,12 @@ class Pipeline:
             route=route,
             now=self._clock(),
         )
-        prepared = await self._prepare(trace, call, interactions)
-        if isinstance(prepared, PipelineOutcome):
-            return prepared
-        payload, merged = prepared
-        return await self._execute(trace, call, payload, merged)
+        with call_scope(CallScope(snapshot=trace.snapshot, principal=call.principal)):
+            prepared = await self._prepare(trace, call, interactions)
+            if isinstance(prepared, PipelineOutcome):
+                return prepared
+            payload, merged = prepared
+            return await self._execute_metered(trace, call, payload, merged)
 
     def _normalize(
         self, trace: _Trace, ctx: SessionContext, route: ChannelRoute | None
@@ -421,6 +451,55 @@ class Pipeline:
                 record_throttled(self._recorder.agent_label(agent, snapshot))
                 raise
         return payload, merged
+
+    async def _execute_metered(
+        self, trace: _Trace, call: _Admitted, payload: object, merged: MergedVerdict
+    ) -> PipelineOutcome:
+        """The budget seam around steps 6-7 (SPEC "Budgets", `gateway.budget.ledger`).
+
+        Reserve right before dispatch: inside the session lock, after authorization, controls
+        and throttling, so nothing refused earlier holds budget. Settle in ``finally``, so
+        completion, upstream failure and cancellation all reconcile the hold. The outcome is a
+        ``budget`` verdict like any control's, so audit, metrics and merging see it the same way.
+        """
+        if self._budgets is None:
+            return await self._execute(trace, call, payload, merged)
+        snapshot, claims = trace.snapshot, call.claims
+        metered = BudgetedCall(
+            session_id=claims.session_id,
+            principal=claims.sub,
+            agent=claims.agent,
+            channel=trace.call.channel,
+            model=_model_label(trace.executed) if trace.call.channel is Channel.LLM else None,
+            payload=payload,
+            user_label=self._recorder.user_label(claims.sub, snapshot),
+            agent_label=self._recorder.agent_label(claims.agent, snapshot),
+        )
+        started = time.perf_counter()
+        try:
+            reservation = await self._budgets.reserve(metered, snapshot)
+        except (BudgetExceededError, BudgetStoreUnavailableError) as exc:
+            self._add_budget_verdict(trace, started, Decision.BLOCK, exc.reason_code, exc.message)
+            raise
+        self._add_budget_verdict(trace, started, Decision.ALLOW, "within_budget")
+        try:
+            return await self._execute(trace, call, reservation.payload, merged)
+        finally:
+            await self._budgets.settle(reservation, trace.upstream)
+
+    @staticmethod
+    def _add_budget_verdict(
+        trace: _Trace, started: float, decision: Decision, reason_code: str, reason: str = ""
+    ) -> None:
+        verdict = Verdict(
+            decision=decision,
+            control_id=BUDGET,
+            reason_code=reason_code,
+            reason=reason,
+            latency_ms=(time.perf_counter() - started) * 1000,
+        )
+        for step in trace.steps:
+            step.add(Stage.PRE, [verdict])
 
     async def _execute(
         self, trace: _Trace, call: _Admitted, payload: object, merged: MergedVerdict
@@ -698,7 +777,7 @@ class Pipeline:
         record_verdicts(trace.verdicts())
         if trace.upstream is not None and trace.upstream.usage is not None:
             usage = trace.upstream.usage
-            record_tokens(user, agent, _model_label(trace.executed), usage.total_tokens)
+            record_tokens(user, agent, _model_label(trace.executed), charged_tokens(usage))
 
         latency = AuditLatency(
             total=total * 1000,
@@ -720,6 +799,7 @@ class Pipeline:
             "reason_code": outcome.reason_code,
             "status": outcome.status_code,
             "policy_revision": snapshot.revision,
+            "feed_version": trace.feed_version,
             "latency_ms": latency,
             **identity,
         }

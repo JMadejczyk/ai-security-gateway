@@ -8,12 +8,16 @@ dependencies = [
     "fastapi>=0.142.2",
     "httpx>=0.28.1",
     "jsonschema>=4.26.0",
+    "presidio-analyzer>=2.2.364",
     "prometheus-client>=0.26.0",
     "pydantic>=2.13.5",
     "pydantic-settings>=2.15.0",
     "pyjwt>=2.15.1",
     "pyyaml>=6.0.3",
+    "redis>=8.1.0",
+    "regex>=2026.9.29",
     "sqlglot>=30.21.0",
+    "tldextract>=5.3.2",
     "uvicorn[standard]>=0.54.0",
     "watchfiles>=1.3.0",
 ]
@@ -27,6 +31,7 @@ packages = ["gateway"]
 
 [dependency-groups]
 dev = [
+    "fakeredis[lua]>=2.39.0",
     "mcp==2.3.0",
     "pyright>=1.1.414",
     "pytest>=9.1.1",
@@ -72,4 +77,5 @@ asyncio_default_fixture_loop_scope = "function"
 addopts = ["-ra", "--strict-markers"]
 markers = [
     "docker: needs the live docker compose stack (run with `make test-docker`)",
+    "redis: needs a real Redis (a throwaway docker container, or ACL_TEST_REDIS_URL); skips without",
 ]

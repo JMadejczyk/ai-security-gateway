@@ -13,7 +13,7 @@ import jwt
 import pytest
 from gateway_testkit import INTERNAL_KEY, bearer, running_gateway
 from mcp_harness import PROTOCOL, MCPClient, MCPStack, connect, connect_all, error_text
-from upstreams import INJECTION_PAGE, RoutingTransport, running_upstreams
+from upstreams import RoutingTransport, running_upstreams
 
 from gateway.sessions import SessionUpdate
 from gateway.telemetry import REGISTRY
@@ -211,7 +211,9 @@ async def test_trusted_upstream_gets_a_signed_principal_never_the_bearer(stack: 
 async def test_untrusted_upstream_gets_no_principal_assertion(stack: MCPStack):
     web = await connect(stack, ANNA, "web")
     result = await web.call("fetch", url="https://example.com/outlook")
-    assert result["content"][0]["text"] == INJECTION_PAGE
+    assert len(stack.log.of("fetch")) == 1
+    # The page's hidden injection is withheld by the signatures control (post).
+    assert error_text(result) == "signature_match"
     assert all("x-acl-principal" not in r.headers for r in stack.transport.sent("mcp-fetch"))
 
 
@@ -317,7 +319,9 @@ async def test_malformed_call_params_are_a_protocol_error(stack: MCPStack):
 async def test_pinned_schema_wins_over_the_advertised_one(stack: MCPStack, tmp_path):
     pins = tmp_path / "pins"
     pins.mkdir()
-    pinned = {"type": "object", "properties": {"sql": {"type": "string", "maxLength": 40}}}
+    # 50 fits COUNT_CUSTOMERS with sql_guard's forced " LIMIT 500" (the rewrite is validated
+    # against the pin too), not long_sql.
+    pinned = {"type": "object", "properties": {"sql": {"type": "string", "maxLength": 50}}}
     (pins / "sales_db.json").write_text(
         json.dumps({"tools": [{"name": "query", "inputSchema": pinned}]})
     )
@@ -357,8 +361,8 @@ async def test_each_downstream_session_has_its_own_upstream_session(stack: MCPSt
     anna, bartek = await connect(stack, ANNA, "sales_db"), await connect(stack, BARTEK, "sales_db")
     await anna.call("query", sql=COUNT_CUSTOMERS)
     await bartek.call("query", sql=COUNT_CUSTOMERS)
-    upstream_ids = {
-        r.headers.get("mcp-session-id") for r in stack.transport.sent("mcp-postgres", "tools/call")
+    upstream_ids = {  # sql_guard's explain calls run in short-lived sessions of their own
+        r.headers.get("mcp-session-id") for r in stack.transport.tool_calls("mcp-postgres", "query")
     }
     assert len(upstream_ids) == 2
     assert None not in upstream_ids
@@ -367,14 +371,20 @@ async def test_each_downstream_session_has_its_own_upstream_session(stack: MCPSt
 async def test_deleting_the_downstream_session_ends_the_upstream_one(stack: MCPStack):
     sales = await connect(stack, ANNA, "sales_db")
     await sales.call("query", sql=COUNT_CUSTOMERS)
-    [call] = stack.transport.sent("mcp-postgres", "tools/call")
+    [call] = stack.transport.tool_calls("mcp-postgres", "query")
     upstream_id = call.headers["mcp-session-id"]
 
+    def deletes() -> list:  # sql_guard's planner sessions end on their own; not this one
+        return [
+            r
+            for r in stack.transport.sent("mcp-postgres")
+            if r.method == "DELETE" and r.headers["mcp-session-id"] == upstream_id
+        ]
+
+    assert deletes() == []
     response = await stack.gateway.agent.delete(sales.path, headers=sales.headers())
     assert response.status_code == 204
-
-    [deleted] = [r for r in stack.transport.sent("mcp-postgres") if r.method == "DELETE"]
-    assert deleted.headers["mcp-session-id"] == upstream_id
+    assert len(deletes()) == 1
     assert (await sales.request("ping")).status_code == 404
     assert len(stack.gateway.container.mcp.registry) == 0
 

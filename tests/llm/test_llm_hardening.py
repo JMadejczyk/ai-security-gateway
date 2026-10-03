@@ -72,6 +72,8 @@ async def test_rewrite_to_an_unauthorized_model_is_blocked(gateway, upstream):
             return allow()
         return allow("rewritten", rewrite={**interaction.payload, "model": "llama3:70b"})
 
+    gateway.container.pipeline.controls.clear()  # scripted below, replacing the real controls
+
     gateway.container.pipeline.controls.register(Scripted(to_llama))
     response = await gateway.agent.post(
         CHAT, json=chat(), headers=bearer(await gateway.token("bartek@demo"))
@@ -87,6 +89,7 @@ async def test_rewrite_to_an_unauthorized_model_is_blocked(gateway, upstream):
 
 
 async def test_rewrite_into_an_invalid_request_is_blocked(gateway, upstream):
+    gateway.container.pipeline.controls.clear()  # scripted below, replacing the real controls
     gateway.container.pipeline.controls.register(
         Scripted(lambda i, s: allow(rewrite={"model": "qwen3:8b"}) if s is Stage.PRE else allow())
     )
@@ -102,6 +105,8 @@ async def test_authorized_rewrite_still_runs(gateway, upstream):
         if stage is Stage.POST:
             return allow()
         return allow(rewrite={**interaction.payload, "temperature": 0.0})
+
+    gateway.container.pipeline.controls.clear()  # scripted below, replacing the real controls
 
     gateway.container.pipeline.controls.register(Scripted(lower_temperature))
     response = await gateway.agent.post(
@@ -150,8 +155,11 @@ async def test_throttle_backoff_resets_after_a_compliant_window(gateway, upstrea
     await gateway.agent.post(CHAT, json=chat(), headers=bearer(token))
     await raise_risk(gateway, token, 0.6)
 
-    async def call() -> httpx.Response:
-        return await gateway.agent.post(CHAT, json=chat(), headers=bearer(token))
+    prompts = iter(range(100))
+
+    async def call() -> httpx.Response:  # distinct prompts: identical ones trip loop_detect
+        body = chat(messages=[{"role": "user", "content": f"step {next(prompts)}"}])
+        return await gateway.agent.post(CHAT, json=body, headers=bearer(token))
 
     assert (await call()).status_code == 200
     assert (await call()).headers["retry-after"] == "5"
@@ -230,6 +238,8 @@ async def test_a_crashing_control_logs_no_payload(gateway, upstream, caplog):
 
     def crash(interaction, stage):
         raise ValueError(f"cannot parse {interaction.payload['messages'][0]['content']}")
+
+    gateway.container.pipeline.controls.clear()  # scripted below, replacing the real controls
 
     gateway.container.pipeline.controls.register(Scripted(crash))
     token = await gateway.token("anna@demo")

@@ -5,6 +5,7 @@
 #   llm_backend   internal  gateway <-> ollama
 #   mcp_backend   internal  gateway <-> mcp-postgres, mcp-files, postgres
 #   mcp_untrusted internal  gateway <-> mcp-fetch
+#   state         internal  gateway <-> redis (budget counters)
 #   fetch_egress  external  mcp-fetch only: its outbound internet access
 #   bootstrap     external  ollama-init only (profile `init`), to pull models before lock-down
 #
@@ -38,6 +39,8 @@ networks:
     # gateway's default-route network and DNAT published ports to it instead of `ops`.
     # mcp-fetch reaches the internet through `fetch_egress`, a network nothing else joins.
     internal: true
+  state:
+    internal: true
   fetch_egress: {}
   bootstrap: {}
 
@@ -45,6 +48,7 @@ volumes:
   ollama_models: {}
   pgdata: {}
   reports: {}
+  redis_data: {}
 
 services:
   gateway:
@@ -63,6 +67,10 @@ services:
       ACL_OPERATOR_PORT: "9090"
       ACL_JWT_SECRET: ${ACL_JWT_SECRET:?set ACL_JWT_SECRET in .env}
       ACL_INTERNAL_KEY: ${ACL_INTERNAL_KEY:?set ACL_INTERNAL_KEY in .env}
+      # Budget counters (SPEC "Budgets"). Redis unreachable = budget-limited calls fail closed.
+      ACL_BUDGET_STORE: redis
+      ACL_REDIS_URL: redis://redis:6379/0
+      ACL_REDIS_PASSWORD: ${ACL_REDIS_PASSWORD:?set ACL_REDIS_PASSWORD in .env}
     volumes:
       - type: bind
         source: ./policy.yaml
@@ -85,6 +93,7 @@ services:
       llm_backend: {}
       mcp_backend: {}
       mcp_untrusted: {}
+      state: {}
     ports:
       # Host ports are overridable when 9090/8080 are taken on the developer machine.
       - "127.0.0.1:${ACL_OPERATOR_HOST_PORT:-9090}:9090"  # operator API
@@ -95,6 +104,34 @@ services:
       mcp-postgres: { condition: service_started }
       mcp-files: { condition: service_started }
       mcp-fetch: { condition: service_started }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+
+  # Budget counters. redis 7.2 is the last BSD-3 line (7.4+ is RSALv2/SSPL). The password
+  # reaches redis-server through a 0600 config file on tmpfs, never its command line. AOF on a
+  # volume keeps the day's counters across a Redis restart.
+  redis:
+    <<: *hardening
+    image: redis:7.2.16
+    user: redis
+    read_only: true
+    tmpfs: [/tmp]
+    environment:
+      ACL_REDIS_PASSWORD: ${ACL_REDIS_PASSWORD:?set ACL_REDIS_PASSWORD in .env}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        umask 077;
+        printf 'requirepass %s\n' "$$ACL_REDIS_PASSWORD" > /tmp/redis.conf;
+        exec redis-server /tmp/redis.conf --dir /data --appendonly yes --save ''
+    volumes:
+      - redis_data:/data
+    networks: [state]
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$ACL_REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
   ollama:

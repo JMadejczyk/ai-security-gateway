@@ -80,6 +80,7 @@ limits:
   max_request_bytes: 1048576
   max_response_bytes: 4194304
   upstream_timeout_s: 120
+  default_max_tokens: 4096        # completion cap injected when an LLM request names none
 
 controls:
   model_allowlist:  { mode: block }
@@ -88,8 +89,12 @@ controls:
   secrets:          { mode: block }
   prompt_injection: { mode: block, threshold: 0.85, judge_band: [0.5, 0.85], risk_delta: 0.6 }
   sql_guard:        { mode: block, max_cost: 10000, force_limit: 500, timeout_ms: 3000 }
-  signatures:       { mode: block, feed: http://feed:9000/signatures.json, refresh_s: 30 }
+  signatures:       { mode: block, feed: feeds/signatures.json, refresh_s: 30 }  # relative to this file, or an http(s) URL
   loop_detect:      { mode: block, max_repeats: 5, window_s: 60 }
+
+pricing:                   # USD; local models are priced by GPU wall-time estimate
+  "qwen3:8b": { prompt_per_1k: 0.0, completion_per_1k: 0.0, gpu_second: 0.0005 }
+  # A model without an entry costs 0; its tokens and GPU time still count.
 
 budgets:
   per_user:    { daily_tokens: 200000, daily_cost_usd: 2.0 }

@@ -18,7 +18,7 @@ reason code; a held call also carries its ``approval_id``.
 
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Any, Final
@@ -47,6 +47,9 @@ logger = logging.getLogger(__name__)
 
 SERVER_VERSION: Final = "0.1.0"
 _JSON_MEDIA: Final = frozenset({"application/json", "application/*", "*/*"})
+
+type ToolScreen = Callable[[Mapping[str, str | None], PolicySnapshot], set[str]]
+"""Given advertised tools (name -> description), the names to hide from ``tools/list``."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,8 +92,10 @@ class MCPProxy:
         pins: PinnedSchemas,
         allowed_origins: frozenset[str] = frozenset(),
         clock: Clock = utc_now,
+        tool_screen: ToolScreen | None = None,
     ) -> None:
         self._gate = gate
+        self._tool_screen = tool_screen
         self._pipeline = pipeline
         self._registry = registry
         self._pins = pins
@@ -204,8 +209,9 @@ class MCPProxy:
         snapshot: PolicySnapshot,
     ) -> MCPReply:
         """Only tools that are mapped, within the agent's ``max_actions`` and not currently
-        removed by session restrictions; none while tools are frozen. Listing never starts a
-        session timer. Resource checks wait for ``tools/call``."""
+        removed by session restrictions and not flagged by the tool screen (``signatures``);
+        none while tools are frozen. Listing never starts a session timer. Resource checks
+        wait for ``tools/call``."""
         async with self._gate.admit(request.token, snapshot) as (claims, ctx):
             upstream = await self._registry.upstream(session, snapshot)
             try:
@@ -220,10 +226,13 @@ class MCPProxy:
             usable = frozenset(agent.max_actions) - removed if agent else frozenset[Action]()
             if evaluator.tools_frozen(snapshot, ctx, now):  # every tool call would be refused
                 usable = frozenset[Action]()
+            hidden = self._screened(tools, snapshot)
             listed = [
                 tool.as_wire()
                 for tool in tools
-                if (mapped := config.tools.get(tool.name)) is not None and mapped.action in usable
+                if (mapped := config.tools.get(tool.name)) is not None
+                and mapped.action in usable
+                and tool.name not in hidden
             ]
         return MCPReply(HTTPStatus.OK, wire.result(message.id, {"tools": listed}))
 
@@ -261,7 +270,10 @@ class MCPProxy:
         if outcome.status_code == HTTPStatus.UNAUTHORIZED:  # token or session gone mid-call
             await self._end_if_session_over(outcome.reason_code, outcome.session_id)
             return refusal_reply(outcome.status_code, outcome.reason_code, outcome.message)
-        if outcome.status_code == HTTPStatus.TOO_MANY_REQUESTS:  # throttled: retry later
+        if outcome.status_code in {  # throttled, or the budget store is down: retry later
+            HTTPStatus.TOO_MANY_REQUESTS,
+            HTTPStatus.SERVICE_UNAVAILABLE,
+        }:
             return refusal_reply(
                 outcome.status_code,
                 outcome.reason_code,
@@ -269,6 +281,15 @@ class MCPProxy:
                 retry_after_s=outcome.retry_after_s,
             )
         return MCPReply(HTTPStatus.OK, wire.result(message.id, _tool_result(outcome)))
+
+    def _screened(self, tools: list[wire.ToolDefinition], snapshot: PolicySnapshot) -> set[str]:
+        if self._tool_screen is None:
+            return set()
+        advertised: dict[str, str | None] = {}
+        for tool in tools:
+            description = (tool.model_extra or {}).get("description")
+            advertised[tool.name] = description if isinstance(description, str) else None
+        return self._tool_screen(advertised, snapshot)
 
     # -------------------------------------------------------------------- admission
 

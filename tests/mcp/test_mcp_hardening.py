@@ -32,6 +32,7 @@ class RewriteSql(Control):
 
 
 async def test_rewrite_to_a_forbidden_table_is_blocked(stack: MCPStack):
+    stack.gateway.container.pipeline.controls.clear()  # scripted below, replacing the real controls
     stack.gateway.container.pipeline.controls.register(
         RewriteSql("SELECT SUM(amount) FROM sales.payments")
     )
@@ -48,6 +49,7 @@ async def test_rewrite_to_a_forbidden_table_is_blocked(stack: MCPStack):
 
 
 async def test_rewrite_within_the_grant_still_runs(stack: MCPStack):
+    stack.gateway.container.pipeline.controls.clear()  # scripted below, replacing the real controls
     stack.gateway.container.pipeline.controls.register(
         RewriteSql("SELECT COUNT(*) FROM sales.orders")
     )

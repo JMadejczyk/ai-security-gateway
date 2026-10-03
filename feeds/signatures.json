@@ -1,4 +1,213 @@
 {
-  "version": "0",
-  "signatures": []
+  "version": "2026-10-03.1",
+  "signatures": [
+    {
+      "id": "inj.ignore-previous",
+      "source": "OWASP LLM01 prompt injection (own wording)",
+      "pattern_type": "regex",
+      "pattern": "(?i)\\b(?:ignore|disregard|forget)\\s+(?:all\\s+|any\\s+|the\\s+)?(?:previous|prior|above|earlier|preceding)\\s+(?:instructions|prompts|rules|directions)",
+      "severity": "high",
+      "channels": ["llm", "mcp"]
+    },
+    {
+      "id": "inj.override-system-prompt",
+      "source": "OWASP LLM01 prompt injection (own wording)",
+      "pattern_type": "regex",
+      "pattern": "(?i)\\b(?:disregard|override|bypass|ignore)\\s+(?:the\\s+|your\\s+)?system\\s+(?:prompt|message|instructions)",
+      "severity": "high",
+      "channels": ["llm", "mcp"]
+    },
+    {
+      "id": "inj.reveal-system-prompt",
+      "source": "OWASP LLM07 system prompt leakage (own wording)",
+      "pattern_type": "regex",
+      "pattern": "(?i)\\b(?:reveal|print|repeat|show|output)\\s+(?:me\\s+)?(?:your|the)\\s+(?:system\\s+prompt|hidden\\s+instructions|initial\\s+instructions)",
+      "severity": "medium",
+      "channels": ["llm", "mcp"]
+    },
+    {
+      "id": "inj.new-instructions-header",
+      "source": "OWASP LLM01 indirect injection (own wording)",
+      "pattern_type": "regex",
+      "pattern": "(?i)(?:^|\\n)\\s*(?:#{1,3}\\s*)?(?:new|updated|real)\\s+(?:system\\s+)?instructions\\s*:",
+      "severity": "medium",
+      "channels": ["llm", "mcp"]
+    },
+    {
+      "id": "jb.dan",
+      "source": "public role-play jailbreak family (own wording)",
+      "pattern_type": "regex",
+      "pattern": "(?i)\\b(?:you\\s+are\\s+now\\s+DAN|DAN\\s+mode|do\\s+anything\\s+now\\s+mode)\\b",
+      "severity": "high",
+      "channels": ["llm"]
+    },
+    {
+      "id": "jb.unrestricted-mode",
+      "source": "public role-play jailbreak family (own wording)",
+      "pattern_type": "regex",
+      "pattern": "(?i)\\b(?:developer|god|jailbreak|unrestricted)\\s+mode\\s+(?:is\\s+)?(?:enabled|activated|on)\\b",
+      "severity": "high",
+      "channels": ["llm"]
+    },
+    {
+      "id": "jb.no-rules-roleplay",
+      "source": "public role-play jailbreak family (own wording)",
+      "pattern_type": "regex",
+      "pattern": "(?i)\\b(?:pretend|act\\s+as\\s+if|imagine)\\s+(?:that\\s+)?you\\s+(?:have|had)\\s+no\\s+(?:rules|restrictions|guidelines|filters)",
+      "severity": "medium",
+      "channels": ["llm"]
+    },
+    {
+      "id": "hidden.instruction-tag",
+      "source": "documented MCP tool poisoning incidents (own wording)",
+      "pattern_type": "regex",
+      "pattern": "(?i)<\\s*/?\\s*(?:IMPORTANT|SYSTEM|INSTRUCTIONS?)\\s*>",
+      "severity": "high",
+      "channels": ["llm", "mcp"]
+    },
+    {
+      "id": "hidden.conceal-from-user",
+      "source": "documented MCP tool poisoning incidents (own wording)",
+      "pattern_type": "regex",
+      "pattern": "(?i)\\b(?:do\\s+not|don't|never)\\s+(?:tell|inform|alert|mention\\s+(?:this\\s+)?to|reveal\\s+(?:this\\s+)?to)\\s+the\\s+user\\b",
+      "severity": "high",
+      "channels": ["llm", "mcp"]
+    },
+    {
+      "id": "hidden.read-secrets-before-tool",
+      "source": "documented MCP tool poisoning incidents (own wording)",
+      "pattern_type": "regex",
+      "pattern": "(?i)before\\s+(?:using|calling|running)\\s+(?:this|the|any)\\s+tool[^.\\n]{0,120}?(?:read|cat|open|include|attach)[^.\\n]{0,80}?(?:~/\\.ssh|id_rsa|\\.env|mcp\\.json|credentials)",
+      "severity": "critical",
+      "channels": ["llm", "mcp"]
+    },
+    {
+      "id": "exfil.markdown-image-query",
+      "source": "OWASP LLM02 data exfiltration via rendered images (own wording)",
+      "pattern_type": "regex",
+      "pattern": "!\\[[^\\]\\n]{0,200}\\]\\(\\s*https?://[^\\s)?]{1,256}\\?[^\\s)]{0,1024}=[^\\s)]{0,1024}\\)",
+      "severity": "high",
+      "channels": ["llm", "mcp"]
+    },
+    {
+      "id": "exfil.send-contents-of",
+      "source": "OWASP LLM02 sensitive information disclosure (own wording)",
+      "pattern_type": "regex",
+      "pattern": "(?i)\\b(?:send|post|upload|forward|email|exfiltrate)\\s+(?:the\\s+)?(?:full\\s+|entire\\s+|whole\\s+)?(?:contents?|data|text)\\s+of\\b",
+      "severity": "medium",
+      "channels": ["llm", "mcp"]
+    },
+    {
+      "id": "exfil.forward-everything",
+      "source": "OWASP LLM06 excessive agency (own wording)",
+      "pattern_type": "regex",
+      "pattern": "(?i)\\b(?:email|send|forward|upload)\\s+(?:every|all)\\s+(?:the\\s+)?(?:reports?|files?|documents?|records?|emails?|messages?)\\s+to\\b",
+      "severity": "high",
+      "channels": ["llm", "mcp"]
+    },
+    {
+      "id": "tool.desc-hidden-directive",
+      "source": "documented MCP tool poisoning incidents (own wording)",
+      "pattern_type": "mcp_tool",
+      "pattern": "(?i)<\\s*IMPORTANT\\s*>|\\b(?:do\\s+not|don't|never)\\s+(?:mention|tell|reveal|show)\\b[^.\\n]{0,60}?\\b(?:user|human)\\b",
+      "severity": "critical",
+      "channels": ["mcp", "llm"]
+    },
+    {
+      "id": "tool.desc-smuggle-parameter",
+      "source": "documented MCP tool poisoning incidents (own wording)",
+      "pattern_type": "mcp_tool",
+      "pattern": "(?i)\\b(?:pass|put|include|send)\\s+(?:its|the|their)\\s+contents?\\s+(?:as|in|into)\\s+(?:the\\s+)?['\"`]?\\w{1,64}['\"`]?\\s+(?:parameter|argument|field)",
+      "severity": "high",
+      "channels": ["mcp", "llm"]
+    },
+    {
+      "id": "tool.name-shell-exec",
+      "source": "suspicious MCP tool names (own list)",
+      "pattern_type": "mcp_tool",
+      "pattern": "(?i)^(?:exec|execute|run)_?(?:shell|command|cmd|bash|code)$",
+      "severity": "high",
+      "channels": ["mcp", "llm"]
+    },
+    {
+      "id": "tool.name-exfil-secrets",
+      "source": "suspicious MCP tool names (own list)",
+      "pattern_type": "mcp_tool",
+      "pattern": "(?i)^(?:send|upload|export|exfil\\w{0,16}|dump)_?\\w{0,32}(?:secrets?|credentials?|keys?|tokens?|passwords?)$",
+      "severity": "high",
+      "channels": ["mcp", "llm"]
+    },
+    {
+      "id": "tool.name-policy-override",
+      "source": "suspicious MCP tool names (own list)",
+      "pattern_type": "mcp_tool",
+      "pattern": "(?i)(?:ignore|override|bypass|disable)_?(?:instructions|policy|guard|guardrails|safety|security)",
+      "severity": "high",
+      "channels": ["mcp", "llm"]
+    },
+    {
+      "id": "path.ssh-home",
+      "source": "sensitive paths (own list)",
+      "pattern_type": "path_glob",
+      "pattern": "~/.ssh/**",
+      "severity": "critical",
+      "channels": ["mcp"]
+    },
+    {
+      "id": "path.ssh-any",
+      "source": "sensitive paths (own list)",
+      "pattern_type": "path_glob",
+      "pattern": "**/.ssh/**",
+      "severity": "critical",
+      "channels": ["mcp"]
+    },
+    {
+      "id": "path.private-key",
+      "source": "sensitive paths (own list)",
+      "pattern_type": "path_glob",
+      "pattern": "**id_rsa*",
+      "severity": "critical",
+      "channels": ["mcp"]
+    },
+    {
+      "id": "path.pem",
+      "source": "sensitive paths (own list)",
+      "pattern_type": "path_glob",
+      "pattern": "**.pem",
+      "severity": "high",
+      "channels": ["mcp"]
+    },
+    {
+      "id": "path.dotenv",
+      "source": "sensitive paths (own list)",
+      "pattern_type": "path_glob",
+      "pattern": "**/.env*",
+      "severity": "high",
+      "channels": ["mcp"]
+    },
+    {
+      "id": "path.dotenv-bare",
+      "source": "sensitive paths (own list)",
+      "pattern_type": "path_glob",
+      "pattern": ".env*",
+      "severity": "high",
+      "channels": ["mcp"]
+    },
+    {
+      "id": "path.etc-shadow",
+      "source": "sensitive paths (own list)",
+      "pattern_type": "path_glob",
+      "pattern": "**/etc/shadow",
+      "severity": "critical",
+      "channels": ["mcp"]
+    },
+    {
+      "id": "path.cloud-credentials",
+      "source": "sensitive paths (own list)",
+      "pattern_type": "path_glob",
+      "pattern": "**/.aws/credentials",
+      "severity": "high",
+      "channels": ["mcp"]
+    }
+  ]
 }

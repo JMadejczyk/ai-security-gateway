@@ -336,18 +336,43 @@ class DemoTokenIssuer:
         )
 
 
-def mint_principal_assertion(
+class ExecutionLimits(FrozenModel):
+    """The ``limits`` claim of an ``X-ACL-Principal`` assertion for a SQL upstream.
+
+    Derived from the policy (``controls.sql_guard``), signed with the principal, so the server
+    applies them whatever the agent's query says (SPEC "Row-level filtering").
+    """
+
+    stmt_timeout_ms: StrictInt = Field(gt=0)  # SET LOCAL statement_timeout / lock_timeout
+    max_rows: StrictInt = Field(gt=0)  # more rows than this and the call is refused
+    max_result_bytes: StrictInt = Field(gt=0)  # cap on the serialized result
+
+
+def mint_principal_assertion(  # noqa: PLR0913 -- keyword-only claims of one signed assertion
     key: bytes,
     *,
     audience: str,
     principal: str,
     clock: Clock = utc_now,
     ttl_s: int = PRINCIPAL_ASSERTION_TTL_S,
+    limits: ExecutionLimits | None = None,
 ) -> str:
-    """``X-ACL-Principal`` for a trusted upstream: HS256 signed with ``ACL_INTERNAL_KEY``."""
+    """``X-ACL-Principal`` for a trusted upstream: HS256 signed with ``ACL_INTERNAL_KEY``.
+
+    ``limits`` is added as the ``limits`` claim for SQL upstreams, which refuse to run a
+    statement without it.
+    """
     if not 0 < ttl_s <= PRINCIPAL_ASSERTION_TTL_S:
         msg = f"principal assertions live at most {PRINCIPAL_ASSERTION_TTL_S} s"
         raise ValueError(msg)
     now = int(clock().timestamp())
-    claims = {"iss": ISSUER, "aud": audience, "sub": principal, "iat": now, "exp": now + ttl_s}
+    claims: dict[str, Any] = {
+        "iss": ISSUER,
+        "aud": audience,
+        "sub": principal,
+        "iat": now,
+        "exp": now + ttl_s,
+    }
+    if limits is not None:
+        claims["limits"] = limits.model_dump()
     return _sign(claims, key)

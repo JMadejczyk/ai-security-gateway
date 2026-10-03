@@ -4,7 +4,7 @@ import json
 
 import httpx
 import pytest
-from gateway_testkit import bearer, chat, claims, completion, sign
+from gateway_testkit import bearer, chat, claims, completion, echo_completion, sign
 
 from gateway.telemetry import REGISTRY
 
@@ -37,9 +37,7 @@ def sse_chunks(text: str) -> tuple[list[dict], str]:
 
 @pytest.fixture
 def upstream_ok(llm_upstream):
-    return llm_upstream.post("/chat/completions").mock(
-        return_value=httpx.Response(200, json=completion())
-    )
+    return llm_upstream.post("/chat/completions").mock(side_effect=echo_completion)
 
 
 async def test_anna_can_generate(gateway, upstream_ok):
@@ -300,7 +298,7 @@ async def test_audit_entry_has_revision_and_no_content(gateway, upstream_ok):
     revision = gateway.container.policy_store.current.revision
     assert allowed["policy_revision"] == denied["policy_revision"] == revision
     assert (allowed["decision"], allowed["status"], allowed["resource"]) == (
-        "allow",
+        "redact",  # the pii control masked the PESEL before forwarding
         200,
         "model:qwen3:8b",
     )
@@ -309,7 +307,8 @@ async def test_audit_entry_has_revision_and_no_content(gateway, upstream_ok):
         "databot",
         "llm",
     )
-    assert allowed["feed_version"] is None
+    assert allowed["feed_version"] is not None
+    assert allowed["feed_version"] == gateway.container.feed_store.version
     assert len(allowed["payload_hmac"]) == 64
     assert allowed["latency_ms"]["upstream"] is not None
     assert "generate:model:qwen3:8b" in allowed["effective_scope"]
@@ -323,7 +322,7 @@ async def test_audit_entry_has_revision_and_no_content(gateway, upstream_ok):
             "reason_code": "outside_principal_scope",
         }
     ]
-    assert denied["risk"] == pytest.approx(0.1)  # authz deny adds its risk_delta
+    assert denied["risk"] == pytest.approx(0.2)  # pii (0.1, first call) + authz deny (0.1)
     raw = gateway.audit.getvalue()
     for leaked in ("44051401359", "merger", "messages", "There are 40 customers"):
         assert leaked not in raw
@@ -394,4 +393,5 @@ async def test_healthz(gateway):
     assert response.json() == {
         "status": "ok",
         "policy_revision": gateway.container.policy_store.current.revision,
+        "budget_store": "memory",  # the test kit's store; Redis reports up/down
     }

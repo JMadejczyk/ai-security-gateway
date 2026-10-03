@@ -2,7 +2,7 @@
 
 import httpx
 import pytest
-from gateway_testkit import bearer, chat, completion
+from gateway_testkit import bearer, chat, echo_completion
 
 CHAT = "/v1/chat/completions"
 GRANT_LLAMA = (
@@ -13,9 +13,7 @@ GRANT_LLAMA = (
 
 @pytest.fixture
 def upstream(llm_upstream):
-    return llm_upstream.post("/chat/completions").mock(
-        return_value=httpx.Response(200, json=completion(model="llama3:70b"))
-    )
+    return llm_upstream.post("/chat/completions").mock(side_effect=echo_completion)
 
 
 def edit(gateway, old: str, new: str) -> None:

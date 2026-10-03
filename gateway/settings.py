@@ -5,7 +5,7 @@ key refuses to start instead of issuing forgeable tokens.
 """
 
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import AfterValidator, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     # carrying an Origin header is refused (MCP transport security, DNS rebinding).
     mcp_allowed_origins: tuple[str, ...] = ()
     policy_watch: bool = True  # reload policy.yaml on change (POST /admin/reload always works)
+    # Budget counters. `redis` is the only production store: when it is unreachable every
+    # budget-limited call fails closed (503). `memory` (one process, lost on restart) is for
+    # tests and local development and is only ever used when chosen explicitly.
+    budget_store: Literal["redis", "memory"] = "redis"
+    redis_url: str = "redis://127.0.0.1:6379/0"
+    redis_password: SecretStr | None = None  # `requirepass` of the Redis on the `state` network
     log_level: str = "info"
 
     @property

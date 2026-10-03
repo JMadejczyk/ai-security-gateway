@@ -1,7 +1,7 @@
 """The control extension point: verdicts merge, rewrite, redact, log_only, fail closed, taint.
 
-Real controls arrive in stages 5-10; these scripted stand-ins prove the pipeline seams they
-will plug into, through the HTTP app.
+Scripted stand-ins (replacing the real controls for each test) prove the pipeline seams the
+real controls plug into, through the HTTP app.
 """
 
 import json
@@ -48,6 +48,13 @@ class ScriptedSecrets(ScriptedPii):
 class ScriptedInjection(ScriptedPii):
     id: ClassVar[str] = "prompt_injection"
     kind: ClassVar[ControlKind] = ControlKind.SEMANTIC
+
+
+@pytest.fixture(autouse=True)
+def scripted_controls_only(request):
+    """These tests script every control themselves: start from an empty registry."""
+    if "gateway" in request.fixturenames:
+        request.getfixturevalue("gateway").container.pipeline.controls.clear()
 
 
 @pytest.fixture

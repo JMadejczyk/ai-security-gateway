@@ -24,6 +24,7 @@ from gateway.settings import Settings
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ROOT_POLICY = REPO_ROOT / "policy.yaml"
+FEEDS = REPO_ROOT / "feeds"  # policy.yaml names its signature feed relative to itself
 IDENTITIES = REPO_ROOT / "demo" / "identities.yaml"
 # 64+ bytes, so the identity suite's HS512 probes do not trip PyJWT key-length warnings.
 JWT_SECRET = "test-jwt-secret-" + "0123456789abcdef" * 4
@@ -53,6 +54,7 @@ def make_settings(policy_path: Path = ROOT_POLICY, **overrides: Any) -> Settings
         "identities_path": IDENTITIES,
         "policy_watch": False,
         "audit_path": None,
+        "budget_store": "memory",  # tests/budget/ runs the Redis store's contract separately
     }
     values.update(overrides)
     return Settings(**values)
@@ -128,6 +130,12 @@ def completion(
     }
 
 
+def echo_completion(request: httpx.Request) -> httpx.Response:
+    """A respx side effect: an answer from the model the request named (``model_allowlist``
+    blocks an answer from any other model)."""
+    return httpx.Response(200, json=completion(model=json.loads(request.content)["model"]))
+
+
 @dataclass
 class Harness:
     container: GatewayContainer
@@ -153,6 +161,7 @@ async def running_gateway(
     """``transport`` carries every upstream call (LLM and MCP) when given."""
     policy_path = tmp_path / "policy.yaml"
     shutil.copy(ROOT_POLICY, policy_path)
+    shutil.copytree(FEEDS, tmp_path / FEEDS.name, dirs_exist_ok=True)
     clock = MutableClock()
     audit = io.StringIO()
     settings.setdefault("pins_dir", tmp_path / "pins")

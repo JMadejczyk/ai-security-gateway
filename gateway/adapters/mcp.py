@@ -132,6 +132,7 @@ class GenericMCPAdapter(Adapter):
                 resource=resource,
                 payload=payload,
                 context=ctx,
+                server=self._server,
             )
             for resource in self.resources(tool, arguments)
         ]

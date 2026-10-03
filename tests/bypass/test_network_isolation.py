@@ -26,6 +26,7 @@ PROTECTED_PORTS = {
     "mcp-files": 8000,
     "mcp-fetch": 8000,
     "postgres": 5432,
+    "redis": 6379,
 }
 
 StackAddresses = dict[str, dict[str, str]]
@@ -159,3 +160,16 @@ def test_fetch_tool_refuses_non_web_ports(
     result = stack_probe.call_tool("gateway", _fetch_url(addresses), "fetch", {"url": url})
     assert result.is_error
     assert "port 80 or 443" in result.text
+
+
+@pytest.mark.parametrize("service", ["agent", "mcp-fetch"])
+def test_redis_is_unreachable_by_name(stack_probe: StackProbe, service: str) -> None:
+    """By address is covered above; Docker DNS must not even resolve it outside `state`."""
+    result = stack_probe.from_service(service, ["redis:6379"])["redis:6379"]
+    assert not result.connected, result
+
+
+def test_gateway_reaches_redis_by_name(stack_probe: StackProbe) -> None:
+    """Positive control for the test above."""
+    result = stack_probe.from_service("gateway", ["redis:6379"])["redis:6379"]
+    assert result.connected, result

@@ -44,6 +44,10 @@ class ControlRegistry:
         self._controls.append(control)
         self._controls.sort(key=lambda c: c.kind is not ControlKind.DETERMINISTIC)  # stable
 
+    def clear(self) -> None:
+        """Drop every control, e.g. for a test that scripts the whole control set itself."""
+        self._controls.clear()
+
     def for_stage(self, stage: Stage, channel: Channel) -> tuple[Control, ...]:
         return tuple(
             control

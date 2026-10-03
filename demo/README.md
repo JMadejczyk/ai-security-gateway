@@ -38,6 +38,7 @@ flowchart LR
     gw8080 -- mcp_backend --> mcppg[mcp-postgres] --> postgres
     gw8080 -- mcp_backend --> mcpfiles[mcp-files]
     gw8080 -- mcp_untrusted --> mcpfetch[mcp-fetch] -- fetch_egress --> internet((internet))
+    gw8080 -- state --> redis[(redis)]
 ```
 
 | Network | Internal | Members |
@@ -47,6 +48,7 @@ flowchart LR
 | `llm_backend` | yes | gateway, ollama |
 | `mcp_backend` | yes | gateway, mcp-postgres, mcp-files, postgres |
 | `mcp_untrusted` | yes | gateway, mcp-fetch |
+| `state` | yes | gateway, redis |
 | `fetch_egress` | no | mcp-fetch only |
 | `bootstrap` | no | ollama-init only (profile `init`) |
 
@@ -74,6 +76,21 @@ pytest tests/bypass -m "not docker"         # static, needs only the docker CLI
 ACL_DOCKER_TESTS=1 pytest tests/bypass      # also the live probes (stack must be up)
 ```
 
+## Budget counters (`redis`)
+
+The gateway keeps budget counters (SPEC "Budgets") in `redis:7.2.16`, the last BSD-3 Redis
+line. Redis sits on `state` alone with the gateway, publishes no port and requires the
+password `ACL_REDIS_PASSWORD`, which only `redis` and `gateway` receive. The password reaches
+`redis-server` through a `0600` config file on tmpfs, never its command line. The root
+filesystem is read-only, and AOF on the `redis_data` volume keeps the day's counters across a
+Redis restart.
+
+If Redis is unreachable, every call a budget limits is refused with `503
+budget_store_unavailable` (fail closed). `GET /healthz` still answers 200, with `"status":
+"degraded"` and `"budget_store": "down"`, because the gateway is still the process serving
+those refusals. Outside compose, `ACL_BUDGET_STORE=memory` keeps counters in the gateway
+process for local development. The gateway never falls back to it by itself.
+
 ## Identities (`identities.yaml`)
 
 ```yaml
@@ -100,11 +117,20 @@ It applies `sql/01_schema.sql` and `sql/02_seed.sql`:
 
 - `sales_owner` owns everything and cannot log in. `acl_app` is the role mcp-postgres connects
   as: not the owner, no `SUPERUSER`, no `BYPASSRLS`, `SELECT` only.
+- `acl_app` cannot execute `set_config`. The only way to set `app.user_id` is
+  `acl.set_principal(text)`, a `SECURITY DEFINER` function owned by the `NOLOGIN` role
+  `acl_definer`, which refuses a second call in the same transaction. mcp-postgres calls it
+  first, so a statement can change neither the principal nor any other setting.
 - `sales.customers`, `sales.orders` and `sales.payments` have `ENABLE` + `FORCE ROW LEVEL
   SECURITY`. Which customers you see depends on `current_setting('app.user_id', true)`, matched
   against `acl.region_access`. Orders and payments follow the customers you can see. An unset
   user sees no rows.
 - `acl.region_access` lives outside `sales`, so a `read:db:sales.*` grant never covers it.
+- 50 customers, 1000 orders (20 per customer), 750 payments; the seed ends with `ANALYZE`, so
+  planner estimates are stable. Planner costs (`sql_guard`, `max_cost: 10000`), as anna:
+  `SELECT COUNT(*) FROM sales.customers` 2.88; `SELECT * FROM sales.orders` (capped at 500
+  rows) 22.38; `customers CROSS JOIN orders CROSS JOIN payments` with `COUNT(*)` 70495.20,
+  refused (demo step 4).
 
 To re-seed: `docker compose down -v`, or remove the `pgdata` volume.
 
@@ -116,7 +142,7 @@ called `MCPServer`. Each one serves streamable HTTP on `0.0.0.0:8000/mcp`, and t
 
 | Service | Tool | Notes |
 | --- | --- | --- |
-| `mcp-postgres` | `query(sql)` | Verifies `X-ACL-Principal`, then runs the statement in one read-only transaction that starts with `set_config('app.user_id', principal, true)`. Exactly one statement runs (extended protocol). Without a valid principal, nothing runs. |
+| `mcp-postgres` | `query(sql)`, `explain(sql)` | Verifies `X-ACL-Principal` and its `limits`, checks the statement is one plain `SELECT`, then runs it in one read-only transaction that starts with `acl.set_principal(principal)` and `SET LOCAL statement_timeout` / `lock_timeout`. `query` runs exactly that statement through a server-side cursor (extended protocol: one statement), fetches at most `max_rows + 1` rows and refuses more rows or more than `max_result_bytes`. `explain` returns `EXPLAIN (FORMAT JSON)`'s top-level `Total Cost` without running the statement; it is called only by the gateway's `sql_guard` and is absent from the operator mapping, so agents never reach it. Without a valid principal and limits, nothing runs. |
 | `mcp-files` | `write_report(name, content)` | Plain file names only. Creates files only (O_EXCL, so it never overwrites or follows a symlink). Writes under the `reports` volume at `/data/reports`. |
 | `mcp-fetch` | `fetch(url)` | http(s) GET on port 80/443 only, with a 10 s timeout and a 256 KiB cap. It resolves the host itself and refuses the call if any answer is not a public address (loopback, private, CGNAT, link-local/metadata, ULA, multicast, and IPv4-mapped/6to4 forms of those). It then connects to the validated IP, keeping the original Host header and TLS SNI, so DNS rebinding can't redirect the connection. It does not follow redirects: the agent has to fetch the new URL through the gateway. |
 
@@ -135,14 +161,16 @@ key, and it is never the agent's bearer token.
 | `aud` | `mcp-postgres` |
 | `sub` | the authenticated principal, e.g. `anna@demo` |
 | `iat`, `exp` | `exp - iat <= 60` seconds |
+| `limits` | `{stmt_timeout_ms, max_rows, max_result_bytes}` from `controls.sql_guard` (`timeout_ms`, `force_limit`, `max_result_bytes`); required |
 
 The signature matters even on an internal network: mcp-files also sits on `mcp_backend`, and
-without the key it cannot make the database act as another user.
+without the key it cannot make the database act as another user, nor lift the limits.
 
 ### Developing the servers
 
 ```sh
 cd demo/mcp_servers
-uv run pytest                      # unit tests: report paths, principal verification, fetch SSRF
-uv run --with pyright pyright      # strict
+uv run pytest                      # unit tests: report paths, principal, SQL checks, fetch SSRF
+ACL_DOCKER_TESTS=1 uv run pytest   # + mcp-postgres against a throwaway Postgres seeded from db/
+uv run pyright                     # strict
 ```

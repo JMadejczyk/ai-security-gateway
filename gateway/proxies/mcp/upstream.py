@@ -34,9 +34,9 @@ import httpx
 from pydantic import ValidationError
 
 from gateway.clock import Clock, utc_now
-from gateway.identity import mint_principal_assertion
+from gateway.identity import ExecutionLimits, mint_principal_assertion
 from gateway.policy.loader import PolicySnapshot
-from gateway.policy.schema import McpServer
+from gateway.policy.schema import McpServer, SqlGuardConfig
 from gateway.proxies.mcp import wire
 from gateway.upstream import (
     Upstream,
@@ -110,10 +110,28 @@ class MCPConnector:
             self, server=server, url=config.url, trust=config.trust, principal=principal
         )
 
-    def assertion(self, audience: str, principal: str) -> str:
+    def assertion(
+        self, audience: str, principal: str, limits: ExecutionLimits | None = None
+    ) -> str:
         return mint_principal_assertion(
-            self._key, audience=audience, principal=principal, clock=self._clock
+            self._key, audience=audience, principal=principal, clock=self._clock, limits=limits
         )
+
+
+def sql_execution_limits(snapshot: PolicySnapshot, server: str) -> ExecutionLimits | None:
+    """The ``limits`` claim for ``server`` when the policy runs it with the sql adapter:
+    ``controls.sql_guard`` timeout, forced ``LIMIT`` as the row cap, and the result-byte cap."""
+    config = snapshot.policy.upstreams.mcp.get(server)
+    if config is None or config.adapter != "sql":
+        return None
+    guard = snapshot.policy.control_config("sql_guard")
+    if not isinstance(guard, SqlGuardConfig):  # pragma: no cover - the schema types it
+        guard = SqlGuardConfig()
+    return ExecutionLimits(
+        stmt_timeout_ms=guard.timeout_ms,
+        max_rows=guard.force_limit,
+        max_result_bytes=guard.max_result_bytes,
+    )
 
 
 class _SseDecoder:
@@ -362,7 +380,7 @@ class MCPUpstream(Upstream):
                 "POST",
                 self.url,
                 json=message,
-                headers=self._headers(),
+                headers=self._headers(snapshot),
                 timeout=limits.upstream_timeout_s,
             ) as response:
                 return await self._answer(response, snapshot, request_id)
@@ -439,7 +457,7 @@ class MCPUpstream(Upstream):
         refusal = wire.error(request_id, wire.METHOD_NOT_FOUND, "Method not found")
         await self._post(refusal, snapshot, request_id=None)
 
-    def _headers(self) -> dict[str, str]:
+    def _headers(self, snapshot: PolicySnapshot | None = None) -> dict[str, str]:
         headers = {
             "accept": "application/json, text/event-stream",
             "accept-encoding": "identity",  # see refuse_encoded: the size cap reads wire bytes
@@ -450,9 +468,12 @@ class MCPUpstream(Upstream):
         if self._initialized:
             headers[wire.PROTOCOL_HEADER] = wire.PROTOCOL_VERSION
         if self.trust == "internal":
-            # Fresh per request: the assertion lives 60 s, a session may live for hours.
+            # Fresh per request: the assertion lives 60 s, a session may live for hours. SQL
+            # servers also get the execution limits of the snapshot this request runs under
+            # (none on the best-effort DELETE, which runs no statement).
+            limits = sql_execution_limits(snapshot, self.server) if snapshot else None
             headers[wire.PRINCIPAL_HEADER] = self._connector.assertion(
-                self._audience, self.principal
+                self._audience, self.principal, limits
             )
         return headers
 

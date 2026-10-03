@@ -138,6 +138,7 @@ class Interaction(FrozenModel):
     payload: Any  # request payload (pre) ...
     result: Any = None  # ... and upstream result (post)
     context: SessionContext
+    server: str | None = None  # MCP upstream name (``/mcp/{server}``); None on other channels
 
     @field_validator("resource")
     @classmethod

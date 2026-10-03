@@ -1,0 +1,125 @@
+"""Where the feed bytes come from: a file, or an http(s) URL.
+
+Both read at most ``max_bytes + 1`` bytes, so an oversized feed is refused without being
+buffered whole. The HTTP source never follows redirects (a redirect could point the gateway at
+an internal address the operator never named), asks for an uncompressed body and gives up after
+a fixed timeout. Sources are synchronous and simple; the store runs them in a worker thread.
+"""
+
+from abc import ABC, abstractmethod
+from http import HTTPStatus
+from pathlib import Path
+from typing import Final, override
+from urllib.parse import urlsplit
+
+import httpx
+
+from gateway.feed.schema import FeedInvalidError, FeedUnavailableError
+
+HTTP_TIMEOUT_S: Final = 5.0
+_HTTP_SCHEMES: Final = frozenset({"http", "https"})
+
+
+class FeedSource(ABC):
+    """Reads the raw feed document."""
+
+    @abstractmethod
+    def fetch(self, max_bytes: int) -> bytes:
+        """At most ``max_bytes + 1`` bytes; raises `FeedUnavailableError`."""
+
+    @abstractmethod
+    def describe(self) -> str:
+        """Where the feed comes from, for logs."""
+
+
+class FileFeedSource(FeedSource):
+    def __init__(self, path: Path) -> None:
+        self._path = path
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    @override
+    def fetch(self, max_bytes: int) -> bytes:
+        try:
+            with self._path.open("rb") as handle:
+                return handle.read(max_bytes + 1)
+        except OSError as exc:
+            msg = f"cannot read feed {self._path}: {exc.strerror or type(exc).__name__}"
+            raise FeedUnavailableError(msg) from None
+
+    @override
+    def describe(self) -> str:
+        return str(self._path)
+
+
+class HttpFeedSource(FeedSource):
+    def __init__(
+        self,
+        url: str,
+        *,
+        timeout_s: float = HTTP_TIMEOUT_S,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        self._url = url
+        self._timeout_s = timeout_s
+        self._transport = transport
+
+    @property
+    def url(self) -> str:
+        return self._url
+
+    @override
+    def fetch(self, max_bytes: int) -> bytes:
+        headers = {"accept": "application/json", "accept-encoding": "identity"}
+        try:
+            with (
+                httpx.Client(
+                    transport=self._transport,
+                    timeout=self._timeout_s,
+                    follow_redirects=False,
+                ) as client,
+                client.stream("GET", self._url, headers=headers) as response,
+            ):
+                return _bounded_body(response, max_bytes)
+        except httpx.HTTPError as exc:
+            msg = f"feed {self._url} is unreachable ({type(exc).__name__})"
+            raise FeedUnavailableError(msg) from None
+
+    @override
+    def describe(self) -> str:
+        return self._url
+
+
+def _bounded_body(response: httpx.Response, max_bytes: int) -> bytes:
+    if response.is_redirect:
+        msg = f"feed answered with a redirect ({response.status_code}); redirects are refused"
+        raise FeedUnavailableError(msg)
+    if response.status_code != HTTPStatus.OK:
+        msg = f"feed answered with HTTP {response.status_code}"
+        raise FeedUnavailableError(msg)
+    if response.headers.get("content-encoding", "identity").strip().lower() != "identity":
+        msg = "feed answered with a compressed body; only identity encoding is accepted"
+        raise FeedUnavailableError(msg)
+    body = bytearray()
+    for chunk in response.iter_raw():
+        body.extend(chunk)
+        if len(body) > max_bytes:
+            break
+    return bytes(body[: max_bytes + 1])
+
+
+def resolve_source(
+    spec: str, *, base_dir: Path, transport: httpx.BaseTransport | None = None
+) -> FeedSource:
+    """An http(s) URL, or a file path; a relative path is resolved against ``base_dir``
+    (the policy file's directory, so the same policy works in a checkout and in compose)."""
+    scheme = urlsplit(spec).scheme.lower()
+    if scheme in _HTTP_SCHEMES:
+        return HttpFeedSource(spec, transport=transport)
+    if "://" in spec:
+        msg = f"feed {spec!r}: only http(s) URLs and file paths are supported"
+        raise FeedInvalidError(msg)
+    path = Path(spec)
+    return FileFeedSource(path if path.is_absolute() else base_dir / path)

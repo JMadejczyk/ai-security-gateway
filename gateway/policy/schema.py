@@ -6,6 +6,7 @@ agent principals, tool mappings, control modes) are checked on the root `Policy`
 
 import re
 from collections.abc import Mapping
+from enum import StrEnum
 from types import MappingProxyType
 from typing import Annotated, Literal, Self
 from urllib.parse import urlsplit
@@ -288,6 +289,9 @@ class Limits(FrozenModel):
     max_request_bytes: PositiveInt = 1_048_576
     max_response_bytes: PositiveInt = 4_194_304
     upstream_timeout_s: Duration = 120.0
+    # Completion cap the gateway puts on an LLM request that names none, so the budget
+    # reservation (prompt estimate + completion cap) is an upper bound on what the call uses.
+    default_max_tokens: PositiveInt = 4096
 
 
 # ------------------------------------------------------------------------------ budgets
@@ -314,12 +318,52 @@ class Budgets(FrozenModel):
     soft_limit_pct: Annotated[float, Field(gt=0.0, le=100.0)] = 80.0
 
 
+type Price = Annotated[float, Field(ge=0.0)]  # USD; finite (FrozenModel forbids inf/nan)
+
+
+class ModelPrice(FrozenModel):
+    """What one model costs. ``gpu_second`` prices upstream wall time, an estimate of the GPU
+    time a local model (Ollama) spends on a call."""
+
+    prompt_per_1k: Price = 0.0
+    completion_per_1k: Price = 0.0
+    gpu_second: Price = 0.0
+
+
+def _model_identifier(value: str) -> str:
+    Resource.parse(f"model:{value}")  # the identifier a `model:<id>` resource carries
+    return value
+
+
+# Keyed by the model identifier the call is authorized for (``generate:model:<id>``). A model
+# without an entry costs nothing, but its tokens and GPU time still count against budgets.
+type PricedModel = Annotated[str, AfterValidator(_model_identifier)]
+
+
 # ----------------------------------------------------------------------------- controls
+
+
+class PiiEntity(StrEnum):
+    """Entity IDs the ``pii`` control detects (Presidio's names, plus our Polish ones)."""
+
+    PL_PESEL = "PL_PESEL"
+    PL_NIP = "PL_NIP"
+    IBAN_CODE = "IBAN_CODE"
+    EMAIL_ADDRESS = "EMAIL_ADDRESS"
+    PHONE_NUMBER = "PHONE_NUMBER"
 
 
 class PiiConfig(ControlConfig):
     threshold: Threshold = 0.6
-    entities: tuple[str, ...] = ()
+    entities: tuple[PiiEntity, ...] = tuple(PiiEntity)  # every entity when omitted
+
+    @field_validator("entities")
+    @classmethod
+    def _entities_unique(cls, value: tuple[PiiEntity, ...]) -> tuple[PiiEntity, ...]:
+        if len(set(value)) != len(value):
+            msg = f"duplicate entries in {[str(e) for e in value]}"
+            raise ValueError(msg)
+        return value
 
 
 class PromptInjectionConfig(ControlConfig):
@@ -340,6 +384,7 @@ class SqlGuardConfig(ControlConfig):
     max_cost: PositiveFloat = 10_000.0
     force_limit: PositiveInt = 500
     timeout_ms: Annotated[int, Field(gt=0, le=int(MAX_DURATION_S * 1000))] = 3_000
+    max_result_bytes: PositiveInt = 1_048_576  # the SQL server's cap on one serialized result
 
 
 class SignaturesConfig(ControlConfig):
@@ -352,6 +397,18 @@ class LoopDetectConfig(ControlConfig):
     window_s: Duration = 60.0
 
 
+type ModelName = Annotated[str, StringConstraints(min_length=1, max_length=256)]
+
+
+class ModelAllowlistConfig(ControlConfig):
+    """Other names the upstream may report for a requested model (a router alias resolving to
+    a provider model). A requested name without a tag also accepts its ``:latest`` (Ollama)."""
+
+    aliases: FrozenDict[ModelName, tuple[ModelName, ...]] = Field(
+        default_factory=FrozenDict[str, tuple[str, ...]]
+    )
+
+
 class IntentJudgeConfig(ControlConfig):
     model: str | None = Field(default=None, min_length=1)
 
@@ -361,7 +418,7 @@ class Controls(FrozenModel):
 
     authn: ControlConfig | None = None
     authz: ControlConfig | None = None
-    model_allowlist: ControlConfig | None = None
+    model_allowlist: ModelAllowlistConfig | None = None
     pii: PiiConfig | None = None
     secrets: ControlConfig | None = None
     sql_guard: SqlGuardConfig | None = None
@@ -384,6 +441,7 @@ class Controls(FrozenModel):
 # Typed settings per control; every other control takes the plain ControlConfig.
 _CONFIG_TYPES: Mapping[str, type[ControlConfig]] = MappingProxyType(
     {
+        "model_allowlist": ModelAllowlistConfig,
         "pii": PiiConfig,
         "sql_guard": SqlGuardConfig,
         "signatures": SignaturesConfig,
@@ -419,6 +477,9 @@ class Policy(FrozenModel):
     limits: Limits = Limits()
     controls: Controls = Controls()
     budgets: Budgets = Budgets()
+    pricing: FrozenDict[PricedModel, ModelPrice] = Field(
+        default_factory=FrozenDict[str, ModelPrice]
+    )
 
     @model_validator(mode="after")
     def _approver_roles_exist(self) -> Self:

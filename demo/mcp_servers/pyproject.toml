@@ -10,10 +10,11 @@ dependencies = [
     "psycopg-pool==3.3.3",
     "pydantic==2.13.5",
     "pyjwt==2.15.1",
+    "sqlglot==30.21.0",
 ]
 
 [dependency-groups]
-dev = ["pytest==9.1.1"]
+dev = ["pyright==1.1.414", "pytest==9.1.1"]
 
 [tool.uv]
 package = false

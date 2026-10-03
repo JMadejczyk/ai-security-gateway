@@ -1,24 +1,34 @@
-"""Tables a SQL statement reads, for the sql MCP adapter's resources.
+"""SQL analysis shared by the sql MCP adapter (resources) and the ``sql_guard`` control (rewrite).
 
-SEAM: this is the minimal subset the adapter needs to name resources, not the ``sql_guard``
-control. ``sql_guard`` (mandatory, stage 5-10) replaces it with the full allowlist, properly
-scoped name resolution, ``EXPLAIN`` cost, forced ``LIMIT``, timeouts and the rewritten query
-that executes. Until then everything outside a small, fail-closed subset is refused:
+`QueryPlan.parse` parses a statement once and refuses everything outside a small, fail-closed
+subset (SPEC "Control catalog" → ``sql_guard``):
 
 - exactly one plain ``SELECT`` (Postgres dialect); no data-modifying or locking clause, no
-  ``SELECT INTO``, and no CTEs at all (a CTE name can shadow a real table in another scope);
+  ``SELECT INTO``, no set operations and no CTEs at all (a CTE name can shadow a real table in
+  another scope, so refusing them is stricter than refusing only data-modifying CTEs);
 - only allowlisted functions (aggregates and a few scalar, string and date functions). Any
-  other call is refused, including unknown ones and anything that takes SQL text
-  (``query_to_xml``, ``dblink``...), which would read tables this check never sees;
-- every table schema-qualified (the upstream's ``search_path`` is unknown here, and the SQL is
-  forwarded unchanged), outside ``pg_catalog``, ``information_schema`` and ``pg_*`` schemas,
-  with plain identifiers only (``[a-z_][a-z0-9_]*`` after Postgres case folding), so that two
-  different tables can never map to the same resource.
+  other call is refused, including unknown ones, anything that takes SQL text
+  (``query_to_xml``, ``dblink``...), which would read tables this check never sees, and every
+  session or settings function (``set_config``, ``current_setting``, ``acl.set_principal``);
+- every table schema-qualified (the upstream's ``search_path`` is unknown here), outside
+  ``pg_catalog``, ``information_schema`` and ``pg_*`` schemas, with plain identifiers only
+  (``[a-z_][a-z0-9_]*`` after Postgres case folding), so that two different tables can never
+  map to the same resource;
+- the outermost row cap (``LIMIT`` or ``FETCH FIRST``), when present, is an integer literal
+  (or ``LIMIT ALL`` / ``LIMIT NULL``, which mean no cap).
+
+The plan's `QueryPlan.sql` is sqlglot's Postgres rendering of the parsed tree with comments
+dropped, and that rendering is what ``sql_guard`` sends upstream. Executing the analyzer's own
+rendering, rather than the agent's text, closes the class of parser differentials (comments,
+quoting, escapes) where Postgres would read something this module did not see.
+`QueryPlan.with_row_limit` caps the outermost ``SELECT`` and re-parses the result, refusing it
+unless it reads exactly the same tables.
 """
 
 import re
+from dataclasses import dataclass
 from enum import StrEnum
-from typing import Final
+from typing import Final, Self
 
 import sqlglot
 from sqlglot import exp
@@ -40,7 +50,7 @@ _FORBIDDEN_NODES: Final = (
     exp.Copy,
     exp.Into,  # SELECT ... INTO creates a table
     exp.Lock,  # FOR UPDATE / FOR SHARE
-    exp.With,  # no CTEs until sql_guard resolves names per scope
+    exp.With,  # no CTEs: names would need resolving per scope
     exp.CTE,
 )
 # Reviewed allowlist of sqlglot function nodes (Postgres spelling in the comment). Anything
@@ -78,11 +88,68 @@ class SqlRefusal(StrEnum):
     UNQUALIFIED_TABLE = "tables must be schema-qualified"
     IDENTIFIER = "table names must be plain lower-case identifiers"
     SYSTEM_CATALOG = "system catalogs are not supported"
+    ROW_LIMIT = "LIMIT and FETCH FIRST must be integer literals"
+    REWRITE = "the rewritten statement does not read the same tables"
 
 
 class UnsupportedSqlError(RejectionError):
     def __init__(self, refusal: SqlRefusal = SqlRefusal.NOT_A_PLAIN_SELECT) -> None:
         super().__init__("unsupported_sql", refusal.value)
+
+
+@dataclass(frozen=True, slots=True)
+class QueryPlan:
+    """One statement inside the supported subset: the tables it reads and its canonical text.
+
+    Build it with `parse`; the constructor trusts its arguments.
+    """
+
+    tables: tuple[str, ...]  # ``schema.table``, sorted and unique, never empty
+    row_limit: int | None  # the outermost cap; None = unbounded
+    statement: exp.Select  # normalized (Postgres case folding); never mutated
+
+    @classmethod
+    def parse(cls, sql: str) -> Self:
+        """Analyze ``sql``; raises `UnsupportedSqlError` for anything outside the subset."""
+        statement = _parse_select(sql)
+        tables = {_resource_name(table) for table in statement.find_all(exp.Table)}
+        if not tables:
+            raise UnsupportedSqlError
+        return cls(
+            tables=tuple(sorted(tables)), row_limit=_row_limit(statement), statement=statement
+        )
+
+    @property
+    def sql(self) -> str:
+        """The statement as Postgres will run it: sqlglot's rendering, comments dropped."""
+        return self.statement.sql(dialect=_DIALECT, comments=False)
+
+    def with_row_limit(self, limit: int) -> Self:
+        """This plan with the outermost ``SELECT`` capped at ``limit`` rows.
+
+        A cap already at or below ``limit`` is kept (as is any ``OFFSET``); anything else,
+        including no cap, becomes ``LIMIT <limit>``. Subqueries are never touched. The result
+        is re-parsed from its own text and refused unless it reads exactly the same tables.
+        """
+        if limit <= 0:
+            msg = f"row limit must be positive, got {limit}"
+            raise ValueError(msg)
+        if self.row_limit is not None and self.row_limit <= limit:
+            return self
+        capped = self.statement.copy()
+        capped.set("limit", exp.Limit(expression=exp.Literal.number(limit)))
+        rewritten = type(self).parse(capped.sql(dialect=_DIALECT, comments=False))
+        if rewritten.tables != self.tables or rewritten.row_limit != limit:
+            raise UnsupportedSqlError(SqlRefusal.REWRITE)
+        return rewritten
+
+
+def referenced_tables(sql: str) -> tuple[str, ...]:
+    """``schema.table`` for every table the statement reads, sorted and unique.
+
+    Raises `UnsupportedSqlError` for anything outside the subset described above.
+    """
+    return QueryPlan.parse(sql).tables
 
 
 def _parse_select(sql: str) -> exp.Select:
@@ -114,13 +181,30 @@ def _resource_name(table: exp.Table) -> str:
     return f"{schema}.{name}"
 
 
-def referenced_tables(sql: str) -> tuple[str, ...]:
-    """``schema.table`` for every table the statement reads, sorted and unique.
+def _integer(node: object) -> int:
+    """The value of a non-negative integer literal, or `UnsupportedSqlError`."""
+    if isinstance(node, exp.Literal) and not node.is_string and node.name.isdigit():
+        return int(node.name)
+    raise UnsupportedSqlError(SqlRefusal.ROW_LIMIT)
 
-    Raises `UnsupportedSqlError` for anything outside the subset described above.
-    """
-    statement = _parse_select(sql)
-    tables = {_resource_name(table) for table in statement.find_all(exp.Table)}
-    if not tables:
-        raise UnsupportedSqlError
-    return tuple(sorted(tables))
+
+def _row_limit(statement: exp.Select) -> int | None:
+    """The outermost ``SELECT``'s row cap. ``LIMIT ALL`` parses as no limit at all."""
+    match statement.args.get("limit"):
+        case None:
+            return None
+        case exp.Limit() as limit if isinstance(limit.expression, exp.Null):
+            return None
+        case exp.Limit() as limit:
+            return _integer(limit.expression)
+        case exp.Fetch() as fetch:
+            count = fetch.args.get("count")
+            value = 1 if count is None else _integer(count)  # FETCH FIRST ROW ONLY
+            options = fetch.args.get("limit_options")
+            if isinstance(options, exp.LimitOptions) and (
+                options.args.get("with_ties") or options.args.get("percent")
+            ):
+                return None  # WITH TIES or PERCENT can return more than `count` rows
+            return value
+        case _:
+            raise UnsupportedSqlError(SqlRefusal.ROW_LIMIT)

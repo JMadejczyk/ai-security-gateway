@@ -105,6 +105,33 @@ SESSION_RISK = Histogram(
 )
 
 
+class FeedReloadResult(StrEnum):
+    OK = "ok"
+    UNCHANGED = "unchanged"
+    INVALID = "invalid"  # read, but oversized, not JSON or failing the feed schema
+    UNAVAILABLE = "unavailable"  # missing file, unreachable URL, HTTP error, redirect
+
+
+FEED_RELOADS = Counter(
+    "acl_feed_reloads",
+    "Signature feed load attempts by result (the last valid feed stays in effect).",
+    ["result"],
+    registry=REGISTRY,
+)
+FEED_INFO = Gauge(
+    "acl_feed_info",
+    "Set to 1 for the active signature feed version.",
+    ["version"],
+    registry=REGISTRY,
+)
+SIGNATURE_HITS = Counter(
+    "acl_signature_hits",
+    "Signature matches by signature id (bounded by the feed: at most 1000 ids).",
+    ["signature"],
+    registry=REGISTRY,
+)
+
+
 def record_policy_reload(result: ReloadResult) -> None:
     POLICY_RELOADS.labels(result=result.value).inc()
 
@@ -154,6 +181,64 @@ def record_session(risk: float, tainted_sessions: int) -> None:
 
 def set_tainted_sessions(count: int) -> None:
     TAINTED_SESSIONS.set(count)
+
+
+def record_feed_reload(result: FeedReloadResult) -> None:
+    FEED_RELOADS.labels(result=result.value).inc()
+
+
+def set_active_feed_version(version: str | None) -> None:
+    """Only the active feed version carries the info series; none while no feed is loaded."""
+    FEED_INFO.clear()
+    if version is not None:
+        FEED_INFO.labels(version=version).set(1)
+
+
+def record_signature_hits(signature_ids: Iterable[str]) -> None:
+    for signature_id in signature_ids:
+        SIGNATURE_HITS.labels(signature=signature_id).inc()
+
+
+COST = Counter(
+    "acl_cost_usd",
+    "Spend in USD from the policy pricing table (GPU part: upstream wall time, an estimate).",
+    ["user", "agent", "model"],
+    registry=REGISTRY,
+)
+BUDGET_USAGE = Gauge(
+    "acl_budget_usage_ratio",
+    "Usage over the hard limit, per limit (`per_user.daily_tokens`, ...) and user or agent.",
+    ["scope", "id"],
+    registry=REGISTRY,
+)
+BUDGET_STORE_ERRORS = Counter(
+    "acl_budget_store_errors",
+    "Budget store operations that failed (the call failed closed, or a settlement was lost).",
+    ["operation"],
+    registry=REGISTRY,
+)
+BUDGET_STORE_UP = Gauge(
+    "acl_budget_store_up",
+    "1 while the budget store answers, 0 after a failed operation or health check.",
+    registry=REGISTRY,
+)
+
+
+def record_cost(user: str, agent: str, model: str, usd: float) -> None:
+    if usd > 0:
+        COST.labels(user=user, agent=agent, model=model).inc(usd)
+
+
+def set_budget_usage(scope: str, subject: str, ratio: float) -> None:
+    BUDGET_USAGE.labels(scope=scope, id=subject).set(ratio)
+
+
+def record_budget_store_error(operation: str) -> None:
+    BUDGET_STORE_ERRORS.labels(operation=operation).inc()
+
+
+def set_budget_store_up(*, up: bool) -> None:
+    BUDGET_STORE_UP.set(1 if up else 0)
 
 
 # --------------------------------------------------------------------------------- audit

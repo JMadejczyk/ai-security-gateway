@@ -234,7 +234,14 @@ def create_operator_app(container: GatewayContainer) -> FastAPI:
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
-        return {"status": "ok", "policy_revision": container.policy_store.current.revision}
+        # Always 200: with Redis down the gateway is still the one serving (fail-closed)
+        # refusals, so it must keep running; `degraded` and acl_budget_store_up say why.
+        budget_store = await container.budgets.status()
+        return {
+            "status": "degraded" if budget_store == "down" else "ok",
+            "policy_revision": container.policy_store.current.revision,
+            "budget_store": budget_store,
+        }
 
     @app.get("/metrics")
     async def metrics() -> Response:

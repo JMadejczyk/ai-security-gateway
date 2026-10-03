@@ -101,9 +101,9 @@ def test_taint_survives_a_gateway_restart(live_stack: LiveStack):
     written = call(live_stack, token, "reports", "write_report", name="q3.md", content="ok")
     assert reason(written) == "action_removed_by_session_risk"
     fresh = live_stack.token("anna@demo")  # another session is not tainted
-    assert reason(
-        call(live_stack, fresh, "reports", "write_report", name="q3.md", content="ok")
-    ) != ("action_removed_by_session_risk")
+    result = call(live_stack, fresh, "reports", "write_report", name="q3.md", content="ok")
+    if result["result"]["isError"]:  # e.g. the file exists already; never the taint rule
+        assert reason(result) != "action_removed_by_session_risk"
 
 
 def test_acl_pin_runs_in_the_gateway_container(live_stack: LiveStack):

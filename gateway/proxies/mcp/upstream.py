@@ -234,6 +234,11 @@ class MCPUpstream(Upstream):
         self._listing = tuple(tools)
         return tools
 
+    @property
+    def cached_listing(self) -> tuple[wire.ToolDefinition, ...] | None:
+        """The latest ``tools/list`` this session holds, without fetching (None: never listed)."""
+        return self._listing
+
     async def latest_listing(self, snapshot: PolicySnapshot) -> tuple[wire.ToolDefinition, ...]:
         """This session's most recent ``tools/list``, fetching one if it never listed
         (``tool_pinning`` verifies a call against it)."""

@@ -24,12 +24,17 @@ tools are compared with nothing (the upstream's first listing supplies argument 
 Which listing a call is checked against: the MCP proxy keeps each upstream session's latest
 ``tools/list`` (fetched on demand when the agent calls a tool by name without listing), verifies
 it with `ToolPinningControl.verify` and publishes the result for the call (`listing_scope`).
+Each cached listing is tied to the baseline revision it was last verified against: when an
+operator has re-pinned since and the cached listing disagrees with the new baseline, it is
+re-fetched before anything is concluded. A stale cache is never evidence of drift, so it can
+neither quarantine a freshly approved tool nor refuse it.
 The listing is not re-fetched on every call: a description only matters once it reaches the
 model, which happens only through ``tools/list``, and every ``tools/list`` is fetched fresh
 and verified; arguments are always validated against the pinned schema.
 """
 
 import logging
+import weakref
 from collections import Counter
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
@@ -116,6 +121,11 @@ def _first_schemas(tools: Sequence[wire.ToolDefinition]) -> dict[str, dict[str, 
     return schemas
 
 
+def _disagrees(listing: PinnedListing) -> bool:
+    """The listing differs from its baseline (a drifted, duplicated or missing pinned tool)."""
+    return any(status is PinStatus.MISMATCH for status in listing.statuses.values())
+
+
 class ToolPinningControl(Control):
     id: ClassVar[str] = "tool_pinning"
     stages: ClassVar[frozenset[Stage]] = frozenset({Stage.PRE})
@@ -127,6 +137,11 @@ class ToolPinningControl(Control):
         self._pins = pins
         self._quarantine = quarantine
         self._clock = clock
+        # Per upstream session: (the cached listing object, the baseline revision it was
+        # verified against). Weak: an ended session's entry goes with it.
+        self._verified: weakref.WeakKeyDictionary[
+            MCPUpstream, tuple[tuple[wire.ToolDefinition, ...], str | None]
+        ] = weakref.WeakKeyDictionary()
 
     # ------------------------------------------------------------------ verification
 
@@ -182,9 +197,9 @@ class ToolPinningControl(Control):
 
     async def quarantined(self, listing: PinnedListing) -> PinnedListing:
         """``listing`` with the server's quarantine applied: this listing's drifted tools are
-        quarantined (the first detection is kept), stale records of a re-approved baseline are
-        dropped, and every quarantined tool is refused. Raises
-        `ToolQuarantineUnavailableError`."""
+        recorded (replacing any record of an obsolete baseline), records of a baseline that is
+        no longer pinned are discarded (only the exact record inspected), and every
+        quarantined tool is refused. Raises `ToolQuarantineUnavailableError`."""
         pin = listing.pin
         if pin is None:
             return listing
@@ -199,13 +214,13 @@ class ToolPinningControl(Control):
                     reason=PinStatus.MISMATCH.value,
                     detected_at=now,
                 )
-                await self._quarantine.add(listing.server, entry)
+                await self._quarantine.record(listing.server, entry)
                 logger.error("MCP server %s tool %r quarantined", listing.server, name[:64])
         blocked: set[str] = set()
         for name, entry in (await self._quarantine.entries(listing.server)).items():
             baseline = pin.tool(name)
             if baseline is None or baseline.digest != entry.pin_digest:
-                await self._quarantine.clear(listing.server, name)  # re-approved since
+                await self._quarantine.discard(listing.server, entry)  # re-approved since
             else:
                 blocked.add(name)
         if not blocked:
@@ -242,8 +257,19 @@ class ToolPinningControl(Control):
         the agent never did, with the server's quarantine applied: an approved listing an
         older session cached does not outlive a drift another session saw. Raises
         `PinFileError`, `UpstreamError` or `ToolQuarantineUnavailableError`."""
+        cached = upstream.cached_listing
         tools = await upstream.latest_listing(snapshot)
-        listing = await self.quarantined(self.verify(server, config, tools))
+        listing = self.verify(server, config, tools)
+        revision = listing.pin.revision if listing.pin is not None else None
+        verified = self._verified.get(upstream)
+        same_baseline = verified is not None and verified[0] is tools and verified[1] == revision
+        if cached is not None and not same_baseline and _disagrees(listing):
+            # Cached under another baseline (or unknown): ask the server what it says now.
+            tools = tuple(await upstream.list_tools(snapshot))
+            listing = self.verify(server, config, tools)
+        if upstream.cached_listing is not None:
+            self._verified[upstream] = (upstream.cached_listing, revision)
+        listing = await self.quarantined(listing)
         if listing.pin is None and listing.unknown.usable:  # opted out: the first listing's
             listing = replace(listing, schemas=await upstream.advertised_schemas(snapshot))
         return listing

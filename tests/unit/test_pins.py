@@ -264,3 +264,26 @@ async def test_a_drift_seen_by_one_gateway_blocks_the_tool_on_another(tmp_path, 
     assert approved.status("query") is PinStatus.PINNED
     assert await shared.entries("sales_db") == {}
     await client.aclose()
+
+
+async def test_a_drift_right_after_a_re_approval_is_not_lost(tmp_path, snapshot):
+    """Codex P1 (regression): a quarantine for baseline A exists, the operator installs B,
+    the next listing advertises a malicious C. C's drift against B must be recorded (not
+    dropped along with A's stale entry), so restoring B later stays quarantined."""
+    path = tmp_path / "sales_db.json"
+    path.write_text(pin(tool(description="A")).to_json())
+    client = fakeredis.FakeAsyncRedis()
+    pinning = ToolPinningControl(PinStore(tmp_path), RedisToolQuarantine(client))
+    config = snapshot.policy.upstreams.mcp["sales_db"]
+
+    async def check(description: str) -> PinStatus:
+        tools = [tool(description=description)]
+        return (await pinning.quarantined(pinning.verify("sales_db", config, tools))).status(
+            "query"
+        )
+
+    assert await check("X") is PinStatus.MISMATCH  # drift against A: quarantined
+    path.write_text(pin(tool(description="B")).to_json())  # the operator approves B
+    assert await check("C") is PinStatus.MISMATCH  # malicious C, right after the re-pin
+    assert await check("B") is PinStatus.QUARANTINED  # C vanished, B is back: still blocked
+    await client.aclose()

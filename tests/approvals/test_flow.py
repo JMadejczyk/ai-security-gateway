@@ -577,3 +577,35 @@ async def test_an_approval_stuck_executing_becomes_uncertain(stack: Any):
     assert (record.state, record.outcome) == (ApprovalState.UNCERTAIN, "outcome_lost")
     assert error_text(await retry(reports, approval_id)) == "approval_outcome_uncertain"
     assert stack.log.of("write_report") == []
+
+
+async def test_a_changed_final_payload_gets_a_replacement_approval(stack: Any):
+    """A reload changes redaction (pii off) but not the call's action/resource: the old
+    approval covered the redacted payload, so the retry without its id gets a NEW pending
+    approval for what would actually run, and the old id is a mismatch."""
+    reports = await tainted_etl(stack)
+    content = "Escalations go to ops.lead@example.com tonight."
+    approval_id = await held(reports, content=content)
+    assert (await decide(stack, OLGA, approval_id)).status_code == 200
+
+    document = yaml.safe_load(stack.gateway.policy_path.read_text())
+    document["controls"]["pii"]["mode"] = "log_only"  # the final payload is now unredacted
+    stack.gateway.policy_path.write_text(yaml.safe_dump(document))
+    assert stack.gateway.container.policy_store.reload().result is ReloadResult.OK
+
+    fresh = await held(reports, content=content)
+    assert fresh != approval_id
+    assert await state_of(stack, fresh) is ApprovalState.PENDING
+    assert await held(reports, content=content) == fresh  # identical retries still dedupe
+    old = await stack.gateway.container.oversight.approvals.get(approval_id)
+    new = await stack.gateway.container.oversight.approvals.get(fresh)
+    assert old.operation_digest != new.operation_digest
+
+    assert error_text(await retry(reports, approval_id, content=content)) == "approval_mismatch"
+    assert await state_of(stack, approval_id) is ApprovalState.APPROVED  # not consumed
+    assert stack.log.of("write_report") == []
+
+    assert (await decide(stack, OLGA, fresh)).status_code == 200
+    assert (await retry(reports, fresh, content=content))["isError"] is False
+    (call,) = stack.log.of("write_report")
+    assert call.arguments["content"] == content  # the operation the new approval named

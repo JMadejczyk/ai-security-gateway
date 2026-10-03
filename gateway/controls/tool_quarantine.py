@@ -52,17 +52,31 @@ class QuarantineEntry(FrozenModel):
 
 
 class ToolQuarantine(ABC):
+    """Quarantine records, one per (server, tool). Every write is a compare-and-set, so two
+    gateways checking the same server never lose each other's detections:
+
+    - `record` keeps an existing entry for the *same* baseline (the first detection) and
+      atomically replaces one recorded against an obsolete baseline, so a drift seen right
+      after a re-approval is never dropped together with the stale entry it replaces;
+    - `discard` deletes only the exact entry the caller inspected (stale-baseline cleanup);
+    - `clear` is the operator's unconditional lift.
+    """
+
     @abstractmethod
-    async def add(self, server: str, entry: QuarantineEntry) -> None:
-        """Quarantine a tool; an existing record (the first detection) is kept."""
+    async def record(self, server: str, entry: QuarantineEntry) -> None:
+        """Quarantine a tool against ``entry.pin_digest`` (see the class docstring)."""
 
     @abstractmethod
     async def entries(self, server: str) -> dict[str, QuarantineEntry]:
         """Every quarantined tool of ``server``, by name."""
 
     @abstractmethod
+    async def discard(self, server: str, entry: QuarantineEntry) -> bool:
+        """Delete ``entry`` only if it is still exactly the stored one."""
+
+    @abstractmethod
     async def clear(self, server: str, tool: str) -> bool:
-        """Lift one tool's quarantine; False when it had none."""
+        """Lift one tool's quarantine (operator); False when it had none."""
 
 
 class InMemoryToolQuarantine(ToolQuarantine):
@@ -70,30 +84,68 @@ class InMemoryToolQuarantine(ToolQuarantine):
         self._entries: dict[str, dict[str, QuarantineEntry]] = {}
 
     @override
-    async def add(self, server: str, entry: QuarantineEntry) -> None:
-        self._entries.setdefault(server, {}).setdefault(entry.tool, entry)
+    async def record(self, server: str, entry: QuarantineEntry) -> None:
+        tools = self._entries.setdefault(server, {})
+        current = tools.get(entry.tool)
+        if current is None or current.pin_digest != entry.pin_digest:
+            tools[entry.tool] = entry
 
     @override
     async def entries(self, server: str) -> dict[str, QuarantineEntry]:
         return dict(self._entries.get(server, {}))
 
     @override
+    async def discard(self, server: str, entry: QuarantineEntry) -> bool:
+        tools = self._entries.get(server, {})
+        if tools.get(entry.tool) != entry:
+            return False
+        del tools[entry.tool]
+        return True
+
+    @override
     async def clear(self, server: str, tool: str) -> bool:
         return self._entries.get(server, {}).pop(tool, None) is not None
+
+
+# Values are "<pin digest> <entry JSON>", so the scripts compare baselines without parsing JSON.
+# KEYS[1]: the server's hash. ARGV: tool, pin digest, value.
+_RECORD: Final = """
+local current = redis.call('HGET', KEYS[1], ARGV[1])
+if current and string.sub(current, 1, string.len(ARGV[2]) + 1) == ARGV[2] .. ' ' then
+  return 0
+end
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[3])
+return 1
+"""
+
+# KEYS[1]: the server's hash. ARGV: tool, the exact value inspected.
+_DISCARD: Final = """
+if redis.call('HGET', KEYS[1], ARGV[1]) == ARGV[2] then
+  return redis.call('HDEL', KEYS[1], ARGV[1])
+end
+return 0
+"""
+
+
+def _value(entry: QuarantineEntry) -> str:
+    return f"{entry.pin_digest} {entry.model_dump_json()}"
 
 
 class RedisToolQuarantine(ToolQuarantine):
     def __init__(self, client: Redis) -> None:
         self._client = client
+        self._record = client.register_script(_RECORD)
+        self._discard = client.register_script(_DISCARD)
 
     @staticmethod
     def _key(server: str) -> str:
         return f"{KEY_PREFIX}:{server}"
 
     @override
-    async def add(self, server: str, entry: QuarantineEntry) -> None:
+    async def record(self, server: str, entry: QuarantineEntry) -> None:
+        args = [entry.tool, entry.pin_digest, _value(entry)]
         try:
-            await self._client.hsetnx(self._key(server), entry.tool, entry.model_dump_json())  # pyright: ignore[reportUnknownMemberType] -- untyped in redis-py
+            await self._record(keys=[self._key(server)], args=args)
         except (RedisError, OSError) as error:
             raise ToolQuarantineUnavailableError from error
 
@@ -102,11 +154,21 @@ class RedisToolQuarantine(ToolQuarantine):
         try:
             raw = cast("dict[bytes, bytes]", await self._client.hgetall(self._key(server)))  # pyright: ignore[reportUnknownMemberType] -- untyped in redis-py
             return {
-                name.decode(): QuarantineEntry.model_validate_json(value)
+                name.decode(): QuarantineEntry.model_validate_json(value.partition(b" ")[2])
                 for name, value in raw.items()
             }
         except (RedisError, OSError, ValidationError, UnicodeDecodeError) as error:
             raise ToolQuarantineUnavailableError from error
+
+    @override
+    async def discard(self, server: str, entry: QuarantineEntry) -> bool:
+        try:
+            removed = await self._discard(
+                keys=[self._key(server)], args=[entry.tool, _value(entry)]
+            )
+        except (RedisError, OSError) as error:
+            raise ToolQuarantineUnavailableError from error
+        return bool(removed)
 
     @override
     async def clear(self, server: str, tool: str) -> bool:

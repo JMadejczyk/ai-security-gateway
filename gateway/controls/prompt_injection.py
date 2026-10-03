@@ -8,21 +8,27 @@ context.
 **What is classified.** The segments `TextExtractor` yields for the stage (every string leaf,
 decoded tool-call arguments and base64 text included), minus protocol fields at their
 protocol places (``/messages/0/role``, ``/content/1/type``: `TextSegment.joinable`; a ``name``
-in tool data is data) and strings without a letter. The system prompt is classified like
+in tool data is data). Each segment becomes pieces (`gateway.injection.prose.fragments`): an
+HTML page its readable text (``signatures`` still sees the markup), a JSON text (a SQL
+tool's rows) its keys and string values, and the gateway's own ``[REDACTED:...]`` markers a
+neutral word. Only pieces that look like prose (`looks_like_prose`: words, not numbers,
+dates, ids, emails or single tokens) are classified and counted against ``max_chars``, so a
+500-row result of ids, dates and amounts costs nothing. The system prompt is classified like
 everything else: an attacker who controls any part of the request can put text there too. A
 long benign system prompt full of rules ("never reveal...", "always answer in...") is the
 most likely false positive; the score is per text, so it never dilutes or inflates a user
 message next to it.
 
-**Split text.** An instruction can be cut into many parts (content parts, argument fields, MCP
-content items, down to one character each). Within one group (a message, a declared tool,
-the whole tool call or tool result) whose content is more than one segment, the segments are
-concatenated as written (whitespace-only parts included) and classified again in rolling
-windows of `WINDOW_CHARS` overlapping by `WINDOW_OVERLAP_CHARS`. Between consecutive groups
-(a message split across two messages), the `BOUNDARY_CHARS` on each side of the boundary are
-classified once more. Window and boundary texts count against ``max_chars`` like segments, so
-the cap still bounds the work, and they are cached like any text: a re-sent history adds
-nothing. A text longer than
+**Split text.** An instruction can be cut into many parts (content parts, messages, argument
+fields, MCP content items, down to one character each). All pieces are joined in document
+(conversation) order, as written, with no separator added (whitespace pieces are pieces
+too), and the joined text is classified in rolling windows of `WINDOW_CHARS` overlapping by
+`WINDOW_OVERLAP_CHARS`, across message and result boundaries. A piece longer than twice
+`STREAM_EDGE_CHARS` joins by its first and last `STREAM_EDGE_CHARS` only, so long text is
+not classified twice. The prose test applies to each window, never to the fragments it is
+built from: a one-character fragment is not prose, the instruction it is part of is.
+Windows count against ``max_chars`` like pieces and are cached like any text: in an
+append-only chat the windows over the history are the same every turn. A text longer than
 the model window is classified in overlapping windows and scores as its best window
 (`gateway.injection.classifier`).
 
@@ -65,6 +71,7 @@ from gateway.injection.classifier import (
     ClassifierUnavailableError,
     InjectionScore,
 )
+from gateway.injection.prose import fragments, looks_like_prose
 from gateway.judges.client import JudgeUnavailableError
 from gateway.policy.schema import PromptInjectionConfig
 
@@ -79,10 +86,9 @@ TOO_LARGE: Final = "content_too_large_to_classify"
 UNSCANNABLE: Final = "content_unscannable"
 CLASSIFIER_UNAVAILABLE: Final = "classifier_unavailable"
 
-BOUNDARY_CHARS: Final = 1000  # text taken from each side of a boundary between groups
-WINDOW_CHARS: Final = 1000  # rolling window over the concatenated segments of one group
+WINDOW_CHARS: Final = 1000  # rolling window over the pieces joined in document order
 WINDOW_OVERLAP_CHARS: Final = 200
-_GROUPED: Final = frozenset({"messages", "choices", "tools"})  # one group per list item
+STREAM_EDGE_CHARS: Final = 200  # a piece longer than two edges joins the stream by its edges
 MAX_JUDGED: Final = 4  # uncertain texts judged per call; more fail closed
 SCORE_BUCKETS: Final = (0.0, 0.5, 0.7, 0.85, 0.95, 0.99, 1.0)
 JUDGE_CACHE_ENTRIES: Final = 4096
@@ -126,15 +132,6 @@ def score_bucket(score: float) -> str:
     return f"{SCORE_BUCKETS[-2]:.2f}-{SCORE_BUCKETS[-1]:.2f}"
 
 
-def _group(segment: TextSegment) -> str:
-    """The message, choice or declared tool a segment belongs to; the document otherwise."""
-    match segment.pointer.split("/")[1:3]:
-        case [first, index] if first in _GROUPED:
-            return f"/{first}/{index}"
-        case _:
-            return ""
-
-
 def rolling_windows(text: str) -> list[str]:
     """``text`` in windows of `WINDOW_CHARS` sharing `WINDOW_OVERLAP_CHARS`; the last one
     ends at the end of ``text``."""
@@ -143,29 +140,48 @@ def rolling_windows(text: str) -> list[str]:
     return [text[start : start + WINDOW_CHARS] for start in starts]
 
 
+def _runs(pieces: Sequence[tuple[str, str]]) -> list[str]:
+    """The ``(separator, piece)`` pairs as continuous runs of text: short pieces whole, a
+    longer piece by its two edges only (its middle cannot be part of an instruction split
+    across pieces, and it is classified whole on its own). A run made of a single piece is
+    left out: that piece is classified on its own."""
+    runs: list[str] = []
+    current: list[str] = []
+
+    def close() -> None:
+        if len(current) > 2:  # noqa: PLR2004 -- separator + piece: one piece only
+            runs.append("".join(current[1:]))  # no separator before the first piece
+
+    for separator, piece in pieces:
+        if len(piece) <= 2 * STREAM_EDGE_CHARS:
+            current += [separator, piece]
+            continue
+        current += [separator, piece[:STREAM_EDGE_CHARS]]
+        close()
+        current = ["", piece[-STREAM_EDGE_CHARS:]]
+    close()
+    return runs
+
+
 def classified_texts(segments: Sequence[TextSegment]) -> list[str]:
-    """Texts to classify: content segments, rolling windows over each multi-segment group,
-    and the joins around the boundaries between groups (see the module docstring)."""
-    content = [
-        s for s in segments if s.joinable and s.kind in {SegmentKind.TEXT, SegmentKind.OPAQUE}
+    """Texts to classify (see the module docstring): every prose piece, then the prose
+    windows over the pieces joined in document order. Pieces of different segments are
+    joined as written; the pieces of one segment by its `Fragments.separator`."""
+    pieces = [
+        (parts.separator if index else "", piece)
+        for segment in segments
+        if segment.joinable and segment.kind in {SegmentKind.TEXT, SegmentKind.OPAQUE}
+        for parts in (fragments(segment.text),)
+        for index, piece in enumerate(parts.pieces)
     ]
-    units = [s.text for s in content if any(c.isalpha() for c in s.text)]
-    groups: dict[str, list[str]] = {}
-    for segment in content:
-        groups.setdefault(_group(segment), []).append(segment.text)
-    joined = ["".join(parts) for parts in groups.values()]
+    units = [piece for _, piece in pieces if looks_like_prose(piece)]
     windows = [
         window
-        for parts, text in zip(groups.values(), joined, strict=True)
-        if len(parts) > 1
-        for window in rolling_windows(text)
+        for run in _runs(pieces)
+        for window in rolling_windows(run)
+        if looks_like_prose(window)  # filtered as joined text, never fragment by fragment
     ]
-    joins = [
-        before[-BOUNDARY_CHARS:] + after[:BOUNDARY_CHARS]
-        for before, after in itertools.pairwise(joined)
-    ]
-    texts = [*units, *windows, *joins]
-    return list(dict.fromkeys(t for t in texts if any(c.isalpha() for c in t)))
+    return list(dict.fromkeys([*units, *windows]))
 
 
 class Outcome(StrEnum):

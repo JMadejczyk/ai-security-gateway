@@ -971,6 +971,11 @@ class Pipeline:
             else None
         )
         operation_digest = self._oversight.operation_digest(payload)
+        presented = trace.approval
+        if presented is not None and presented.operation_digest != operation_digest:
+            # The id names another final operation (redaction or rewrite changed since):
+            # it cannot stand for this one. Retrying without it gets this operation's own.
+            return self._stop(trace, APPROVAL, ApprovalRefusal.MISMATCH)
         if binding is None or operation_digest is None:  # nothing canonical to bind to
             return self._stop(trace, APPROVAL, ApprovalRefusal.UNBINDABLE)
         reasons = tuple(

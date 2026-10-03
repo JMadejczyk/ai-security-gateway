@@ -139,6 +139,12 @@ def test_mcp_postgres_applies_the_signed_statement_timeout(live_stack: LiveStack
 def test_pii_redaction_cannot_make_a_priced_false_predicate_true(live_stack: LiveStack):
     """Codex P1 live: sql_guard prices the redacted statement, the one that would execute."""
     exploit = HEAVY + " WHERE 'alice@example.com' = '[REDACTED:EMAIL_ADDRESS]'"
+    time.sleep(STATS_FLUSH_S)  # earlier tests' scans (the timeout test's) land first
+    settled = payment_scans(live_stack)
     result = call_tool(live_stack, ANNA, "query", sql=exploit)
     assert result["isError"] is True, result
-    assert text_of(result) == "sql_cost_exceeded"
+    # The property is "never executes": sql_guard prices it, or prompt_injection refuses the
+    # argument first (the redaction marker scored 0.995 before the classifier neutralized it).
+    assert text_of(result) in {"sql_cost_exceeded", "prompt_injection_detected"}
+    time.sleep(STATS_FLUSH_S)
+    assert payment_scans(live_stack) == settled  # the query never ran

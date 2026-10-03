@@ -83,9 +83,13 @@ class ApprovalService:
         """Keyed digest of the canonical payload; None when it has no canonical form."""
         return canonical_digest(self._key, payload)
 
-    def operation_of(self, binding: ApprovalBinding) -> str:
-        """The slot of one exact operation: a keyed digest of every binding field."""
-        digest = canonical_digest(self._key, binding.model_dump(mode="json"))
+    def operation_of(self, binding: ApprovalBinding, operation_digest: str) -> str:
+        """The slot of one exact operation: a keyed digest of every binding field and of the
+        final operation. The same call whose final payload changed (a reload changed its
+        redaction or rewrite) is another operation, with its own slot and deterministic id;
+        an identical retry lands in the same slot."""
+        identity = {"binding": binding.model_dump(mode="json"), "final": operation_digest}
+        digest = canonical_digest(self._key, identity)
         if digest is None:  # a binding is strings only; this cannot happen
             msg = "approval binding has no canonical form"
             raise ValueError(msg)
@@ -108,7 +112,7 @@ class ApprovalService:
         policy = snapshot.policy
         agent = policy.agents.get(binding.agent)
         draft = ApprovalDraft(
-            operation=self.operation_of(binding),
+            operation=self.operation_of(binding, operation_digest),
             binding=binding,
             operation_digest=operation_digest,
             policy_revision=snapshot.revision,

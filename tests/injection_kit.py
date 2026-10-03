@@ -17,8 +17,10 @@ from gateway.injection.classifier import InjectionScore
 from gateway.injection.manifest import ModelManifest
 from gateway.judges.client import JudgeResult, JudgeUnavailableError
 
-INJECT_MARKER: Final = "<<acl-test-injection>>"
-DOUBT_MARKER: Final = "<<acl-test-doubtful>>"
+# Prose-shaped (several words), as an instruction is: prompt_injection classifies prose only.
+# Square brackets: angle brackets would read as an HTML tag in a page.
+INJECT_MARKER: Final = "[[acl test injection marker]]"
+DOUBT_MARKER: Final = "[[acl test doubtful marker]]"
 DEFAULT_SCORES: Final = {INJECT_MARKER: 0.99, DOUBT_MARKER: 0.6}
 
 REPO_ROOT: Final = Path(__file__).resolve().parent.parent

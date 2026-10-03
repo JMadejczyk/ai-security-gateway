@@ -159,6 +159,12 @@ class PinFile(_PinModel):
         return next((tool for tool in self.tools if tool.name == name), None)
 
     @property
+    def revision(self) -> str:
+        """Identifies the approved baseline: SHA-256 over every tool's name and digest."""
+        entries = sorted((tool.name, tool.digest) for tool in self.tools)
+        return hashlib.sha256(canonical_json(entries)).hexdigest()
+
+    @property
     def schemas(self) -> wire.ToolSchemas:
         return MappingProxyType({tool.name: tool.input_schema for tool in self.tools})
 

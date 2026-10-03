@@ -22,18 +22,26 @@ lifetimes, sticky taint, decay, retirement), with three differences forced by sh
   ``session_lock_wait_s`` and is then refused with 429 ``session_busy``.
 - **Fencing the lease.** A lease can be lost while its holder is still running (renewal fails
   for longer than the TTL, a stalled process). So, right before a call goes upstream,
-  `before_dispatch` atomically checks that the lease still holds this call's token and sets
-  an in-flight marker (``acl:session:<id>:inflight`` = the token). A lost lease means no
-  dispatch (503 ``session_lease_lost``). While a marker of another token exists nobody can
-  acquire the lease, whatever happened to it: the session is *uncertain* until the in-flight
-  call has persisted its outcome and released the marker. The marker is renewed with the
-  lease and otherwise expires after ``upstream_timeout_s + DISPATCH_SLACK_S``: the upstream
-  call itself is bounded by that timeout, so a marker can only expire under a holder that
-  crashed or lost Redis. The holder's write is fenced too: it always lands (version
-  compare-and-set merges its deltas, so taint is never lost), but if its marker is no longer
-  its own another call may have run meanwhile, and the result is withheld (503).
-  Marking before dispatch rather than after a failure is deliberate: a lease is usually lost
-  because Redis is unreachable, and then no after-the-fact "uncertain" write could land.
+  `before_dispatch` atomically checks that the lease still holds this call's token and records
+  an in-flight marker (``acl:session:<id>:inflight``: the token and a deadline). A lost lease
+  means no dispatch (503 ``session_lease_lost``). The marker is removed **only by persisting
+  the call's outcome** (the same script that writes the session record), never by releasing
+  the lease. While a marker of another token exists nobody else proceeds:
+    - before its deadline (renewed with the lease while the holder lives; otherwise
+      ``upstream_timeout_s + DISPATCH_SLACK_S`` after the last renewal) the session is busy
+      (429 ``session_busy`` while a lease is held) or *uncertain* (503 ``session_uncertain``:
+      the holder left without persisting, e.g. its taint write failed);
+    - past its deadline the outcome is unrecoverable, and the next holder resolves it the
+      fail-closed way: it marks the session tainted (the attempt may have brought untrusted
+      content to the gateway, which taints by SPEC whether or not it was released), clears
+      the marker and proceeds.
+  This keeps durable uncertainty without an operator: no lost taint, no permanent lock-out,
+  the worst case is one bounded wait followed by a taint the session would likely have had.
+  The holder's own write is fenced too: it always lands (version compare-and-set merges its
+  deltas), but if its marker is no longer its own another call may have run, and the result
+  is withheld (503). Marking before dispatch rather than after a failure is deliberate: a
+  lease is usually lost because Redis is unreachable, and then no after-the-fact "uncertain"
+  write could land.
 
 Any Redis or connection error fails closed: `SessionStoreUnavailableError` (503).
 """
@@ -81,12 +89,15 @@ _BACKOFF_MIN_S: Final = 0.005
 _BACKOFF_MAX_S: Final = 0.2
 _ENDED: Final = -1
 _CONFLICT: Final = 0
+_UNCERTAIN: Final = -1  # acquire statuses
+_ACQUIRED_ORPHAN: Final = 2
 
 # KEYS: record, tombstone, tainted zset, in-flight marker. ARGV: expected version, doc,
-# record TTL (ms), tainted (1/0), tainted score, session id, the writer's dispatch token ('' if
-# it never dispatched). Returns {status, fenced}: status is the new version, 0 on a version
-# conflict, -1 when the session has a tombstone; fenced is 0 when the writer dispatched and its
-# in-flight marker is no longer its own.
+# record TTL (ms), tainted (1/0), tainted score, session id, the dispatch token whose outcome
+# this write persists ('' for none). Returns {status, fenced}: status is the new version, 0 on
+# a version conflict, -1 when the session has a tombstone; fenced is 0 when that token's
+# in-flight marker was no longer there. On success the marker is removed with the write: the
+# outcome it stood for is persisted.
 _SAVE: Final = """
 if redis.call('EXISTS', KEYS[2]) == 1 then return {-1, 1} end
 local version = tonumber(redis.call('HGET', KEYS[1], 'v') or '0')
@@ -99,14 +110,20 @@ else
   redis.call('ZREM', KEYS[3], ARGV[6])
 end
 local fenced = 1
-if ARGV[7] ~= '' and redis.call('GET', KEYS[4]) ~= ARGV[7] then fenced = 0 end
+if ARGV[7] ~= '' then
+  if redis.call('HGET', KEYS[4], 'token') == ARGV[7] then
+    redis.call('DEL', KEYS[4])
+  else
+    fenced = 0
+  end
+end
 return {version + 1, fenced}
 """
 
-# KEYS: record, tombstone, tainted zset. ARGV: retired-at (ISO), tombstone TTL (ms), id.
-# An existing tombstone keeps its original time; its TTL is only ever extended.
+# KEYS: record, tombstone, tainted zset, in-flight marker. ARGV: retired-at (ISO), tombstone
+# TTL (ms), id. An existing tombstone keeps its original time; its TTL is only ever extended.
 _RETIRE: Final = """
-redis.call('DEL', KEYS[1])
+redis.call('DEL', KEYS[1], KEYS[4])
 redis.call('ZREM', KEYS[3], ARGV[3])
 redis.call('SET', KEYS[2], ARGV[1], 'NX')
 if redis.call('PTTL', KEYS[2]) < tonumber(ARGV[2]) then
@@ -115,39 +132,61 @@ end
 return 1
 """
 
-# Lease scripts. KEYS: lease, in-flight marker. ARGV[1]: the owner token.
+# Lease scripts. KEYS: lease, in-flight marker (hash: token, deadline in epoch ms on the
+# store's clock). ARGV[1]: the caller's token.
 
-# ARGV[2]: lease TTL (ms). Refused while another token's call may still be in flight.
+# ARGV[2]: lease TTL (ms), ARGV[3]: now (ms). Returns {1} acquired, {0} busy (a lease is
+# held), {-1} uncertain (another call's outcome is unpersisted and within its deadline), or
+# {2, token} acquired past the deadline of that token's unpersisted outcome: resolve it.
 _ACQUIRE: Final = """
-local inflight = redis.call('GET', KEYS[2])
-if inflight and inflight ~= ARGV[1] then return 0 end
-if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then return 1 end
-return 0
+local owner = redis.call('HGET', KEYS[2], 'token')
+if owner and owner ~= ARGV[1] then
+  if tonumber(ARGV[3]) < tonumber(redis.call('HGET', KEYS[2], 'deadline') or '0') then
+    if redis.call('EXISTS', KEYS[1]) == 1 then return {0} end
+    return {-1}
+  end
+  if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then return {2, owner} end
+  return {0}
+end
+if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then return {1} end
+return {0}
 """
 
-# ARGV[2]: lease TTL (ms), ARGV[3]: marker hold (ms). The marker is extended even when the
-# lease was lost: it is this (live) holder's call that is still in flight.
+# ARGV[2]: lease TTL (ms), ARGV[3]: now (ms), ARGV[4]: marker hold (ms). The marker's
+# deadline is extended even when the lease was lost: this live holder's call is in flight.
 _RENEW: Final = """
 local owned = 0
 if redis.call('GET', KEYS[1]) == ARGV[1] then
   redis.call('PEXPIRE', KEYS[1], ARGV[2])
   owned = 1
 end
-if redis.call('GET', KEYS[2]) == ARGV[1] then redis.call('PEXPIRE', KEYS[2], ARGV[3]) end
+if redis.call('HGET', KEYS[2], 'token') == ARGV[1] then
+  redis.call('HSET', KEYS[2], 'deadline', tonumber(ARGV[3]) + tonumber(ARGV[4]))
+end
 return owned
 """
 
-# ARGV[2]: marker hold (ms). Sets the marker only while the lease is still this token's.
+# ARGV[2]: now (ms), ARGV[3]: marker hold (ms), ARGV[4]: marker key TTL (ms, durable: it is
+# removed by persisting the outcome or resolving it, not by expiry). Only while the lease is
+# still this token's.
 _DISPATCH: Final = """
 if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
-redis.call('SET', KEYS[2], ARGV[1], 'PX', ARGV[2])
+redis.call('DEL', KEYS[2])
+redis.call('HSET', KEYS[2], 'token', ARGV[1], 'deadline', tonumber(ARGV[2]) + tonumber(ARGV[3]))
+redis.call('PEXPIRE', KEYS[2], ARGV[4])
 return 1
 """
 
+# The lease only: an in-flight marker outlives its holder until its outcome is persisted.
 _RELEASE: Final = """
-if redis.call('GET', KEYS[2]) == ARGV[1] then redis.call('DEL', KEYS[2]) end
 if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('DEL', KEYS[1]) end
 return 1
+"""
+
+# KEYS[1]: in-flight marker. ARGV[1]: the token whose marker to remove.
+_DROP_MARKER: Final = """
+if redis.call('HGET', KEYS[1], 'token') == ARGV[1] then return redis.call('DEL', KEYS[1]) end
+return 0
 """
 
 
@@ -167,6 +206,16 @@ class SessionBusyError(RejectionError):
 
     def __init__(self) -> None:
         super().__init__("session_busy", "another call of this session is still running")
+
+
+class SessionUncertainError(RejectionError):
+    """An earlier call of this session went upstream and left without persisting its outcome;
+    until it is resolved (its deadline passes) the session admits nothing."""
+
+    status_code = 503
+
+    def __init__(self) -> None:
+        super().__init__("session_uncertain", "an earlier call's outcome is unresolved; retry")
 
 
 class SessionLeaseLostError(RejectionError):
@@ -230,11 +279,13 @@ class _Local:
 class RedisSessionLock(AbstractAsyncContextManager[None]):
     """One call's lease on a session, shared by every gateway (enter once, exit once).
 
-    Acquire: ``SET lease token NX PX ttl``, refused while another token's in-flight marker
-    exists. A background task renews the lease (and this call's marker) every third of the
-    TTL. ``lost`` turns true once the lease is provably gone (renewal finds another owner) or
-    may be gone (no successful renewal for a whole TTL); `RedisSessionStore.before_dispatch`
-    then refuses to dispatch. Release deletes only what still holds this token.
+    Acquire: ``SET lease token NX PX ttl``, refused while another token's in-flight marker is
+    within its deadline (past it, the orphaned outcome is resolved first). A background task
+    renews the lease (and this call's marker deadline) every third of the TTL. ``lost`` turns
+    true once the lease is provably gone (renewal finds another owner) or may be gone (no
+    successful renewal for a whole TTL); `RedisSessionStore.before_dispatch`
+    then refuses to dispatch. Release deletes the lease only: the marker goes when the outcome
+    is persisted.
     """
 
     def __init__(
@@ -289,7 +340,7 @@ class RedisSessionLock(AbstractAsyncContextManager[None]):
         self._store.leases.pop(self.session_id, None)
         try:
             await self._store.scripts.release(keys=self._keys, args=[self.token])
-        except (RedisError, OSError) as error:  # both expire on their own
+        except (RedisError, OSError) as error:  # the lease expires on its own
             logger.warning("session lock release failed: %s", type(error).__name__)
         finally:
             self._release_local()
@@ -300,8 +351,9 @@ class RedisSessionLock(AbstractAsyncContextManager[None]):
             self.lost = True
             raise SessionLeaseLostError
         hold_ms = _ms(hold_s)
+        args = [self.token, self._store.now_ms(), hold_ms, _ms(tombstone_ttl_s(Sessions()))]
         try:
-            owned = await self._store.scripts.dispatch(keys=self._keys, args=[self.token, hold_ms])
+            owned = await self._store.scripts.dispatch(keys=self._keys, args=args)
         except (RedisError, OSError) as error:
             raise SessionStoreUnavailableError from error
         if not owned:
@@ -315,19 +367,34 @@ class RedisSessionLock(AbstractAsyncContextManager[None]):
         while True:
             started = loop.time()
             try:
-                acquired = await self._store.scripts.acquire(
-                    keys=self._keys, args=[self.token, self._ttl_ms]
+                reply = cast(
+                    "list[int | bytes]",
+                    await self._store.scripts.acquire(
+                        keys=self._keys, args=[self.token, self._ttl_ms, self._store.now_ms()]
+                    ),
                 )
             except (RedisError, OSError) as error:
                 raise SessionStoreUnavailableError from error
-            if acquired:
+            status = int(reply[0])
+            if status > 0:
                 self._valid_until = started + self._ttl_ms / 1000
+                if status == _ACQUIRED_ORPHAN:
+                    await self._resolve_orphan(cast("bytes", reply[1]).decode())
                 return
             remaining = deadline - loop.time()
             if remaining <= 0:
-                raise SessionBusyError
+                raise SessionUncertainError if status == _UNCERTAIN else SessionBusyError
             await asyncio.sleep(min(remaining, backoff * (1 + random.random())))  # noqa: S311 -- jitter, not security
             backoff = min(backoff * 2, _BACKOFF_MAX_S)
+
+    async def _resolve_orphan(self, orphan: str) -> None:
+        """Holding the lease past the deadline of an unpersisted outcome: taint, then drop it."""
+        try:
+            await self._store.resolve_orphan(self.session_id, orphan)
+        except BaseException:
+            with contextlib.suppress(RedisError, OSError):
+                await self._store.scripts.release(keys=self._keys, args=[self.token])
+            raise
 
     async def _renew(self) -> None:
         loop = asyncio.get_running_loop()
@@ -335,10 +402,9 @@ class RedisSessionLock(AbstractAsyncContextManager[None]):
         while True:
             await asyncio.sleep(interval)
             started = loop.time()
+            args = [self.token, self._ttl_ms, self._store.now_ms(), self.hold_ms or 0]
             try:
-                owned: object = await self._store.scripts.renew(
-                    keys=self._keys, args=[self.token, self._ttl_ms, self.hold_ms or 0]
-                )
+                owned: object = await self._store.scripts.renew(keys=self._keys, args=args)
             except (RedisError, OSError) as error:
                 logger.warning("session lock renewal failed: %s", type(error).__name__)
                 if loop.time() >= self._valid_until:
@@ -364,6 +430,7 @@ class _Scripts:
     renew: AsyncScript
     dispatch: AsyncScript
     release: AsyncScript
+    drop_marker: AsyncScript
     save: AsyncScript
     retire: AsyncScript
 
@@ -374,6 +441,7 @@ class _Scripts:
             renew=client.register_script(_RENEW),
             dispatch=client.register_script(_DISPATCH),
             release=client.register_script(_RELEASE),
+            drop_marker=client.register_script(_DROP_MARKER),
             save=client.register_script(_SAVE),
             retire=client.register_script(_RETIRE),
         )
@@ -439,6 +507,35 @@ class RedisSessionStore(SessionStore):
     def lock(self, session_id: str) -> AbstractAsyncContextManager[None]:
         return RedisSessionLock(self, session_id, wait_s=self._lock_wait_s, ttl_s=self._lock_ttl_s)
 
+    def _outcome(self, session_id: str) -> str | None:
+        """The token of this process's dispatched call in ``session_id``, if any."""
+        lease = self.leases.get(session_id)
+        return lease.token if lease is not None and lease.hold_ms is not None else None
+
+    def now_ms(self) -> int:
+        return _epoch_ms(self._clock())
+
+    async def resolve_orphan(self, session_id: str, orphan: str) -> None:
+        """An outcome dispatched under ``orphan``'s lease was never persisted and its deadline
+        passed: assume the worst (taint, which only removes rights) and drop its marker."""
+        logger.error("a call's outcome was never persisted; tainting its session (fail closed)")
+        for _ in range(MAX_WRITE_ATTEMPTS):
+            loaded = await self._load(session_id)
+            if loaded.ended or loaded.stored is None:
+                try:
+                    await self.scripts.drop_marker(
+                        keys=[self.key(session_id, "inflight")], args=[orphan]
+                    )
+                except (RedisError, OSError) as error:
+                    raise SessionStoreUnavailableError from error
+                return
+            ctx = loaded.stored.context.model_copy(update={"taint": True})
+            record = loaded.stored.model_copy(update={"context": ctx})
+            if await self._write(session_id, record, loaded.version, self._clock(), orphan):
+                return
+            await _conflict_backoff()
+        raise SessionStoreUnavailableError
+
     @override
     async def before_dispatch(self, session_id: str, *, upstream_timeout_s: float) -> None:
         lease = self.leases.get(session_id)
@@ -501,7 +598,9 @@ class RedisSessionStore(SessionStore):
                 raise SessionError(SessionReason.ENDED)
             ctx = apply_update(loaded.stored.context, update, now=now, half_life_s=half_life_s)
             record = loaded.stored.model_copy(update={"context": ctx})
-            if await self._write(session_id, record, loaded.version, now, fence=True):
+            if await self._write(
+                session_id, record, loaded.version, now, self._outcome(session_id)
+            ):
                 return ctx
             await _conflict_backoff()
         raise SessionStoreUnavailableError
@@ -577,12 +676,13 @@ class RedisSessionStore(SessionStore):
         record: StoredSession,
         version: int,
         now: datetime,
-        *,
-        fence: bool = False,
+        outcome_of: str | None = None,
     ) -> bool:
         """Compare-and-set; False on a version conflict. Raises `SessionError` when the
-        session was ended meanwhile. With ``fence``, a writer that dispatched and no longer
-        owns its in-flight marker still writes, then raises `SessionLeaseLostError`."""
+        session was ended meanwhile. ``outcome_of`` names the dispatch token whose outcome this
+        write persists: its in-flight marker goes with the write. If that is this process's
+        own call and its marker was no longer there, it still writes, then raises
+        `SessionLeaseLostError` (another call may have run meanwhile)."""
         expires_at = record.expires_at()
         ttl_s = max((expires_at - now).total_seconds(), 0.0) + tombstone_ttl_s(record.limits)
         keys = [
@@ -591,8 +691,6 @@ class RedisSessionStore(SessionStore):
             TAINTED_KEY,
             self.key(session_id, "inflight"),
         ]
-        lease = self.leases.get(session_id) if fence else None
-        dispatched = lease is not None and lease.hold_ms is not None
         args: list[str | int] = [
             version,
             record.model_dump_json(),
@@ -600,7 +698,7 @@ class RedisSessionStore(SessionStore):
             int(record.context.taint),
             _epoch_ms(expires_at),
             session_id,
-            lease.token if lease is not None and dispatched else "",
+            outcome_of or "",
         ]
         try:
             reply = cast("list[int]", await self.scripts.save(keys=keys, args=args))
@@ -611,13 +709,19 @@ class RedisSessionStore(SessionStore):
             raise SessionError(SessionReason.ENDED)
         if status == _CONFLICT:
             return False
-        if not fenced:
+        lease = self.leases.get(session_id)
+        if not fenced and lease is not None and lease.token == outcome_of:
             logger.error("a call persisted after its session fence lapsed; result withheld")
             raise SessionLeaseLostError
         return True
 
     async def _retire_id(self, session_id: str, limits: Sessions, now: datetime) -> None:
-        keys = [self.key(session_id), self.key(session_id, "ended"), TAINTED_KEY]
+        keys = [
+            self.key(session_id),
+            self.key(session_id, "ended"),
+            TAINTED_KEY,
+            self.key(session_id, "inflight"),
+        ]
         args = [now.isoformat(), _ms(tombstone_ttl_s(limits)), session_id]
         try:
             await self.scripts.retire(keys=keys, args=args)

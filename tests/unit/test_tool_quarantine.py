@@ -19,10 +19,10 @@ DEAD_REDIS = "redis://127.0.0.1:1/0"  # nothing listens on port 1
 T0 = datetime(2026, 10, 4, 10, 0, tzinfo=UTC)
 
 
-def entry(tool: str = "write_report", advertised: str = "b" * 64) -> QuarantineEntry:
+def entry(tool: str = "write_report", advertised: str = "b" * 64, pin: str = "a" * 64):
     return QuarantineEntry(
         tool=tool,
-        pin_digest="a" * 64,
+        pin_digest=pin,
         advertised_digest=advertised,
         reason="tool_pin_mismatch",
         detected_at=T0,
@@ -47,10 +47,10 @@ async def quarantine(request) -> AsyncIterator[ToolQuarantine]:
             await client.aclose()
 
 
-async def test_add_keeps_the_first_detection_and_clear_lifts_it(quarantine):
+async def test_record_keeps_the_first_detection_and_clear_lifts_it(quarantine):
     assert await quarantine.entries("reports") == {}
-    await quarantine.add("reports", entry())
-    await quarantine.add("reports", entry(advertised="c" * 64))  # a later drift
+    await quarantine.record("reports", entry())
+    await quarantine.record("reports", entry(advertised="c" * 64))  # a later drift, same baseline
     assert await quarantine.entries("reports") == {"write_report": entry()}
     assert await quarantine.entries("web") == {}  # per server
     assert await quarantine.clear("reports", "write_report")
@@ -58,10 +58,37 @@ async def test_add_keeps_the_first_detection_and_clear_lifts_it(quarantine):
     assert await quarantine.entries("reports") == {}
 
 
+async def test_record_replaces_an_entry_of_an_obsolete_baseline(quarantine):
+    """Codex P1 (regression): a drift against the new baseline B must replace the stale
+    entry for A atomically, not be dropped while A is kept and then cleaned up."""
+    await quarantine.record("reports", entry(pin="a" * 64))
+    against_b = entry(pin="d" * 64, advertised="c" * 64)
+    await quarantine.record("reports", against_b)
+    assert await quarantine.entries("reports") == {"write_report": against_b}
+
+
+async def test_discard_deletes_only_the_exact_entry_inspected(quarantine):
+    stale = entry(pin="a" * 64)
+    await quarantine.record("reports", stale)
+    [inspected] = (await quarantine.entries("reports")).values()
+    assert inspected == stale
+    fresh = entry(pin="d" * 64)
+    await quarantine.record("reports", fresh)  # another gateway records meanwhile
+    assert not await quarantine.discard("reports", inspected)  # the fresh one survives
+    assert await quarantine.entries("reports") == {"write_report": fresh}
+    assert await quarantine.discard("reports", fresh)
+    assert await quarantine.entries("reports") == {}
+
+
 async def test_redis_down_fails_closed():
     client = Redis.from_url(DEAD_REDIS, socket_connect_timeout=0.2, socket_timeout=0.2)
     store = RedisToolQuarantine(client)
-    for operation in (store.entries("reports"), store.add("reports", entry())):
+    for operation in (
+        store.entries("reports"),
+        store.record("reports", entry()),
+        store.discard("reports", entry()),
+        store.clear("reports", "write_report"),
+    ):
         with pytest.raises(ToolQuarantineUnavailableError):
             await operation
     await client.aclose()

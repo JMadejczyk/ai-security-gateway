@@ -20,12 +20,14 @@ from gateway.core.envelope import FlaggedToolCall
 from gateway.core.types import SessionMode
 from gateway.policy.schema import MAX_DURATION_S, Sessions
 from gateway.redis_sessions import (
+    DISPATCH_SLACK_S,
     LOCK_TTL_S,
     RedisSessionLock,
     RedisSessionStore,
     SessionBusyError,
     SessionLeaseLostError,
     SessionStoreUnavailableError,
+    SessionUncertainError,
     tombstone_ttl_s,
 )
 from gateway.sessions import (
@@ -147,7 +149,7 @@ async def test_a_lost_lease_never_lets_a_second_call_run_while_the_first_is_in_f
     await asyncio.sleep(1.0)  # > 3 lease TTLs without one renewal: the lease is gone
     assert await shared.client.get("acl:session:s-1:lock") is None
     second = shared.store(lock_wait_s=0.5)
-    with pytest.raises(SessionBusyError):  # the in-flight call fences the session
+    with pytest.raises(SessionUncertainError):  # the in-flight call fences the session
         async with second.lock("s-1"):
             pytest.fail("a second call ran while the first was in flight")
     # The first call comes back with untrusted content: its taint lands, then it releases.
@@ -181,18 +183,18 @@ async def test_a_lease_taken_over_before_dispatch_does_not_dispatch(shared):
 
 
 async def test_a_lapsed_fence_still_persists_taint_but_withholds_the_result(shared, monkeypatch):
-    """The marker expired under a holder cut off from Redis, and another call ran: the
-    late holder's taint is still merged in, and its call is refused rather than released."""
+    """The marker's deadline passed under a holder cut off from Redis, and another call ran:
+    the late holder's taint is still merged in, and its call is refused rather than released."""
     first_gateway = shared.store(lock_ttl_s=0.3)
     first = lease(first_gateway)
     failing_renewals(first, monkeypatch)
     await first.__aenter__()
     await first_gateway.open("s-1", ANNA, LIMITS)
-    monkeypatch.setattr("gateway.redis_sessions.DISPATCH_SLACK_S", 0.0)
-    await first_gateway.before_dispatch("s-1", upstream_timeout_s=0.3)
-    await asyncio.sleep(0.8)  # lease and marker both expired
+    await first_gateway.before_dispatch("s-1", upstream_timeout_s=5)
+    await asyncio.sleep(0.5)  # the lease expired
+    shared.clock.advance(5 + DISPATCH_SLACK_S)  # and the in-flight deadline passed
     second = shared.store()
-    async with second.lock("s-1"):
+    async with second.lock("s-1"):  # resolves the orphaned outcome first
         await second.open("s-1", ANNA, LIMITS)
         await second.apply("s-1", SessionUpdate(risk_delta=0.2), half_life_s=HALF_LIFE)
     with pytest.raises(SessionLeaseLostError):
@@ -201,6 +203,53 @@ async def test_a_lapsed_fence_still_persists_taint_but_withholds_the_result(shar
     state = await second.get("s-1")
     assert state is not None
     assert (state.taint, state.risk) == (True, pytest.approx(0.2, abs=1e-3))
+
+
+def failing_saves(store, monkeypatch: pytest.MonkeyPatch) -> None:
+    """This gateway's session writes fail (Redis drops them), everything else works."""
+
+    async def dropped(**_: object) -> object:
+        raise RedisConnectionError("injected")
+
+    monkeypatch.setattr(store, "scripts", replace(store.scripts, save=dropped))
+
+
+async def test_a_failed_persist_keeps_the_session_fenced_then_resolves_it_closed(
+    shared, monkeypatch
+):
+    """Codex P1 (regression): the taint write fails, releasing succeeds. The in-flight marker
+    must survive the release: the next holder is refused (session_uncertain) until the
+    deadline, then resolves the unknown outcome by tainting the session, never clean."""
+    first_gateway = shared.store()
+    async with first_gateway.lock("s-1"):
+        await first_gateway.open("s-1", ANNA, LIMITS)
+        await first_gateway.before_dispatch("s-1", upstream_timeout_s=5)
+        failing_saves(first_gateway, monkeypatch)  # the untrusted result came back...
+        with pytest.raises(SessionStoreUnavailableError):  # ...but its taint never landed
+            await first_gateway.apply("s-1", SessionUpdate(taint=True), half_life_s=HALF_LIFE)
+    assert await shared.client.exists("acl:session:s-1:inflight")
+    second = shared.store(lock_wait_s=0.3)
+    with pytest.raises(SessionUncertainError) as caught:
+        async with second.lock("s-1"):
+            pytest.fail("admitted a call over an unpersisted outcome")
+    assert (caught.value.status_code, caught.value.reason_code) == (503, "session_uncertain")
+    shared.clock.advance(5 + DISPATCH_SLACK_S)  # bounded: no operator needed
+    async with second.lock("s-1"):
+        state = await second.open("s-1", ANNA, LIMITS)
+    assert state.taint
+    assert not await shared.client.exists("acl:session:s-1:inflight")
+
+
+async def test_a_persisted_outcome_clears_the_fence(shared):
+    gateway = shared.store()
+    async with gateway.lock("s-1"):
+        await gateway.open("s-1", ANNA, LIMITS)
+        await gateway.before_dispatch("s-1", upstream_timeout_s=5)
+        assert await shared.client.exists("acl:session:s-1:inflight")
+        await gateway.apply("s-1", SessionUpdate(risk_delta=0.1), half_life_s=HALF_LIFE)
+        assert not await shared.client.exists("acl:session:s-1:inflight")
+    async with shared.store(lock_wait_s=0.2).lock("s-1"):  # free, nothing to resolve
+        assert not (await gateway.open("s-1", ANNA, LIMITS)).taint
 
 
 async def test_dispatch_without_holding_the_session_is_refused(shared):

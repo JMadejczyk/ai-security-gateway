@@ -7,6 +7,7 @@ from datetime import timedelta
 
 import pytest
 from approvals_kit import StoreUnderTest
+from gateway_testkit import ROOT_POLICY
 
 from gateway.approvals.model import (
     TRANSITIONS,
@@ -19,6 +20,7 @@ from gateway.approvals.model import (
 )
 from gateway.approvals.service import ApprovalService
 from gateway.core.types import Action, Channel
+from gateway.policy.loader import PolicyLoader
 
 S = ApprovalState
 OPERATION = "ab" * 32
@@ -355,3 +357,25 @@ async def test_a_kill_revokes_more_approvals_than_any_listing_holds(
             continue
         consumed += 1
     assert consumed == 0
+
+
+async def test_a_different_final_operation_is_a_different_slot(store_under_test: StoreUnderTest):
+    """Same binding, different final-operation digest: the service gives it its own slot (a
+    new pending approval), while the identical operation keeps deduplicating."""
+    sut = store_under_test
+    service = ApprovalService(sut.store, key=b"k" * 32, clock=sut.clock)
+    binding = draft(sut).binding
+    snapshot = PolicyLoader().load(ROOT_POLICY)
+
+    async def hold(digest: str) -> Approval:
+        return await service.hold(
+            binding, snapshot, operation_digest=digest, actions=(), resources=(), reasons=()
+        )
+
+    first = await hold("aa" * 32)
+    await move(sut, first.id, S.APPROVED)
+    assert (await hold("aa" * 32)).id == first.id
+    other = await hold("bb" * 32)
+    assert other.id != first.id
+    assert (other.state, other.operation_digest) == (S.PENDING, "bb" * 32)
+    assert (await hold("bb" * 32)).id == other.id

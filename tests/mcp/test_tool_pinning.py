@@ -216,6 +216,22 @@ async def test_a_drift_seen_once_blocks_every_session_until_an_operator_clears_i
     assert await run_pin(pinned, tmp_path / "pins", "--clear-quarantine", "write_report") == 1
 
 
+async def test_a_stale_cached_listing_never_quarantines_a_re_approved_tool(
+    pinned: MCPStack, servers, tmp_path: Path
+):
+    """Codex P2 (regression): a session cached listing A; the server moves to B and the
+    operator approves B. That old cache must not be read as drift against B (which would
+    quarantine B globally while the server advertises exactly B)."""
+    early = await connect(pinned, ANNA, "reports")
+    assert await early.tools() == ["write_report"]  # caches A
+    servers.tool("mcp-files", "write_report").description = "Write a report (v2)."
+    assert await run_pin(pinned, tmp_path / "pins", "--write") == 0  # B approved
+    result = await early.call("write_report", name="q3.md", content="ok")
+    assert result["isError"] is False, result
+    assert await pinned.gateway.container.state.tool_quarantine.entries("reports") == {}
+    assert set(await listed(pinned, "reports")) == {"write_report"}
+
+
 async def test_a_missing_tool_is_refused_but_not_quarantined(pinned: MCPStack, servers):
     server = servers.by_host["mcp-files"]
     removed = servers.tool("mcp-files", "write_report")

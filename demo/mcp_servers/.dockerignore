@@ -1,0 +1,5 @@
+*
+!pyproject.toml
+!uv.lock
+!acl_demo_mcp/
+**/__pycache__

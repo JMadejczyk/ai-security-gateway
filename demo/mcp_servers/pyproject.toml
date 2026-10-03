@@ -1,0 +1,39 @@
+[project]
+name = "acl-demo-mcp"
+version = "0.1.0"
+description = "Demo MCP upstreams (postgres, fetch, files) that sit behind the AI Control Layer gateway"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "mcp==2.3.0",
+    "httpx==0.28.1",
+    "psycopg[binary]==3.3.6",
+    "psycopg-pool==3.3.3",
+    "pydantic==2.13.5",
+    "pyjwt==2.15.1",
+]
+
+[dependency-groups]
+dev = ["pytest==9.1.1"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+extend = "../../pyproject.toml"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "PLR2004", "ANN"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["acl_demo_mcp"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+venvPath = "."
+venv = ".venv"
+include = ["acl_demo_mcp", "tests"]
+typeCheckingMode = "strict"

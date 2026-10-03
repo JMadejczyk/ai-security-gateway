@@ -1,0 +1,8 @@
+# Build context of the gateway image (the root Dockerfile). Allow-list: only what the image
+# copies is sent to the daemon, so .env, .git, local venvs and tests never reach a layer.
+*
+!pyproject.toml
+!uv.lock
+!gateway/
+**/__pycache__
+**/*.pyc

@@ -1,0 +1,45 @@
+# Demo identities: the only principals POST /auth/demo-token (operator API) will issue tokens for.
+#
+# Shape:
+#   identities:
+#     <sub>:                    # the JWT `sub`; humans are user@demo, services are svc:<agent>
+#       roles: [<role>, ...]    # must exist under `roles` in policy.yaml
+#       mode: interactive | autonomous   # must equal the registered `type` of default_agent
+#       default_agent: <agent>  # the JWT `act.sub` used unless the request names another agent;
+#                               # must exist under `agents` in policy.yaml
+#       description: <text>     # human note, not used for decisions
+#
+# Autonomous identities have no human: `sub` is the agent's own service principal and its
+# grants come from the agent's `allow` list (SPEC: identity and permission model).
+# Row-level visibility in the demo database is keyed on `sub` (demo/db/sql/02_seed.sql).
+
+identities:
+  anna@demo:
+    roles: [analyst]
+    mode: interactive
+    default_agent: databot
+    description: Analyst; sees north, south and east customers (40 rows).
+
+  bartek@demo:
+    roles: [intern]
+    mode: interactive
+    default_agent: databot
+    description: Intern; sees east customers only (7 rows), no access to sales.payments.
+
+  olga@demo:
+    roles: [ops-team]
+    mode: interactive
+    default_agent: databot
+    description: Approver for databot and nightly_etl; ops-team grants nothing by itself.
+
+  root@demo:
+    roles: [admin]
+    mode: interactive
+    default_agent: databot
+    description: Administrator; operator token for /admin/* and all regions in the database.
+
+  svc:nightly_etl:
+    roles: []
+    mode: autonomous
+    default_agent: nightly_etl
+    description: Service principal of the autonomous nightly_etl agent.

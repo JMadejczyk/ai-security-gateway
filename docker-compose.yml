@@ -1,0 +1,203 @@
+# AI Control Layer demo stack. Topology (SPEC: "No bypassing the gateway"):
+#
+#   edge          internal  agent <-> gateway agent listener (:8080). Nothing else lives here.
+#   ops           external  gateway operator listener (:9090, static IP) [+ prometheus/loki/grafana]
+#   llm_backend   internal  gateway <-> ollama
+#   mcp_backend   internal  gateway <-> mcp-postgres, mcp-files, postgres
+#   mcp_untrusted internal  gateway <-> mcp-fetch
+#   fetch_egress  external  mcp-fetch only: its outbound internet access
+#   bootstrap     external  ollama-init only (profile `init`), to pull models before lock-down
+#
+# Only the gateway publishes ports, and only on 127.0.0.1. No container gets the Docker socket,
+# `privileged`, or host networking/namespaces. Verified by tests/bypass/.
+#
+# First run:
+#   cp .env.example .env                                # then replace every secret
+#   docker compose --profile init run --rm ollama-init  # one-off model pull (several GB)
+#   docker compose up -d --build
+
+name: ai-control-layer
+
+x-hardening: &hardening
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
+networks:
+  edge:
+    internal: true
+  ops:
+    ipam:
+      config:
+        - subnet: 172.29.90.0/24
+  llm_backend:
+    internal: true
+  mcp_backend:
+    internal: true
+  mcp_untrusted:
+    # Internal on purpose: if it carried the internet route, Docker would pick it as the
+    # gateway's default-route network and DNAT published ports to it instead of `ops`.
+    # mcp-fetch reaches the internet through `fetch_egress`, a network nothing else joins.
+    internal: true
+  fetch_egress: {}
+  bootstrap: {}
+
+volumes:
+  ollama_models: {}
+  pgdata: {}
+  reports: {}
+
+services:
+  gateway:
+    <<: *hardening
+    build: .
+    image: ai-control-layer/gateway:dev
+    environment:
+      ACL_POLICY_PATH: /app/policy.yaml
+      ACL_IDENTITIES_PATH: /app/demo/identities.yaml
+      # The agent listener serves `edge`; the demo agent reaches it there as http://gateway:8080.
+      ACL_AGENT_HOST: 0.0.0.0
+      ACL_AGENT_PORT: "8080"
+      # The operator listener binds the gateway's `ops` address only, so `edge` and the upstream
+      # networks cannot reach /auth/demo-token, /admin/* or /metrics.
+      ACL_OPERATOR_HOST: 172.29.90.10
+      ACL_OPERATOR_PORT: "9090"
+      ACL_JWT_SECRET: ${ACL_JWT_SECRET:?set ACL_JWT_SECRET in .env}
+      ACL_INTERNAL_KEY: ${ACL_INTERNAL_KEY:?set ACL_INTERNAL_KEY in .env}
+    volumes:
+      - type: bind
+        source: ./policy.yaml
+        target: /app/policy.yaml
+        read_only: true
+        bind: { create_host_path: false }
+      - type: bind
+        source: ./demo/identities.yaml
+        target: /app/demo/identities.yaml
+        read_only: true
+        bind: { create_host_path: false }
+      - type: bind
+        source: ./feeds
+        target: /app/feeds
+        read_only: true
+    networks:
+      edge: {}
+      ops:
+        ipv4_address: 172.29.90.10
+      llm_backend: {}
+      mcp_backend: {}
+      mcp_untrusted: {}
+    ports:
+      # Host ports are overridable when 9090/8080 are taken on the developer machine.
+      - "127.0.0.1:${ACL_OPERATOR_HOST_PORT:-9090}:9090"  # operator API
+      # Lets a developer on the host act as an agent; the demo agent uses `edge` instead.
+      - "127.0.0.1:${ACL_AGENT_HOST_PORT:-8080}:8080"
+    depends_on:
+      ollama: { condition: service_started }
+      mcp-postgres: { condition: service_started }
+      mcp-files: { condition: service_started }
+      mcp-fetch: { condition: service_started }
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:0.35.1
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+    volumes:
+      - ollama_models:/root/.ollama
+    networks: [llm_backend]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # One-off model pull on a temporary network with internet access; `ollama` itself never gets
+  # one. Run before `up`: docker compose --profile init run --rm ollama-init
+  ollama-init:
+    profiles: [init]
+    image: ollama/ollama:0.35.1
+    environment:
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:8b}
+    volumes:
+      - ollama_models:/root/.ollama
+    networks: [bootstrap]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        ollama serve & server=$$!;
+        until ollama list >/dev/null 2>&1; do sleep 1; done;
+        ollama pull "$$OLLAMA_MODEL"; status=$$?;
+        kill $$server; exit $$status
+
+  mcp-postgres:
+    <<: *hardening
+    build: ./demo/mcp_servers
+    image: ai-control-layer/demo-mcp:dev
+    command: ["postgres"]
+    read_only: true
+    tmpfs: [/tmp]
+    environment:
+      PGHOST: postgres
+      PGDATABASE: acl_demo
+      PGUSER: acl_app
+      ACL_APP_DB_PASSWORD: ${ACL_APP_DB_PASSWORD:?set ACL_APP_DB_PASSWORD in .env}
+      ACL_INTERNAL_KEY: ${ACL_INTERNAL_KEY:?set ACL_INTERNAL_KEY in .env}
+    networks: [mcp_backend]
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+
+  mcp-files:
+    <<: *hardening
+    build: ./demo/mcp_servers
+    image: ai-control-layer/demo-mcp:dev
+    command: ["files"]
+    read_only: true
+    tmpfs: [/tmp]
+    volumes:
+      - reports:/data/reports
+    networks: [mcp_backend]
+    restart: unless-stopped
+
+  mcp-fetch:
+    <<: *hardening
+    build: ./demo/mcp_servers
+    image: ai-control-layer/demo-mcp:dev
+    command: ["fetch"]
+    read_only: true
+    tmpfs: [/tmp]
+    networks: [mcp_untrusted, fetch_egress]
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16.15
+    environment:
+      POSTGRES_DB: acl_demo
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      ACL_APP_DB_PASSWORD: ${ACL_APP_DB_PASSWORD:?set ACL_APP_DB_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - type: bind
+        source: ./demo/db
+        target: /docker-entrypoint-initdb.d
+        read_only: true
+        bind: { create_host_path: false }
+    networks: [mcp_backend]
+    healthcheck:
+      test: ["CMD", "pg_isready", "--username=postgres", "--dbname=acl_demo"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  agent:
+    <<: *hardening
+    build: ./demo/agent
+    image: ai-control-layer/demo-agent:dev
+    read_only: true
+    tmpfs: [/tmp]
+    environment:
+      ACL_GATEWAY_URL: http://gateway:8080
+    networks: [edge]
+    restart: unless-stopped

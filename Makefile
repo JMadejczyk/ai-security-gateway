@@ -1,7 +1,8 @@
 .DEFAULT_GOAL := help
 REPORTS := reports
 
-.PHONY: help install models lint fmt test report test-docker test-all perf up down grafana smoke dashboards
+.PHONY: help install models lint fmt test report test-docker test-all perf up down grafana smoke dashboards \
+	demo demo-up demo-off diagrams
 
 help: ## List targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -63,3 +64,33 @@ smoke: ## Demo traffic through the running stack (allow, block, redact, approval
 
 dashboards: ## Regenerate grafana/dashboards/*.json from grafana/build_dashboards.py
 	uv run python -m grafana.build_dashboards
+
+# Mermaid CLI, pinned. Its first run downloads a headless Chromium for puppeteer.
+MMDC := npx -y @mermaid-js/mermaid-cli@12.0.0 -q
+ARCH_IMG := docs/img/architecture
+
+diagrams: ## Render docs/architecture.md's diagrams to docs/img/architecture/ (SVG + 2x PNG, light and -dark; needs Node)
+	@tmp=$$(mktemp -d) && trap 'rm -rf "$$tmp"' EXIT && \
+	for variant in light dark; do \
+		if [ $$variant = dark ]; then bg=transparent; suffix=-dark; else bg=white; suffix=; fi; \
+		$(MMDC) -i docs/architecture.md -o $$tmp/d.svg -c $(ARCH_IMG)/config-$$variant.json -b $$bg && \
+		$(MMDC) -i docs/architecture.md -o $$tmp/d.png -c $(ARCH_IMG)/config-$$variant.json -b $$bg -s 2 --size 1400 && \
+		n=1 && for name in topology pipeline thesis; do \
+			mv $$tmp/d-$$n.svg $(ARCH_IMG)/$$name$$suffix.svg && mv $$tmp/d-$$n.png $(ARCH_IMG)/$$name$$suffix.png; \
+			n=$$((n + 1)); \
+		done || exit 1; \
+	done
+	@ls $(ARCH_IMG)
+
+DEMO_COMPOSE := docker compose -f docker-compose.yml -f demo/compose.demo.yml
+
+demo-up: ## Start the stack with the demo overlay (demo-web serves the injection page); waits until healthy
+	$(DEMO_COMPOSE) up -d --build --wait
+	@$(MAKE) --no-print-directory grafana
+
+demo: ## Run the 7-scene demo against the running stack (DEMO_ARGS="--pause" or "--scene 3"); exit 1 on any deviation
+	ACL_OPERATOR_HOST_PORT=$(OPERATOR_PORT) ACL_GRAFANA_HOST_PORT=$(GRAFANA_PORT) \
+		uv run python -m demo.run_demo $(DEMO_ARGS)
+
+demo-off: ## Back to the default stack: gateway and mcp-fetch without the demo allowances, demo-web removed
+	docker compose up -d --wait --remove-orphans

@@ -191,7 +191,8 @@ class GatewayContainer:
                 [
                     sql_guard,  # sealing: runs last, on the final (redacted) SQL that executes
                     pinning,  # MCP tools must match their approved baseline (pins/)
-                    EgressControl(resolver),  # http-adapter destinations: public, allowed
+                    # http-adapter destinations: public, allowed (demo hosts: overlay only)
+                    EgressControl(resolver, demo_hosts=frozenset(settings.egress_demo_hosts)),
                     SecretsControl(),
                     PiiControl(),  # builds the shared Presidio analyzer once per process
                     signatures,

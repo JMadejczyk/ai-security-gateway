@@ -200,3 +200,55 @@ def test_unresolvable_host_is_a_tool_error(transport: RecordingTransport) -> Non
 def test_rejections_are_tool_errors() -> None:
     for error in (DisallowedDestinationError, UnresolvableHostError, UnsupportedUrlError):
         assert issubclass(error, ToolError)
+
+
+# ------------------------------------------------------------------ demo hosts (overlay only)
+
+DEMO_WEB_IP = "172.30.99.2"
+
+
+def test_demo_hosts_are_off_by_default() -> None:
+    assert FetchSettings().demo_hosts == frozenset()
+    assert FetchSettings.from_env({}).demo_hosts == frozenset()
+
+
+def test_demo_hosts_env_is_an_exact_lower_cased_list() -> None:
+    settings = FetchSettings.from_env({"ACL_FETCH_DEMO_HOSTS": " Demo-Web , ,other "})
+    assert settings.demo_hosts == frozenset({"demo-web", "other"})
+
+
+def test_without_the_overlay_the_demo_host_is_refused(transport: RecordingTransport) -> None:
+    fetcher = Fetcher(FetchSettings(), resolver=FakeResolver([DEMO_WEB_IP]), transport=transport)
+    with pytest.raises(DisallowedDestinationError):
+        _fetch(fetcher, "http://demo-web/q3-market-notes.html")
+    assert transport.requests == []
+
+
+def test_a_listed_demo_host_is_fetched_pinned_to_its_address(
+    transport: RecordingTransport,
+) -> None:
+    settings = FetchSettings(demo_hosts=frozenset({"demo-web"}))
+    fetcher = Fetcher(settings, resolver=FakeResolver([DEMO_WEB_IP]), transport=transport)
+    assert _fetch(fetcher, "http://demo-web/q3-market-notes.html") == "hello"
+    [request] = transport.requests
+    assert request.url.host == DEMO_WEB_IP
+    assert request.headers["host"] == "demo-web"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://other-host/",  # another private name
+        "http://demo-web.evil.example/",  # a suffix is not the host
+        "http://127.0.0.1/",  # IP literals are never exempt
+        "http://demo-web:8080/",  # ports still apply
+    ],
+)
+def test_the_exemption_covers_exactly_the_listed_names(
+    transport: RecordingTransport, url: str
+) -> None:
+    settings = FetchSettings(demo_hosts=frozenset({"demo-web"}))
+    fetcher = Fetcher(settings, resolver=FakeResolver([DEMO_WEB_IP]), transport=transport)
+    with pytest.raises(ToolError):
+        _fetch(fetcher, url)
+    assert transport.requests == []

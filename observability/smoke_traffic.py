@@ -22,15 +22,16 @@ import os
 import re
 import sys
 import time
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from pathlib import Path
-from typing import Final, Self, cast
+from typing import Final
 
 import httpx
 from pydantic import BaseModel, ConfigDict
 
-PROTOCOL_VERSION: Final = "2025-06-18"
-META: Final = "ai-control-layer/"
+# The demo agent's client (httpx + stdlib only, so it also runs in the agent container).
+from demo.agent.acl_agent.client import MCPSession, Outcome, as_object, chat, unthrottled
+
 ANNA, BARTEK, OLGA, ROOT, ETL = (
     "anna@demo",
     "bartek@demo",
@@ -44,29 +45,12 @@ HEAVY_QUERY: Final = (
     "SELECT COUNT(*) FROM sales.customers CROSS JOIN sales.orders CROSS JOIN sales.payments"
 )
 MAX_COST: Final = re.compile(r"(sql_guard:\s*\{[^}]*max_cost:\s*)(\d+)")
-MAX_THROTTLE_RETRIES: Final = 6
 # A truncated, made-up key block: what the secrets control matches, never a real credential.
 FAKE_PRIVATE_KEY: Final = (
     "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA7b2y\n-----END RSA PRIVATE KEY-----"
 )
-HTTP_OK: Final = 200
 
 type JsonObject = dict[str, object]
-
-
-class Outcome(BaseModel):
-    """What one call got: ``ok`` or the gateway's reason code."""
-
-    model_config = ConfigDict(frozen=True)
-
-    status: int
-    reason: str
-    approval_id: str | None = None
-    retry_after_s: float | None = None
-
-    @property
-    def throttled(self) -> bool:
-        return self.reason == "throttled"
 
 
 class Step(BaseModel):
@@ -79,10 +63,6 @@ class Step(BaseModel):
     @property
     def passed(self) -> bool:
         return self.got in self.expected
-
-
-def _object(value: object) -> JsonObject:
-    return cast(JsonObject, value) if isinstance(value, dict) else {}
 
 
 class Gateway:
@@ -109,120 +89,8 @@ class Gateway:
         return self.operator.request(method, path, headers={"authorization": f"Bearer {token}"})
 
     def chat(self, token: str, text: str) -> Outcome:
-        response = self.agent.post(
-            "/v1/chat/completions",
-            headers={"authorization": f"Bearer {token}"},
-            json={
-                "model": "qwen3:8b",
-                "max_tokens": 64,
-                "messages": [{"role": "user", "content": text}],
-            },
-        )
-        if response.status_code == HTTP_OK:
-            return Outcome(status=HTTP_OK, reason="ok")
-        error = _object(_object(response.json()).get("error"))
-        return Outcome(status=response.status_code, reason=str(error.get("code", "error")))
-
-
-class MCPSession:
-    """One downstream MCP session on ``/mcp/<server>`` (streamable HTTP, JSON answers)."""
-
-    def __init__(self, gateway: Gateway, token: str, server: str) -> None:
-        self._client = gateway.agent
-        self._path = f"/mcp/{server}"
-        self._headers = {
-            "authorization": f"Bearer {token}",
-            "accept": "application/json, text/event-stream",
-            "content-type": "application/json",
-        }
-        self._next_id = 0
-
-    def __enter__(self) -> Self:
-        reply = self._rpc(
-            "initialize",
-            {
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "smoke-traffic", "version": "1"},
-            },
-        )
-        if "result" not in reply.body:
-            msg = f"MCP initialize on {self._path} failed: {reply.body}"
-            raise RuntimeError(msg)
-        self._headers["mcp-protocol-version"] = PROTOCOL_VERSION
-        self._client.post(
-            self._path,
-            headers=self._headers,
-            json={"jsonrpc": "2.0", "method": "notifications/initialized"},
-        ).raise_for_status()
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        with contextlib.suppress(httpx.HTTPError):
-            self._client.delete(self._path, headers=self._headers)
-
-    def call(self, tool: str, approval_id: str | None = None, **arguments: object) -> Outcome:
-        params: JsonObject = {"name": tool, "arguments": arguments}
-        if approval_id is not None:
-            params["_meta"] = {f"{META}approval_id": approval_id}
-        reply = self._rpc("tools/call", params)
-        if "error" in reply.body:
-            error = _object(reply.body["error"])
-            return Outcome(status=reply.status, reason=str(error.get("message", "error")))
-        result = _object(reply.body.get("result"))
-        meta = _object(result.get("_meta"))
-        if not result.get("isError"):
-            return Outcome(status=reply.status, reason="ok")
-        approval = meta.get(f"{META}approval_id")
-        return Outcome(
-            status=reply.status,
-            reason=str(meta.get(f"{META}reason_code", "tool_error")),
-            approval_id=str(approval) if approval is not None else None,
-            retry_after_s=reply.retry_after_s,
-        )
-
-    class _Reply(BaseModel):
-        status: int
-        body: JsonObject
-        retry_after_s: float | None = None
-
-    def _rpc(self, method: str, params: JsonObject) -> "MCPSession._Reply":
-        self._next_id += 1
-        response = self._client.post(
-            self._path,
-            headers=self._headers,
-            json={"jsonrpc": "2.0", "id": self._next_id, "method": method, "params": params},
-        )
-        if session := response.headers.get("mcp-session-id"):
-            self._headers["mcp-session-id"] = session
-        retry = response.headers.get("retry-after")
-        return self._Reply(
-            status=response.status_code,
-            body=_parse_rpc(response),
-            retry_after_s=float(retry) if retry else None,
-        )
-
-
-def _parse_rpc(response: httpx.Response) -> JsonObject:
-    if not response.content:
-        return {}
-    if response.headers.get("content-type", "").startswith("text/event-stream"):
-        for line in response.text.splitlines():
-            if line.startswith("data:") and line[5:].strip():
-                return _object(httpx.Response(200, content=line[5:]).json())
-        return {}
-    return _object(response.json())
-
-
-def unthrottled(call: Callable[[], Outcome]) -> Outcome:
-    """Retry a call the autonomous throttle rejected, after its Retry-After."""
-    outcome = call()
-    for _ in range(MAX_THROTTLE_RETRIES):
-        if not outcome.throttled:
-            break
-        time.sleep((outcome.retry_after_s or 10.0) + 0.5)
-        outcome = call()
-    return outcome
+        answer = chat(self.agent, token, text, max_tokens=64)
+        return Outcome(status=answer.status, reason=answer.reason)
 
 
 class Smoke:
@@ -247,11 +115,11 @@ class Smoke:
 
     def same_question_two_principals(self) -> None:
         for sub in (ANNA, BARTEK):
-            with MCPSession(self.gateway, self.gateway.token(sub), "sales_db") as db:
+            with MCPSession(self.gateway.agent, self.gateway.token(sub), "sales_db") as db:
                 self.record(
                     f"{sub} counts customers (RLS)", db.call("query", sql=COUNT_CUSTOMERS), "ok"
                 )
-        with MCPSession(self.gateway, self.gateway.token(BARTEK), "sales_db") as db:
+        with MCPSession(self.gateway.agent, self.gateway.token(BARTEK), "sales_db") as db:
             self.record(
                 "bartek reads sales.payments",
                 db.call("query", sql="SELECT COUNT(*) FROM sales.payments"),
@@ -268,8 +136,8 @@ class Smoke:
         """Demo step 2: a report write is allowed, then refused once the session is tainted."""
         token = self.gateway.token(ANNA)
         with (
-            MCPSession(self.gateway, token, "reports") as reports,
-            MCPSession(self.gateway, token, "web") as web,
+            MCPSession(self.gateway.agent, token, "reports") as reports,
+            MCPSession(self.gateway.agent, token, "web") as web,
         ):
             self.record(
                 "anna writes a report",
@@ -287,7 +155,7 @@ class Smoke:
                 reports.call("write_report", name=self.report_name("anna-2"), content="Q3: 40"),
                 "action_removed_by_session_risk",
             )
-        with MCPSession(self.gateway, token, "sales_db") as db:
+        with MCPSession(self.gateway.agent, token, "sales_db") as db:
             self.record(
                 "anna runs a heavy query (sql_guard)",
                 db.call("query", sql=HEAVY_QUERY),
@@ -297,7 +165,7 @@ class Smoke:
     def content_controls(self) -> None:
         """Demo step 5 over MCP (PII redacted, a secret blocked) and over the LLM channel."""
         token = self.gateway.token(BARTEK)
-        with MCPSession(self.gateway, token, "reports") as reports:
+        with MCPSession(self.gateway.agent, token, "reports") as reports:
             self.record(
                 "bartek writes a report with a PESEL (pii)",
                 reports.call(
@@ -343,7 +211,7 @@ class Smoke:
         )
 
     def loop(self) -> None:
-        with MCPSession(self.gateway, self.gateway.token(BARTEK), "sales_db") as db:
+        with MCPSession(self.gateway.agent, self.gateway.token(BARTEK), "sales_db") as db:
             last = Outcome(status=0, reason="none")
             for _ in range(6):
                 last = db.call("query", sql="SELECT COUNT(*) FROM sales.orders")
@@ -353,8 +221,8 @@ class Smoke:
         """Demo step 3: the tainted autonomous agent's write waits for olga, then runs once."""
         token = self.gateway.token(ETL)
         with (
-            MCPSession(self.gateway, token, "web") as web,
-            MCPSession(self.gateway, token, "reports") as reports,
+            MCPSession(self.gateway.agent, token, "web") as web,
+            MCPSession(self.gateway.agent, token, "reports") as reports,
         ):
             self.record(
                 "nightly_etl fetches an untrusted page",
@@ -401,7 +269,7 @@ class Smoke:
             Outcome(status=killed.status_code, reason="ok" if killed.is_success else "error"),
             "ok",
         )
-        with MCPSession(self.gateway, self.gateway.token(ETL), "sales_db") as db:
+        with MCPSession(self.gateway.agent, self.gateway.token(ETL), "sales_db") as db:
             self.record(
                 "nightly_etl queries while killed",
                 unthrottled(lambda: db.call("query", sql=COUNT_CUSTOMERS)),
@@ -431,7 +299,7 @@ class Smoke:
 
 
 def _reload_outcome(response: httpx.Response) -> Outcome:
-    body = _object(response.json())
+    body = as_object(response.json())
     return Outcome(status=response.status_code, reason=str(body.get("result", "error")))
 
 

@@ -1,2 +1,5 @@
 *
 !requirements.txt
+!acl_agent/
+**/__pycache__
+**/*.pyc

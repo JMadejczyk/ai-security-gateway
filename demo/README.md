@@ -8,7 +8,9 @@ this directory belongs to that stack:
 | `identities.yaml` | The principals `POST /auth/demo-token` may issue tokens for, with each one's roles, mode and default agent |
 | `db/` | Postgres init: the `sales` schema, roles, row-level security and a small seed |
 | `mcp_servers/` | One image that serves the three MCP upstreams: `postgres`, `fetch`, `files` |
-| `agent/` | The agent container: it can reach only the gateway (it idles for now) |
+| `agent/` | The agent container: it can reach only the gateway. `acl_agent/` is DataBot, the demo agent (httpx: MCP + OpenAI chat), run one action at a time with `docker compose exec` |
+| `compose.demo.yml`, `web/` | The demo overlay: `demo-web` serves the page with the hidden injection to mcp-fetch only, plus the two named egress exceptions it needs (see `docs/demo.md`) |
+| `run_demo.py`, `orchestrator/` | The host-side demo orchestrator (`make demo`) |
 
 ## Running it
 
@@ -62,7 +64,8 @@ flowchart LR
 | `mcp_untrusted` | yes | gateway, mcp-fetch |
 | `state` | yes | gateway, redis |
 | `fetch_egress` | no | mcp-fetch only |
-| `bootstrap` | no | ollama-init only (profile `init`) |
+| `demo_web` | yes | mcp-fetch, demo-web (only with the overlay `demo/compose.demo.yml`) |
+| `bootstrap` | no | ollama-init, models-init (profile `init`) |
 
 Two choices are worth spelling out:
 

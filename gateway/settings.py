@@ -22,6 +22,10 @@ def _strong_secret(value: SecretStr) -> SecretStr:
 
 type Secret = Annotated[SecretStr, AfterValidator(_strong_secret)]
 type Port = Annotated[int, Field(ge=1, le=65535)]
+# A single lower-case DNS name with a letter in its first label: never an IP literal or a glob.
+type DemoHost = Annotated[
+    str, Field(pattern=r"^[a-z][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*$", max_length=253)
+]
 
 
 class Settings(BaseSettings):
@@ -68,6 +72,10 @@ class Settings(BaseSettings):
     injection_classifier: Literal["onnx", "disabled"] = "onnx"
     classifier_threads: int = Field(default=4, ge=1, le=64)  # intra-op threads per inference
     classifier_workers: int = Field(default=2, ge=1, le=64)  # inferences running at once
+    # Exact host names `egress` lets through without the public-address check (reason code
+    # `egress_demo_host`). Empty by default; only the demo overlay (demo/compose.demo.yml) sets
+    # it, as a JSON list: ACL_EGRESS_DEMO_HOSTS='["demo-web"]'.
+    egress_demo_hosts: tuple[DemoHost, ...] = ()
     log_level: str = "info"
 
     @property

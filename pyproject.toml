@@ -71,9 +71,9 @@ known-first-party = ["gateway"]
 pythonVersion = "3.12"
 venvPath = "."
 venv = ".venv"
-include = ["gateway", "tests", "grafana", "observability"]
+include = ["gateway", "tests", "grafana", "observability", "demo/agent", "demo/orchestrator", "demo/run_demo.py"]
 typeCheckingMode = "basic"
-strict = ["gateway", "grafana", "observability"]
+strict = ["gateway", "grafana", "observability", "demo/agent", "demo/orchestrator", "demo/run_demo.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

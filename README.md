@@ -7,6 +7,18 @@ and taint, and those change what the agent may do for the rest of the session. A
 session loses actions; an autonomous system gets throttled and sent to human approval.
 `SPEC.md` is the source of truth.
 
+## Architecture
+
+The agent reaches only the gateway. Models, MCP servers, Postgres and Redis sit on internal
+networks they share only with the gateway, and observability stays on `ops`.
+[`docs/architecture.md`](docs/architecture.md) explains this topology, the per-call pipeline,
+and how a detection reshapes the session's permissions.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/architecture/topology-dark.png">
+  <img alt="Topology: agent, gateway, upstream networks and observability" src="docs/img/architecture/topology.png">
+</picture>
+
 ## Layout
 
 | Path | What lives there |
@@ -25,6 +37,7 @@ session loses actions; an autonomous system gets throttled and sent to human app
 | `observability/` | Prometheus, Loki and Alloy configs; `smoke_traffic.py` (demo traffic) and `verify_panels.py` |
 | `config/` | `policy.yaml`, the policy the gateway runs with (validated, reloaded on change), and `feeds/signatures.json`, the attack-signature feed it names. Compose mounts the directory read-only, so host edits reach the running gateway |
 | `tests/` | The test layers, the attack corpus and the `control` marker plugin (see "Test suite") |
+| `demo/` | The compose stack's demo parts: identities, database seed, MCP upstreams, the agent (`agent/acl_agent`, DataBot), the demo overlay (`compose.demo.yml`, `web/`) and the orchestrator (`run_demo.py`, `orchestrator/`) |
 
 ## Develop
 
@@ -38,6 +51,8 @@ make test      # every non-docker test + control coverage check; reports/ (see "
 make up        # docker compose up -d --build --wait, then prints the Grafana URL
 make down      # docker compose down
 make smoke     # demo traffic through the running stack, so the dashboards have data
+make demo-up   # the stack plus the demo overlay (demo-web), then prints the Grafana URL
+make demo      # the 7-scene demo against it; exit 1 if any scene deviates (see "Demo")
 make grafana   # the Grafana URL
 ```
 
@@ -56,6 +71,16 @@ curl -s -X POST localhost:9090/auth/demo-token -H 'content-type: application/jso
 The gateway refuses to start without a valid policy or strong secrets. A policy edit that
 fails validation is logged and counted (`acl_policy_reloads_total{result="invalid"}`), and the last valid
 version stays in force.
+
+## Demo
+
+`make demo-up` then `make demo` runs the seven steps of SPEC "Demo script" against the live
+stack and narrates each one: who acts, what is sent, the gateway's decision and `reason_code`,
+and the audit entry. Agent actions run inside the `agent` container (`edge` only); operator
+actions (tokens, approvals, the live policy edit) run on the host. Every scene asserts its own
+outcome, so the run exits 1 on any deviation. [`docs/demo.md`](docs/demo.md) has the talk
+track, timings, the reasons the injection page is served by a demo-only overlay, and what to
+do when the CPU model is slow. A recording is in `docs/demo.cast`.
 
 ## Test suite
 

@@ -13,12 +13,19 @@ SSRF defence at connect time, independent of the gateway's egress control:
 
 Redirects are not followed: the gateway's egress control validates every destination, so a
 redirect is reported back and the agent must fetch the new URL explicitly (through the gateway).
+
+**Demo hosts** (``ACL_FETCH_DEMO_HOSTS``, unset by default): exact host names that may resolve
+to non-public addresses. Only the demo overlay (``demo/compose.demo.yml``) sets it, to the one
+``demo-web`` container that serves the demo's injection page on a network shared with nothing
+but this server. Everything else still applies to them (ports, resolution, IP pinning, no
+redirects); every other host keeps the public-address rule.
 """
 
 from __future__ import annotations
 
+import os
 import socket
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from ipaddress import IPv4Address, IPv6Address, ip_address
 from typing import Protocol
 
@@ -32,6 +39,7 @@ from pydantic import BaseModel, ConfigDict, Field
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 _ALLOWED_PORTS = frozenset(_DEFAULT_PORTS.values())
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+DEMO_HOSTS_ENV = "ACL_FETCH_DEMO_HOSTS"
 
 
 type IPAddress = IPv4Address | IPv6Address
@@ -101,6 +109,15 @@ class FetchSettings(BaseModel):
 
     max_bytes: int = Field(default=256 * 1024, gt=0)
     timeout_s: float = Field(default=10.0, gt=0)
+    # Exact host names exempt from the public-address rule (demo overlay only; see module doc).
+    demo_hosts: frozenset[str] = frozenset()
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str] | None = None) -> FetchSettings:
+        """``ACL_FETCH_DEMO_HOSTS``: comma-separated host names (lower-cased); unset = none."""
+        raw = (os.environ if env is None else env).get(DEMO_HOSTS_ENV, "")
+        hosts = frozenset(name.strip().lower() for name in raw.split(",") if name.strip())
+        return cls(demo_hosts=hosts)
 
 
 class Fetcher:
@@ -155,7 +172,8 @@ class Fetcher:
             literal = False
         if not addresses:
             raise UnresolvableHostError(host)
-        if not all(is_public_address(address) for address in addresses):
+        exempt = not literal and host.lower() in self._settings.demo_hosts
+        if not exempt and not all(is_public_address(address) for address in addresses):
             raise DisallowedDestinationError(host)
         pinned = parsed.copy_with(host=str(addresses[0]))
         headers = {"Host": parsed.netloc.decode("ascii")}
@@ -175,7 +193,7 @@ class Fetcher:
 
 
 def build_fetch_server(settings: FetchSettings | None = None) -> MCPServer:
-    fetcher = Fetcher(settings or FetchSettings())
+    fetcher = Fetcher(settings or FetchSettings.from_env())
     server = MCPServer(name="mcp-fetch")
     server.tool(
         name="fetch",

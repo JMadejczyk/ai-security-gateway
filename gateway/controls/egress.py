@@ -20,6 +20,13 @@ The gateway's resolution is defense in depth. The fetch server resolves again, r
 and pins its connection to the validated address, so DNS rebinding between the two
 resolutions is caught there. The gateway cannot pin the upstream server's connection itself.
 Taint is not this control's concern: ``risk_rules`` remove or hold egress per session mode.
+
+**Demo hosts** (``ACL_EGRESS_DEMO_HOSTS``, empty by default): exact host names that skip checks
+4 and 5 after passing 1 to 3, answered with their own reason code (``egress_demo_host``) so
+every use is visible in the audit. Only the demo overlay (``demo/compose.demo.yml``) sets it,
+for the ``demo-web`` container that serves the demo's injection page. The gateway shares no
+network with that container, so it could not resolve the name anyway; the fetch server needs
+its own, separate switch (``ACL_FETCH_DEMO_HOSTS``) before it connects to a non-public address.
 """
 
 import asyncio
@@ -45,6 +52,7 @@ EGRESS_HOST_NOT_ALLOWED: Final = "egress_host_not_allowed"
 EGRESS_SCHEME_NOT_ALLOWED: Final = "egress_scheme_not_allowed"
 EGRESS_UNRESOLVABLE: Final = "egress_unresolvable"
 EGRESS_UNVERIFIABLE: Final = "egress_unverifiable"  # no call scope, or no URL to check
+EGRESS_DEMO_HOST: Final = "egress_demo_host"  # an ACL_EGRESS_DEMO_HOSTS name (demo overlay)
 
 _HOLDABLE: Final = frozenset(
     {EGRESS_PRIVATE_ADDRESS, EGRESS_PORT_NOT_ALLOWED, EGRESS_HOST_NOT_ALLOWED}
@@ -138,8 +146,11 @@ class EgressControl(Control):
     stages: ClassVar[frozenset[Stage]] = frozenset({Stage.PRE})
     kind: ClassVar[ControlKind] = ControlKind.DETERMINISTIC
 
-    def __init__(self, resolver: HostResolver = system_resolver) -> None:
+    def __init__(
+        self, resolver: HostResolver = system_resolver, *, demo_hosts: frozenset[str] = frozenset()
+    ) -> None:
         self._resolver = resolver
+        self._demo_hosts = demo_hosts
 
     @override
     async def evaluate(self, interaction: Interaction, stage: Stage, cfg: ControlConfig) -> Verdict:
@@ -164,6 +175,10 @@ class EgressControl(Control):
             host, port = _destination(url, settings)
         except _RefusedError as refused:
             return self._refuse(refused.reason_code, refused.reason, cfg)
+        if host in self._demo_hosts:
+            return Verdict(
+                decision=Decision.ALLOW, control_id=self.id, reason_code=EGRESS_DEMO_HOST
+            )
         try:
             addresses: Sequence[IPAddress] = [ip_address(host.strip("[]"))]
         except ValueError:

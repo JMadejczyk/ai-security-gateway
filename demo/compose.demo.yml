@@ -1,0 +1,64 @@
+# Demo overlay: the page with a hidden prompt injection that demo steps 2 and 3 fetch.
+#
+#   docker compose -f docker-compose.yml -f demo/compose.demo.yml up -d --build --wait   (make demo-up)
+#   docker compose up -d --remove-orphans                                                (make demo-off)
+#
+# The base stack is unchanged and refuses this page: both the gateway's `egress` control and
+# mcp-fetch reject any destination that is not a public address (SSRF), and `demo-web`, like any
+# container, has a private one. Rather than depend on a page on the internet (it can change,
+# vanish, or be unreachable at a venue) or punch a hole in the default configuration, this file
+# adds three things, all off unless the overlay is named on the command line:
+#
+#   1. `demo-web`: a static server for demo/web/, alone on the internal `demo_web` network with
+#      mcp-fetch. The agent, the gateway and every other upstream share no network with it.
+#   2. mcp-fetch joins `demo_web` and gets ACL_FETCH_DEMO_HOSTS=demo-web: that one exact name
+#      may resolve to a private address. Ports, IP pinning and no-redirects still apply; IP
+#      literals and every other name keep the public-address rule.
+#   3. The gateway gets ACL_EGRESS_DEMO_HOSTS=["demo-web"]: `egress` passes that exact name
+#      with reason code `egress_demo_host` (visible in every audit entry) instead of resolving
+#      it, which it could not do anyway since it shares no network with `demo-web`.
+#
+# What the demo shows is unchanged by this: the page is untrusted content on an `untrusted`
+# server, so the fetch result taints the session and the injection classifier runs on it, as
+# it would for any web page.
+
+networks:
+  demo_web:
+    internal: true
+
+services:
+  demo-web:
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    image: python:3.12.15-slim
+    user: "65534:65534"  # nobody
+    read_only: true
+    working_dir: /srv
+    # Docker lets unprivileged processes bind port 80 inside a container
+    # (net.ipv4.ip_unprivileged_port_start=0), so no capability is needed.
+    command: ["python", "-m", "http.server", "80", "--bind", "0.0.0.0", "--directory", "/srv"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - type: bind
+        source: ./demo/web
+        target: /srv
+        read_only: true
+        bind: { create_host_path: false }
+    networks: [demo_web]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1/', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  mcp-fetch:
+    environment:
+      ACL_FETCH_DEMO_HOSTS: demo-web
+    networks:
+      demo_web: {}
+
+  gateway:
+    environment:
+      ACL_EGRESS_DEMO_HOSTS: '["demo-web"]'

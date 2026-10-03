@@ -453,7 +453,7 @@
           },
           "expr": "topk(20, sum by (session_id, principal, actor) (count_over_time({job=\"acl\", decision=~\".+\"} | json session_id=\"session_id\", principal=\"principal\" | session_id != \"\" [$__range])))",
           "editorMode": "code",
-          "queryType": "range"
+          "queryType": "instant"
         }
       ],
       "fieldConfig": {
@@ -538,27 +538,43 @@
       },
       "transformations": [
         {
-          "id": "reduce",
+          "id": "labelsToFields",
           "options": {
-            "reducers": [
-              "lastNotNull"
-            ],
-            "labelsToFields": true
+            "mode": "columns"
+          }
+        },
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "^Value.*$",
+            "renamePattern": "calls"
+          }
+        },
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "session_id",
+                "principal",
+                "actor",
+                "calls"
+              ]
+            }
           }
         },
         {
           "id": "organize",
           "options": {
-            "excludeByName": {
-              "Field": true
-            },
             "indexByName": {
               "session_id": 0,
               "principal": 1,
-              "actor": 2
-            },
-            "renameByName": {
-              "Last *": "calls"
+              "actor": 2,
+              "calls": 3
             }
           }
         },
@@ -573,8 +589,7 @@
             ]
           }
         }
-      ],
-      "interval": "1m"
+      ]
     },
     {
       "id": 6,
@@ -873,8 +888,7 @@
             ]
           }
         }
-      ],
-      "interval": "1m"
+      ]
     },
     {
       "id": 8,
@@ -1019,8 +1033,7 @@
             ]
           }
         }
-      ],
-      "interval": "1m"
+      ]
     }
   ]
 }

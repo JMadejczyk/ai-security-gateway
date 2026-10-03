@@ -20,9 +20,13 @@ when it decides which tool to call. Two checks, both on the same texts per tool
 
 **Judge band.** A definition scoring inside ``judge_band`` (below ``threshold``) goes to the
 LLM judge, which answers whether it tries to instruct the agent (`InjectionJudgement`, strict).
-Answers are remembered by the definition's digest in a bounded cache, and one judge call per
-digest is in flight at a time: pinned definitions are static, so each one is judged at most
-once per process and ``tools/list`` is fast after the first listing. Each decision is taken
+Answers are remembered by the judge configuration in effect (`judge_config_key`: the
+``judges`` section, this control's settings and its instructions) and the definition's
+digest, in a bounded cache, and one judge call per key is in flight at a time: pinned
+definitions are static, so each one is judged at most once per judge configuration and
+``tools/list`` is fast after the first listing. A reload that changes the judge model asks
+again; a judge call runs under the snapshot it was started for and fills only that
+configuration's entry. Each decision is taken
 from answers collected for that request, so storing answers (which may evict entries) never
 loses one. On ``tools/list`` the judge shares the listing's deadline: a definition whose
 answer is not ready in time is hidden (``tool_screen_timeout``), and its judge call keeps
@@ -44,7 +48,9 @@ from gateway.controls.prompt_injection import (
     Finding,
     InjectionJudge,
     InjectionJudgement,
+    call_snapshot,
     finding_verdict,
+    judge_config_key,
     score_bucket,
 )
 from gateway.controls.tool_pinning import current_listing
@@ -53,7 +59,7 @@ from gateway.core.interfaces import Control, ControlConfig
 from gateway.core.types import Channel, ControlKind, Decision, Stage
 from gateway.injection.classifier import ClassifierRunner, ClassifierUnavailableError
 from gateway.injection.prose import looks_like_prose
-from gateway.judges.client import JudgeResult, JudgeUnavailableError
+from gateway.judges.client import JudgeResult, JudgeUnavailableError, judging_under
 from gateway.policy.loader import PolicySnapshot
 from gateway.policy.schema import ToolPoisoningConfig
 from gateway.proxies.mcp import wire
@@ -157,7 +163,8 @@ class ToolPoisoningControl(Control):
         self._runner = runner
         self._judge = judge
         self._budget_s = listing_budget_s
-        self._answers: OrderedDict[str, bool] = OrderedDict()  # digest -> poisoned (bounded)
+        # (judge config key):(definition digest) -> poisoned, bounded; in-flight calls likewise
+        self._answers: OrderedDict[str, bool] = OrderedDict()
         self._cache_entries = judge_cache_entries
         self._inflight: dict[str, asyncio.Task[InjectionJudgement]] = {}
         self._judge_slots: asyncio.Semaphore | None = None  # created on the running loop
@@ -188,7 +195,7 @@ class ToolPoisoningControl(Control):
             scores = await self._scores(entries)
         except ClassifierUnavailableError:
             return Finding.refusal(CLASSIFIER_UNAVAILABLE, "the injection classifier is disabled")
-        findings = await self._assess(texts, scores, config, deadline=None)
+        findings = await self._assess(texts, scores, config, call_snapshot(), deadline=None)
         return _worst(findings)
 
     async def screen_listing(
@@ -196,7 +203,7 @@ class ToolPoisoningControl(Control):
     ) -> set[str]:
         """Names of advertised tools to hide from ``tools/list`` (see the module docstring)."""
         config = _typed(snapshot.policy.control_config(self.id))
-        flagged = await self._flag(tools, config)
+        flagged = await self._flag(tools, config, snapshot)
         for name, (reason_code, reason) in flagged.items():
             record_verdicts(
                 [Verdict(decision=Decision.BLOCK, control_id=self.id, reason_code=reason_code)]
@@ -211,7 +218,10 @@ class ToolPoisoningControl(Control):
         return set(flagged)
 
     async def _flag(
-        self, tools: Sequence[wire.ToolDefinition], config: ToolPoisoningConfig
+        self,
+        tools: Sequence[wire.ToolDefinition],
+        config: ToolPoisoningConfig,
+        snapshot: PolicySnapshot,
     ) -> dict[str, tuple[str, str]]:
         deadline = asyncio.get_running_loop().time() + self._budget_s
         screened = list(tools[:MAX_LISTED_TOOLS])
@@ -226,7 +236,7 @@ class ToolPoisoningControl(Control):
             return flagged | {t.name: (SCREEN_TIMEOUT, "") for t in screened}
         except ClassifierUnavailableError:
             return flagged | {t.name: (CLASSIFIER_UNAVAILABLE, "") for t in screened}
-        findings = await self._assess(texts, scores, config, deadline)
+        findings = await self._assess(texts, scores, config, snapshot, deadline)
         by_name: dict[str, list[Finding]] = {}
         for tool, finding in zip(screened, findings, strict=True):
             by_name.setdefault(tool.name, []).append(finding)
@@ -249,21 +259,29 @@ class ToolPoisoningControl(Control):
         texts: Sequence[str],
         scores: Sequence[float],
         config: ToolPoisoningConfig,
+        snapshot: PolicySnapshot | None,
         deadline: float | None,
     ) -> list[Finding]:
         """One finding per definition: detected at ``threshold``, judged inside the band,
-        clean below. Decided from this request's own answers (see the module docstring)."""
+        clean below. Decided from this request's own answers (see the module docstring).
+        Answers are keyed by the judge configuration of ``snapshot`` and the definition, so a
+        reload that changes the judge model or this control's settings asks again."""
         low, high = config.judge_band
+        config_key = judge_config_key(self.id, JUDGE_INSTRUCTIONS, config, snapshot)
+
+        def key_of(text: str) -> str:
+            return f"{config_key}:{_digest(text)}"
+
         uncertain = {
-            _digest(text): text
+            key_of(text): text
             for text, score in zip(texts, scores, strict=True)
             if score < config.threshold and low <= score <= high
         }
-        answers, failures, timed_out = await self._answers_for(uncertain, deadline)
+        answers, failures, timed_out = await self._answers_for(uncertain, snapshot, deadline)
         findings: list[Finding] = []
         for text, score in zip(texts, scores, strict=True):
             bucket = score_bucket(score)
-            digest = _digest(text)
+            digest = key_of(text)
             if score >= config.threshold:
                 findings.append(Finding.detection(DETECTED, f"classifier score {bucket}"))
             elif digest not in uncertain:
@@ -284,7 +302,7 @@ class ToolPoisoningControl(Control):
         return findings
 
     async def _answers_for(
-        self, uncertain: Mapping[str, str], deadline: float | None
+        self, uncertain: Mapping[str, str], snapshot: PolicySnapshot | None, deadline: float | None
     ) -> tuple[dict[str, bool], dict[str, str], set[str]]:
         """(answers, failure reasons, timed-out digests) for the uncertain definitions."""
         answers = {d: self._answers[d] for d in uncertain if d in self._answers}
@@ -292,7 +310,7 @@ class ToolPoisoningControl(Control):
         if not pending or self._judge is None:
             return answers, dict.fromkeys(pending, "not_configured"), set()
         loop = asyncio.get_running_loop()
-        tasks = {digest: self._judge_task(digest, text) for digest, text in pending.items()}
+        tasks = {key: self._judge_task(key, text, snapshot) for key, text in pending.items()}
         timeout = None if deadline is None else max(deadline - loop.time(), 0.0)
         await asyncio.wait(tasks.values(), timeout=timeout)
         failures: dict[str, str] = {}
@@ -310,13 +328,21 @@ class ToolPoisoningControl(Control):
                 answers[digest] = task.result().is_injection
         return answers, failures, timed_out
 
-    def _judge_task(self, digest: str, text: str) -> "asyncio.Task[InjectionJudgement]":
-        """The judge call for one definition, shared by concurrent requests."""
+    def _judge_task(
+        self, digest: str, text: str, snapshot: PolicySnapshot | None
+    ) -> "asyncio.Task[InjectionJudgement]":
+        """The judge call for one definition under one judge configuration, shared by
+        concurrent requests. It runs under ``snapshot`` (the policy the request was decided
+        under) even after a reload, and its answer lands under that configuration's key only."""
         loop = asyncio.get_running_loop()
         task = self._inflight.get(digest)
         if task is not None and task.get_loop() is loop and not task.done():
             return task
-        task = loop.create_task(self._ask(text))
+        if snapshot is None:
+            task = loop.create_task(self._ask(text))
+        else:
+            with judging_under(snapshot):  # the task copies this context
+                task = loop.create_task(self._ask(text))
         self._inflight[digest] = task
         task.add_done_callback(lambda done: self._settle(digest, done))
         return task

@@ -41,7 +41,7 @@ flowchart LR
     gw8080 -- mcp_untrusted --> mcpfetch[mcp-fetch] -- fetch_egress --> internet((internet))
     gw8080 -- state --> redis[(redis)]
     prometheus -- ops: scrape /metrics --> gw9090
-    gw9090 -. audit.jsonl on audit_log volume .-> alloy -- ops --> loki
+    gw9090 -. audit-*.jsonl on audit_log volume .-> alloy -- ops --> loki
     grafana -- ops --> prometheus
     grafana -- ops --> loki
     host --> grafana[grafana :3000<br/>127.0.0.1:3300]
@@ -93,7 +93,8 @@ exact versions (`LICENSES.md` records them; Grafana and Loki are AGPLv3, used un
 - `prometheus` scrapes `gateway:9090/metrics`. It shares only `ops` with the gateway, so the
   name resolves to the operator listener's static address.
 - The gateway writes its audit JSONL to the `audit_log` volume. `alloy` mounts that volume
-  read-only, tails `audit.jsonl` and pushes to `loki`. Alloy gets no Docker socket, and its
+  read-only, tails the `audit-*.jsonl` segments (never renamed, so an Alloy outage loses
+  nothing within the retention) and pushes to `loki`. Alloy gets no Docker socket, and its
   own HTTP server listens on 127.0.0.1 inside its container.
 - `grafana` is the only one that publishes a port (`127.0.0.1:3300`). It is provisioned
   read-only from `grafana/`, and it is the only service holding `ACL_GRAFANA_ADMIN_PASSWORD`.

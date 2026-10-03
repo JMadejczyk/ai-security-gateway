@@ -7,19 +7,18 @@ Audit entries (SPEC "Audit, metrics and Grafana" → "Audit entry") are JSON lin
 (→ Loki) and, when ``ACL_AUDIT_PATH`` is set, in a JSONL export file. They carry reason codes
 and metadata only: payloads, messages, SQL text, tool arguments and upstream errors are never
 written. A keyed HMAC of the payload lets an operator match an entry to a known payload.
-The export file rotates by size; Grafana Alloy tails it into Loki. Policy reloads go to the
-same stream as `PolicyReloadEvent` lines (``"event": "policy_reload"``) for dashboard
-annotations.
+The export is size-capped, never-renamed segments; Grafana Alloy tails them into Loki.
+Policy reloads go to the same stream as `PolicyReloadEvent` lines
+(``"event": "policy_reload"``) for dashboard annotations.
 """
 
 import hashlib
 import hmac
 import json
 import logging
-import logging.handlers
 import sys
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Final, Literal, TextIO
@@ -141,19 +140,35 @@ SIGNATURE_HITS = Counter(
 SERVED_CHANNELS: Final = (Channel.LLM, Channel.MCP)
 
 
-def initialize_series(*, agents: Iterable[str], controls: Iterable[str]) -> None:
-    """Create every bounded label set of the decision counters at 0.
+def initialize_series(
+    *,
+    agents: Iterable[str],
+    controls: Iterable[str],
+    spend: Iterable[tuple[str, str, str]] = (),
+    alert_rules: Iterable[str] = (),
+) -> None:
+    """Create every bounded label set of the decision and spend counters at 0.
 
     Prometheus cannot see the increment that creates a series, so ``increase()`` over a
     dashboard's time range would miss each label set's first call (the one block of a short
-    demo). Run at startup and after every policy reload (new agents); idempotent.
+    demo). ``spend`` is the ``(user, agent, model)`` combinations of ``acl_tokens_total`` and
+    ``acl_cost_usd_total``; ``alert_rules`` the ``acl_alerts_total`` rule labels. Run at
+    startup and after every policy reload (`gateway.metric_series`); idempotent.
     """
+    for user, agent, model in spend:
+        TOKENS.labels(user=user, agent=agent, model=model)
+        COST.labels(user=user, agent=agent, model=model)
+    for rule in alert_rules:
+        ALERTS.labels(rule=rule)
     agent_labels = (*agents, OTHER_LABEL)
     for channel in SERVED_CHANNELS:
         for decision in Decision:
             for agent in agent_labels:
                 REQUESTS.labels(channel=channel.value, decision=decision.value, agent=agent)
+    for channel in SERVED_CHANNELS:  # histograms too: rate() over their first burst
+        OVERHEAD.labels(channel=channel.value)
     for control in controls:
+        CONTROL_LATENCY.labels(control=control)
         for decision in Decision:
             CONTROL_VERDICTS.labels(control=control, decision=decision.value)
     for agent in agent_labels:
@@ -363,12 +378,85 @@ AUDIT_MAX_BYTES: Final = 50 * 1024 * 1024
 AUDIT_BACKUPS: Final = 4
 
 
-class AuditLogger:
-    """Writes each entry as one JSON line to stdout and, optionally, a JSONL export file.
+class SegmentedFileHandler(logging.Handler):
+    """Append-only JSONL segments that are never renamed: ``<stem>-<UTC time>-<n><suffix>``.
 
-    The export file rotates by size (``audit.jsonl`` -> ``audit.jsonl.1`` ... ``.<backups>``,
-    the oldest dropped), so the operator volume holds at most ``max_bytes * (backups + 1)``.
-    The log shipper tails ``audit.jsonl`` by name and follows the rename.
+    A segment is created exclusively (never reopened, never overwritten) and written until it
+    would pass ``max_bytes``; then the next one starts and all but the newest ``backups + 1``
+    are deleted, so the volume holds about ``max_bytes * (backups + 1)``. Names sort
+    chronologically. Because no file is ever renamed, a tailer that keys its read offset by
+    path (Grafana Alloy) can be down across any number of rollovers and resumes every segment
+    at the right offset; a rename-based rotation would leave it with a stale offset into a
+    new file at the old path.
+    """
+
+    def __init__(self, base: Path, *, max_bytes: int, backups: int) -> None:
+        super().__init__()
+        self._dir = base.parent
+        self._stem, self._suffix = base.stem, base.suffix
+        self._max_bytes = max_bytes
+        self._backups = backups
+        self._stream: TextIO | None = None
+        self._size = 0
+        self._sequence = 0
+
+    @property
+    def pattern(self) -> str:
+        """Glob that matches every segment (what the log shipper tails)."""
+        return f"{self._stem}-*{self._suffix}"
+
+    def segments(self) -> list[Path]:
+        return sorted(self._dir.glob(self.pattern))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            line = self.format(record) + "\n"
+            size = len(line.encode("utf-8"))
+            stream = self._stream
+            if stream is None or (self._size and self._size + size > self._max_bytes):
+                stream = self._roll()
+            stream.write(line)
+            stream.flush()
+            self._size += size
+        except Exception:  # logging's contract: report, never raise into the caller
+            self.handleError(record)
+
+    def close(self) -> None:
+        self.acquire()
+        try:
+            if self._stream is not None:
+                self._stream.close()
+                self._stream = None
+        finally:
+            self.release()
+        super().close()
+
+    def _roll(self) -> TextIO:
+        if self._stream is not None:
+            self._stream.close()
+            self._stream = None
+        self._dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        stream: TextIO | None = None
+        while stream is None:
+            self._sequence += 1
+            name = f"{self._stem}-{stamp}-{self._sequence:06d}{self._suffix}"
+            try:
+                stream = (self._dir / name).open("x", encoding="utf-8")
+            except FileExistsError:
+                continue
+        self._stream, self._size = stream, 0
+        for stale in self.segments()[: -(self._backups + 1)]:
+            stale.unlink(missing_ok=True)
+        return stream
+
+
+class AuditLogger:
+    """Writes each entry as one JSON line to stdout and, optionally, a JSONL export.
+
+    The export is `SegmentedFileHandler` segments next to ``path``: ``/var/log/acl/audit.jsonl``
+    gives ``/var/log/acl/audit-<UTC time>-<n>.jsonl``, a new segment every ``max_bytes``,
+    ``backups`` old ones kept.
     """
 
     def __init__(
@@ -384,12 +472,7 @@ class AuditLogger:
         formatter = logging.Formatter("%(message)s")
         sinks: list[logging.Handler] = [logging.StreamHandler(stream or sys.stdout)]
         if path is not None:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            sinks.append(
-                logging.handlers.RotatingFileHandler(
-                    path, maxBytes=max_bytes, backupCount=backups, encoding="utf-8"
-                )
-            )
+            sinks.append(SegmentedFileHandler(path, max_bytes=max_bytes, backups=backups))
         for sink in sinks:
             sink.setFormatter(formatter)
             self._logger.addHandler(sink)

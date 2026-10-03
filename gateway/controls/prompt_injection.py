@@ -35,7 +35,9 @@ the model window is classified in overlapping windows and scores as its best win
 **Tiers.** Score at or above ``threshold``: detected. Score inside ``judge_band`` (and below
 ``threshold``): the best window of each such text goes to the LLM judge, which answers
 whether it tries to instruct an AI agent; at most `MAX_JUDGED` texts per call are judged.
-Below the band: clean. Judge verdicts are remembered by window digest like scores.
+Below the band: clean. Judge verdicts are remembered by window text under a key of the judge
+configuration in effect (`judge_config_key`), so a policy reload that changes the judge
+model or this control's settings asks the judge again.
 
 **Verdicts.** A detection is ``block`` with ``prompt_injection_detected``, a score bucket
 (never text) in ``reason`` and the configured ``risk_delta``; under ``log_only`` the same
@@ -52,7 +54,9 @@ show to be clean is treated as untrusted.
 """
 
 import asyncio
+import hashlib
 import itertools
+import json
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -61,6 +65,7 @@ from typing import ClassVar, Final, Protocol, Self, override
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from gateway.controls.scope import current_scope
 from gateway.controls.text import SegmentKind, TextExtractor, TextSegment
 from gateway.core.catalog import control_spec
 from gateway.core.envelope import Interaction, Verdict
@@ -73,6 +78,7 @@ from gateway.injection.classifier import (
 )
 from gateway.injection.prose import fragments, looks_like_prose
 from gateway.judges.client import JudgeUnavailableError
+from gateway.policy.loader import PolicySnapshot
 from gateway.policy.schema import PromptInjectionConfig
 
 logger = logging.getLogger(__name__)
@@ -239,18 +245,43 @@ def finding_verdict(control_id: str, finding: Finding, cfg: ControlConfig) -> Ve
     )
 
 
+def judge_config_key(
+    control_id: str, instructions: str, config: ControlConfig, snapshot: PolicySnapshot | None
+) -> str:
+    """Digest of everything a judge answer depends on besides the content: the control, its
+    instructions, its settings and the policy's ``judges`` section (model, limits). A cached
+    answer is reused only under the same key, so a reload that changes the judge model or the
+    control's settings asks again instead of trusting the old model's verdict."""
+    judges = snapshot.policy.judges if snapshot is not None else None
+    document = {
+        "control": control_id,
+        "instructions": instructions,
+        "config": config.model_dump(mode="json"),
+        "judges": judges.model_dump(mode="json") if judges is not None else None,
+    }
+    encoded = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def call_snapshot() -> PolicySnapshot | None:
+    """The snapshot pinned for the current call, if any (the judge uses the same one)."""
+    scope = current_scope()
+    return scope.snapshot if scope is not None else None
+
+
 class _JudgeMemory:
-    """Judge verdicts by window text, bounded (FIFO); only real verdicts are remembered."""
+    """Judge verdicts by (judge config key, window text), bounded (FIFO); only real verdicts
+    are remembered."""
 
     def __init__(self, entries: int = JUDGE_CACHE_ENTRIES) -> None:
         self._entries = entries
-        self._verdicts: dict[str, bool] = {}
+        self._verdicts: dict[tuple[str, str], bool] = {}
 
-    def get(self, text: str) -> bool | None:
-        return self._verdicts.get(text)
+    def get(self, key: str, text: str) -> bool | None:
+        return self._verdicts.get((key, text))
 
-    def put(self, text: str, is_injection: bool) -> None:
-        self._verdicts[text] = is_injection
+    def put(self, key: str, text: str, is_injection: bool) -> None:
+        self._verdicts[key, text] = is_injection
         while len(self._verdicts) > self._entries:
             del self._verdicts[next(iter(self._verdicts))]
 
@@ -318,16 +349,17 @@ class PromptInjectionControl(Control):
         if not uncertain:
             return Finding.passed(CLEAN)
         windows = list(dict.fromkeys(text[s.start : s.end] or text for text, s in uncertain))
-        return await self._judge_band(windows, uncertain[0][1])
+        key = judge_config_key(self.id, JUDGE_INSTRUCTIONS, config, call_snapshot())
+        return await self._judge_band(windows, uncertain[0][1], key)
 
-    async def _judge_band(self, windows: list[str], top: InjectionScore) -> Finding:
+    async def _judge_band(self, windows: list[str], top: InjectionScore, key: str) -> Finding:
         """Decide from this request's own answers: remembered ones are copied out first, so
         storing fresh answers (which may evict entries) cannot lose one. A window without an
         answer is unavailable, never clean."""
         bucket = score_bucket(top.score)
         answers: dict[str, bool] = {}
         for window in windows:
-            if (known := self._judged.get(window)) is not None:
+            if (known := self._judged.get(key, window)) is not None:
                 answers[window] = known
         unjudged = [w for w in windows if w not in answers]
         if len(unjudged) > MAX_JUDGED:
@@ -348,7 +380,7 @@ class PromptInjectionControl(Control):
                 raise outcome  # a bug, not an unavailable judge: the pipeline fails closed
             else:
                 answers[window] = outcome.is_injection
-                self._judged.put(window, outcome.is_injection)
+                self._judged.put(key, window, outcome.is_injection)
         if any(answers.values()):
             return Finding.detection(DETECTED, f"judge: injection; classifier score {bucket}")
         if failures or len(answers) < len(windows):

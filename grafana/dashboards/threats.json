@@ -620,7 +620,7 @@
           },
           "expr": "topk(10, max by (session_id, principal) (max_over_time({job=\"acl\", decision=~\".+\"} | json session_id=\"session_id\", principal=\"principal\", risk=\"risk\" | session_id != \"\" | risk != \"\" | unwrap risk | __error__=\"\" [$__range])))",
           "editorMode": "code",
-          "queryType": "range"
+          "queryType": "instant"
         }
       ],
       "fieldConfig": {
@@ -707,26 +707,41 @@
       },
       "transformations": [
         {
-          "id": "reduce",
+          "id": "labelsToFields",
           "options": {
-            "reducers": [
-              "lastNotNull"
-            ],
-            "labelsToFields": true
+            "mode": "columns"
+          }
+        },
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "^Value.*$",
+            "renamePattern": "peak risk"
+          }
+        },
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "session_id",
+                "principal",
+                "peak risk"
+              ]
+            }
           }
         },
         {
           "id": "organize",
           "options": {
-            "excludeByName": {
-              "Field": true
-            },
             "indexByName": {
               "session_id": 0,
-              "principal": 1
-            },
-            "renameByName": {
-              "Last *": "peak risk"
+              "principal": 1,
+              "peak risk": 2
             }
           }
         },
@@ -740,15 +755,8 @@
               }
             ]
           }
-        },
-        {
-          "id": "limit",
-          "options": {
-            "limitField": 10
-          }
         }
-      ],
-      "interval": "1m"
+      ]
     },
     {
       "id": 9,

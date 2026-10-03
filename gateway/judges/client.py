@@ -45,7 +45,9 @@ import logging
 import re
 import secrets
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Generator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import StrEnum
 from typing import Any, Final, cast
 
@@ -203,6 +205,21 @@ def _json_text(answer: str) -> str:
     return text
 
 
+_PINNED: ContextVar[PolicySnapshot | None] = ContextVar("acl_judge_snapshot", default=None)
+
+
+@contextmanager
+def judging_under(snapshot: PolicySnapshot) -> Generator[PolicySnapshot]:
+    """Judge under ``snapshot`` outside a call (e.g. a ``tools/list`` screen), so a judge task
+    started before a policy reload keeps the policy it was started for. Tasks created inside
+    the block inherit it (asyncio copies the context)."""
+    token = _PINNED.set(snapshot)
+    try:
+        yield snapshot
+    finally:
+        _PINNED.reset(token)
+
+
 class JudgeClient:
     """Asks the policy's LLM upstream for a structured verdict. Holds no per-call state.
 
@@ -224,6 +241,8 @@ class JudgeClient:
         self._nonce = nonce
 
     def _current_snapshot(self) -> PolicySnapshot:
+        if (pinned := _PINNED.get()) is not None:
+            return pinned
         scope = current_scope()
         return scope.snapshot if scope is not None else self._snapshot()
 

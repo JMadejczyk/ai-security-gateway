@@ -1,6 +1,9 @@
-"""The audit stream as Loki sees it: size-rotated JSONL export and policy-reload events."""
+"""The audit stream as Loki sees it: size-capped JSONL segments and policy-reload events."""
 
+import fnmatch
 import json
+import os
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -16,7 +19,10 @@ from gateway.telemetry import (
     ReloadResult,
 )
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
 TS = datetime(2026, 10, 4, 10, 0, tzinfo=UTC)
+SEGMENT = re.compile(r"audit-\d{8}T\d{12}Z-\d{6}\.jsonl")
 
 
 def _entry(index: int) -> AuditEntry:
@@ -32,21 +38,71 @@ def _entry(index: int) -> AuditEntry:
     )
 
 
-def test_export_rotates_by_size_and_keeps_a_bounded_number_of_files(tmp_path: Path) -> None:
-    path = tmp_path / "audit" / "audit.jsonl"
-    with open("/dev/null", "w") as sink:
-        logger = AuditLogger(stream=sink, path=path, max_bytes=4096, backups=2)
-        for index in range(200):
+def _write(path: Path, count: int, *, first: int = 0, max_bytes: int = 4096) -> None:
+    with open(os.devnull, "w") as sink:
+        logger = AuditLogger(stream=sink, path=path, max_bytes=max_bytes, backups=2)
+        for index in range(first, first + count):
             logger.write(_entry(index))
         logger.close()
-    files = sorted(p.name for p in path.parent.iterdir())
-    assert files == ["audit.jsonl", "audit.jsonl.1", "audit.jsonl.2"]
-    for file in path.parent.iterdir():
-        assert file.stat().st_size <= 4096
-        lines = file.read_text().splitlines()
-        assert all(json.loads(line)["policy_revision"] == "a1c9e2f04b7d" for line in lines)
-    newest = json.loads(path.read_text().splitlines()[-1])
-    assert newest["session_id"] == "s-199"  # the live file holds the latest lines
+
+
+def _lines(files: list[Path]) -> list[dict[str, object]]:
+    return [json.loads(line) for file in files for line in file.read_text().splitlines()]
+
+
+def test_export_rolls_over_by_size_and_keeps_a_bounded_number_of_segments(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "audit" / "audit.jsonl"
+    _write(path, 200)
+    segments = sorted(path.parent.iterdir())
+    assert len(segments) == 3  # the live one + backups=2; older ones deleted
+    assert all(SEGMENT.fullmatch(p.name) for p in segments), [p.name for p in segments]
+    assert all(p.stat().st_size <= 4096 for p in segments)
+    lines = _lines(segments)  # name order is write order
+    ids = [line["session_id"] for line in lines]
+    assert ids == [f"s-{i}" for i in range(200 - len(ids), 200)]  # contiguous, newest last
+
+
+def test_segments_are_never_renamed_or_rewritten(tmp_path: Path) -> None:
+    """A tailer keys its offset by path: a path must keep naming the same bytes forever."""
+    path = tmp_path / "audit.jsonl"
+    with open(os.devnull, "w") as sink:
+        logger = AuditLogger(stream=sink, path=path, max_bytes=4096, backups=50)
+        seen: dict[str, bytes] = {}
+        for index in range(300):
+            logger.write(_entry(index))
+            for segment in sorted(tmp_path.iterdir())[:-1]:  # every closed segment
+                content = segment.read_bytes()
+                assert seen.setdefault(segment.name, content) == content, segment.name
+        logger.close()
+    assert len(seen) > 5
+    assert not path.exists()  # nothing is ever written under the base name itself
+
+
+def test_a_restart_starts_a_new_segment_and_appends_nothing_to_old_ones(tmp_path: Path) -> None:
+    path = tmp_path / "audit.jsonl"
+    _write(path, 3, max_bytes=1 << 20)
+    (first,) = sorted(tmp_path.iterdir())
+    before = first.read_bytes()
+    _write(path, 3, first=3, max_bytes=1 << 20)
+    segments = sorted(tmp_path.iterdir())
+    assert len(segments) == 2
+    assert segments[0] == first
+    assert first.read_bytes() == before
+    assert [line["session_id"] for line in _lines(segments)] == [f"s-{i}" for i in range(6)]
+
+
+def test_the_alloy_glob_matches_exactly_the_segments(tmp_path: Path) -> None:
+    alloy = (REPO_ROOT / "observability" / "alloy" / "config.alloy").read_text()
+    (pattern,) = re.findall(r'"__path__"\s*=\s*"([^"]+)"', alloy)
+    assert Path(pattern).parent == Path("/var/log/acl")
+    path = tmp_path / "audit.jsonl"
+    _write(path, 50)
+    names = [p.name for p in tmp_path.iterdir()]
+    assert names
+    assert all(fnmatch.fnmatch(name, Path(pattern).name) for name in names)
+    assert not fnmatch.fnmatch("audit.jsonl", Path(pattern).name)
 
 
 def test_reload_event_serializes_like_an_audit_line() -> None:

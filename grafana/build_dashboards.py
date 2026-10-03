@@ -67,7 +67,7 @@ class Query(_Model):
     instant: bool = False
     table: bool = False  # Prometheus ``format: table``
 
-    def target(self, ref_id: str, *, force_range: bool = False) -> Json:
+    def target(self, ref_id: str) -> Json:
         body: Json = {
             "refId": ref_id,
             "datasource": self.datasource.model_dump(),
@@ -77,7 +77,7 @@ class Query(_Model):
         if self.legend is not None:
             body["legendFormat"] = self.legend
         if self.datasource.type == "loki":
-            body["queryType"] = "instant" if self.instant and not force_range else "range"
+            body["queryType"] = "instant" if self.instant else "range"
         else:
             body["instant"] = self.instant
             body["range"] = not self.instant
@@ -178,10 +178,6 @@ class Panel(_Model):
                 "spanNulls": False,
                 "stacking": {"mode": "normal" if self.stack else "none", "group": "A"},
             }
-        # Grafana turns a Loki *instant* metric query into one table frame, so a bar gauge or a
-        # label table would lose its per-series names: those panels query a coarse range and
-        # reduce to the last point (each point already spans the whole $__range window).
-        loki_series = self.type in {"bargauge", "table"} and self.datasource.type == "loki"
         panel: Json = {
             "id": panel_id,
             "type": self.type,
@@ -190,8 +186,7 @@ class Panel(_Model):
             "gridPos": {"h": self.height, "w": self.width, "x": x, "y": y},
             "datasource": self.datasource.model_dump(),
             "targets": [
-                query.target(chr(ord("A") + index), force_range=loki_series)
-                for index, query in enumerate(self.queries)
+                query.target(chr(ord("A") + index)) for index, query in enumerate(self.queries)
             ],
             "fieldConfig": {"defaults": defaults, "overrides": list(self.overrides)},
             "options": self.options or _default_options(self.type),
@@ -199,8 +194,8 @@ class Panel(_Model):
         }
         if self.time_from is not None:
             panel["timeFrom"] = self.time_from
-        if self.interval is not None or loki_series:
-            panel["interval"] = self.interval or "1m"
+        if self.interval is not None:
+            panel["interval"] = self.interval
         return panel
 
 
@@ -217,17 +212,7 @@ def _default_options(kind: PanelType) -> Json:
                 "orientation": "auto",
             }
         case "bargauge":
-            return {
-                "reduceOptions": reduce,
-                "orientation": "horizontal",
-                "displayMode": "gradient",
-                "valueMode": "color",
-                "showUnfilled": True,
-                "namePlacement": "left",
-                "sizing": "manual",
-                "minVizHeight": 10,
-                "maxVizHeight": 24,
-            }
+            return _bargauge_options(reduce)
         case "timeseries":
             return {
                 "legend": {"displayMode": "list", "placement": "bottom", "showLegend": True},
@@ -246,6 +231,21 @@ def _default_options(kind: PanelType) -> Json:
                 "showLabels": False,
                 "showCommonLabels": False,
             }
+
+
+def _bargauge_options(reduce: Json) -> Json:
+    """Horizontal bars, names on the left; ``reduce`` picks one value per series or per row."""
+    return {
+        "reduceOptions": reduce,
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "valueMode": "color",
+        "showUnfilled": True,
+        "namePlacement": "left",
+        "sizing": "manual",
+        "minVizHeight": 10,
+        "maxVizHeight": 24,
+    }
 
 
 class Layout:
@@ -451,6 +451,27 @@ def logs_table(columns: Sequence[str]) -> tuple[Json, ...]:
     )
 
 
+def instant_table(value: str, labels: Sequence[str]) -> tuple[Json, ...]:
+    """A Loki instant metric query (evaluated once, at the end of the range) as one table.
+
+    Series labels become columns, the frames merge into one table, the value column is named
+    ``value`` and rows sort by it, highest first. The query's own ``topk`` decides which rows
+    exist; nothing here re-aggregates over time.
+    """
+    columns: list[JsonValue] = [*labels, value]
+    return (
+        {"id": "labelsToFields", "options": {"mode": "columns"}},
+        {"id": "merge", "options": {}},
+        {"id": "renameByRegex", "options": {"regex": "^Value.*$", "renamePattern": value}},
+        {"id": "filterFieldsByName", "options": {"include": {"names": columns}}},
+        {
+            "id": "organize",
+            "options": {"indexByName": {str(name): i for i, name in enumerate(columns)}},
+        },
+        {"id": "sortBy", "options": {"sort": [{"field": value, "desc": True}]}},
+    )
+
+
 SESSION_ID_LINK: Final[Json] = {
     "matcher": {"id": "byName", "options": "session_id"},
     "properties": [
@@ -586,7 +607,6 @@ def posture() -> Dashboard:
                         'topk(10, sum by (reason_code) (count_over_time({job="acl", '
                         'decision=~"block|require_approval"} | json reason_code="reason_code" '
                         "[$__range])))",
-                        "{{reason_code}}",
                         instant=True,
                     ),
                 ),
@@ -594,6 +614,19 @@ def posture() -> Dashboard:
                 decimals=0,
                 thresholds=(Threshold(color="red"),),
                 color_mode="thresholds",
+                # One bar per reason code: each table row becomes a field named by its code.
+                transformations=(
+                    *instant_table("count", ("reason_code",)),
+                    {
+                        "id": "rowsToFields",
+                        "options": {
+                            "mappings": [
+                                {"fieldName": "reason_code", "handlerKey": "field.name"},
+                                {"fieldName": "count", "handlerKey": "field.value"},
+                            ]
+                        },
+                    },
+                ),
             ),
             Panel(
                 type="bargauge",
@@ -635,7 +668,9 @@ def posture() -> Dashboard:
                 type="timeseries",
                 title="Tokens per agent",
                 description="Token throughput by agent and model.",
-                queries=(prom(rate("acl_tokens_total", "agent, model"), "{{agent}} {{model}}"),),
+                queries=(
+                    prom(rate("acl_tokens_total", "agent, model") + " > 0", "{{agent}} {{model}}"),
+                ),
                 width=8,
                 unit="short",
             ),
@@ -768,22 +803,7 @@ def threats() -> Dashboard:
                 maximum=1,
                 thresholds=GREEN_AMBER_RED,
                 color_mode="thresholds",
-                transformations=(
-                    {
-                        "id": "reduce",
-                        "options": {"reducers": ["lastNotNull"], "labelsToFields": True},
-                    },
-                    {
-                        "id": "organize",
-                        "options": {
-                            "excludeByName": {"Field": True},
-                            "indexByName": {"session_id": 0, "principal": 1},
-                            "renameByName": {"Last *": "peak risk"},
-                        },
-                    },
-                    {"id": "sortBy", "options": {"sort": [{"field": "peak risk", "desc": True}]}},
-                    {"id": "limit", "options": {"limitField": 10}},
-                ),
+                transformations=instant_table("peak risk", ("session_id", "principal")),
                 overrides=(
                     _column_width("principal", 120),
                     {
@@ -992,21 +1012,7 @@ def session_trace() -> Dashboard:
                 queries=(loki(recent, instant=True),),
                 width=8,
                 height=10,
-                transformations=(
-                    {
-                        "id": "reduce",
-                        "options": {"reducers": ["lastNotNull"], "labelsToFields": True},
-                    },
-                    {
-                        "id": "organize",
-                        "options": {
-                            "excludeByName": {"Field": True},
-                            "indexByName": {"session_id": 0, "principal": 1, "actor": 2},
-                            "renameByName": {"Last *": "calls"},
-                        },
-                    },
-                    {"id": "sortBy", "options": {"sort": [{"field": "calls", "desc": True}]}},
-                ),
+                transformations=instant_table("calls", ("session_id", "principal", "actor")),
                 overrides=(
                     _column_width("principal", 110),
                     _column_width("actor", 100),
@@ -1215,7 +1221,11 @@ def performance() -> Dashboard:
                 title="Control latency p95",
                 description="Time spent in each control (deterministic and semantic).",
                 queries=(
-                    prom(quantile(0.95, "acl_control_latency_seconds", "control"), "{{control}}"),
+                    # `> 0` drops the NaN of controls that saw no call (series start at zero)
+                    prom(
+                        quantile(0.95, "acl_control_latency_seconds", "control") + " > 0",
+                        "{{control}}",
+                    ),
                 ),
                 width=12,
                 unit="s",
@@ -1226,7 +1236,8 @@ def performance() -> Dashboard:
                 description="Slowest controls over the whole time range.",
                 queries=(
                     prom(
-                        quantile(0.95, "acl_control_latency_seconds", "control", "$__range"),
+                        quantile(0.95, "acl_control_latency_seconds", "control", "$__range")
+                        + " > 0",
                         "{{control}}",
                         instant=True,
                     ),

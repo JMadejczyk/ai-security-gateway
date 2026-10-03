@@ -120,7 +120,10 @@ async def test_exercised_metrics_carry_values(exposition: dict[str, list[Any]]) 
 async def test_models_outside_the_pricing_table_are_bucketed_as_other(
     exposition: dict[str, list[Any]],
 ) -> None:
-    tokens = {s.labels["model"]: s.value for s in exposition["acl_tokens_total"]}
+    tokens: dict[str, float] = {}
+    for sample in exposition["acl_tokens_total"]:
+        model = sample.labels["model"]
+        tokens[model] = tokens.get(model, 0) + sample.value
     assert tokens.get("other", 0) >= 19  # the unpriced call's usage
     assert tokens.get("qwen3:8b", 0) >= 19
     for name in ("acl_tokens_total", "acl_cost_usd_total"):
@@ -157,5 +160,45 @@ async def test_decision_counters_start_at_zero_for_every_label_set(
     assert ("prompt_injection", "block") in verdicts
     signatures = {s.labels["signature"] for s in exposition["acl_signature_hits_total"]}
     assert "inj.ignore-previous" in signatures
+    # Histograms as well: the exercise makes no MCP call, yet the MCP series exist. (Values
+    # are not asserted: the registry is process-wide, earlier tests may have counted.)
+    assert "mcp" in {s.labels["channel"] for s in exposition["acl_overhead_seconds_count"]}
+    latency_counts = exposition["acl_control_latency_seconds_count"]
+    assert "sql_guard" in {s.labels["control"] for s in latency_counts}
     approvals = {s.labels["decision"] for s in exposition["acl_approvals_total"]}
     assert {"pending", "approved", "denied", "expired"} <= approvals
+
+
+async def test_spend_and_alert_series_start_at_zero_for_allowed_combinations(
+    exposition: dict[str, list[Any]],
+) -> None:
+    for name in ("acl_tokens_total", "acl_cost_usd_total"):
+        series = {
+            (s.labels["user"], s.labels["agent"], s.labels["model"]): s.value
+            for s in exposition[name]
+        }
+        # bartek makes no call here: his allowed pairs exist, every priced model and other.
+        assert ("bartek@demo", "databot", "qwen3:8b") in series
+        assert ("bartek@demo", "databot", "other") in series
+        assert ("svc:nightly_etl", "nightly_etl", "other") in series
+        assert ("other", "databot", "qwen3:8b") in series  # unknown humans are `other`
+        # Pairs the policy never allows are not created: cardinality stays bounded.
+        assert not [k for k in series if k[0] == "svc:nightly_etl" and k[1] != "nightly_etl"]
+        assert not [k for k in series if k[1] == "nightly_etl" and k[0] != "svc:nightly_etl"]
+    rules = {s.labels["rule"] for s in exposition["acl_alerts_total"]}
+    assert {"autonomous.1", "autonomous.2"} <= rules  # policy.yaml's `alert: true` rules
+    assert not {r for r in rules if r.startswith("interactive.")}
+
+
+async def test_a_reload_adds_the_series_of_new_policy_labels(gateway: Harness) -> None:
+    document: dict[str, Any] = yaml.safe_load(gateway.policy_path.read_text())
+    document["pricing"]["llama3.1:8b"] = {"prompt_per_1k": 0.0, "completion_per_1k": 0.0}
+    document["risk_rules"]["interactive"][0]["then"]["alert"] = True
+    gateway.policy_path.write_text(yaml.safe_dump(document))
+    reload = await gateway.operator.post(
+        "/admin/reload", headers=bearer(await gateway.operator_token("root@demo"))
+    )
+    assert reload.json()["result"] == "ok", reload.text
+    text = (await gateway.operator.get("/metrics")).text
+    assert 'acl_tokens_total{agent="databot",model="llama3.1:8b",user="anna@demo"}' in text
+    assert 'acl_alerts_total{rule="interactive.0"}' in text

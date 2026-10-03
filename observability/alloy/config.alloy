@@ -1,16 +1,24 @@
 // Grafana Alloy: ships the gateway's audit log to Loki (SPEC "Audit, metrics and Grafana").
 //
-// The gateway writes one JSON line per decision (and per policy reload) to
-// /var/log/acl/audit.jsonl on the `audit_log` volume, which Alloy mounts read-only. No Docker
-// socket: Alloy sees that one file and nothing else. The gateway rotates the file by size
-// (audit.jsonl -> audit.jsonl.1); the tailer follows the name and reopens the new file.
+// The gateway writes one JSON line per decision (and per policy reload) to append-only
+// segments /var/log/acl/audit-<UTC time>-<n>.jsonl on the `audit_log` volume, which Alloy
+// mounts read-only. No Docker socket: Alloy sees those files and nothing else.
+//
+// Rotation: a segment is never renamed or rewritten; the gateway starts a new one at its size
+// cap and deletes the oldest beyond its retention. Alloy keys its read offset by path, so a
+// path always names the same bytes: after an Alloy outage spanning any number of rollovers
+// each segment resumes at its saved offset and new segments are read from the start. Nothing
+// is lost (unless a segment is deleted before Alloy ever reads it: an outage longer than the
+// retention) and nothing is re-read. (A rename rotation, audit.jsonl -> audit.jsonl.1, would
+// leave a stale offset into the new audit.jsonl after an outage, and matching audit.jsonl*
+// would re-ship every backup on every rotation.)
 //
 // Labels stay low-cardinality: job plus `channel`, `decision`, `actor`, `mode` and `event`
 // (all bounded by the policy or by enums). session_id, principal, resource, reason_code and
 // risk stay in the line, queryable with `| json`.
 
 local.file_match "audit" {
-  path_targets = [{"__path__" = "/var/log/acl/audit.jsonl", "job" = "acl"}]
+  path_targets = [{"__path__" = "/var/log/acl/audit-*.jsonl", "job" = "acl"}]
   sync_period  = "5s"
 }
 
@@ -47,7 +55,7 @@ loki.process "audit" {
     }
   }
 
-  // One file, so the path label carries nothing.
+  // The segment name carries nothing a query needs (and would split streams per segment).
   stage.label_drop {
     values = ["filename"]
   }

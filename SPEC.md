@@ -349,7 +349,7 @@ Each control declares its supported modes ordered from most to least enforcing (
 
 Every decision leaves one audit entry with the full "why", and metrics feed dashboards for both security and management.
 
-**Audit entry** (JSON to stdout, plus a size-rotated JSONL file that Alloy ships to Loki and that doubles as the export):
+**Audit entry** (JSON to stdout, plus append-only JSONL segments `audit-<UTC time>-<n>.jsonl` that are never renamed, so Alloy ships every line to Loki even across an outage; the newest segments double as the export):
 
 ```json
 {"ts":"2026-10-04T10:12:03Z","session_id":"s-81f","principal":"intern@demo","actor":"databot",

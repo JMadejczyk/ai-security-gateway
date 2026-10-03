@@ -1,6 +1,7 @@
 """``prompt_injection`` on its own, with a fake classifier and a scripted judge."""
 
 import asyncio
+import copy
 import json
 import threading
 import time
@@ -20,13 +21,16 @@ from gateway.controls.prompt_injection import (
     rolling_windows,
     score_bucket,
 )
+from gateway.controls.scope import CallScope, call_scope
 from gateway.controls.text import SegmentKind, TextExtractor, TextSegment
 from gateway.core.envelope import Interaction
-from gateway.core.types import Action, Channel, ControlMode, Decision, Stage
+from gateway.core.types import Action, Channel, ControlMode, Decision, SessionMode, Stage
 from gateway.injection.classifier import ClassifierRunner, InjectionScore, UnavailableClassifier
 from gateway.injection.prose import looks_like_prose
-from gateway.judges.client import JudgeResult
+from gateway.judges.client import JudgeClient, JudgeResult
+from gateway.policy.evaluator import PrincipalContext
 from gateway.policy.schema import PromptInjectionConfig
+from gateway.upstream import Upstream, UpstreamResult
 
 BLOCK = PromptInjectionConfig(mode=ControlMode.BLOCK, risk_delta=0.6)
 LOG_ONLY = PromptInjectionConfig(mode=ControlMode.LOG_ONLY, risk_delta=0.6)
@@ -864,3 +868,50 @@ PROSE_CASES = [
 @pytest.mark.parametrize(("text", "prose"), PROSE_CASES, ids=[c[0][:24] for c in PROSE_CASES])
 def test_looks_like_prose(text, prose):
     assert looks_like_prose(text) is prose
+
+
+# ------------------------------------------- judge cache vs policy reload (2026-10-04)
+
+
+class ModelUpstream(Upstream):
+    """Scripted LLM upstream for the real `JudgeClient`: the answer depends on the model."""
+
+    def __init__(self, injection_by: dict[str, bool]) -> None:
+        self.injection_by = injection_by
+        self.models: list[str] = []
+
+    async def execute(self, payload: object, snapshot: Any) -> UpstreamResult:
+        del snapshot
+        model = payload["model"]  # type: ignore[index]
+        self.models.append(model)
+        verdict = {"is_injection": self.injection_by[model], "confidence": 0.9, "rationale": "r"}
+        body = {"choices": [{"message": {"role": "assistant", "content": json.dumps(verdict)}}]}
+        return UpstreamResult(body=body, elapsed_s=0.0)
+
+
+@DENIED
+async def test_a_reload_to_another_judge_model_asks_the_judge_again(
+    interaction, policy_doc, snapshot_from
+):
+    """Codex P2 (also in this control): a clearance cached under one judge model was reused
+    after a reload to another."""
+
+    def with_model(model: str) -> Any:
+        document = copy.deepcopy(policy_doc)
+        document["judges"] = {"model": model, "timeout_s": 5}
+        return snapshot_from(document)
+
+    upstream = ModelUpstream({"lenient-judge": False, "strict-judge": True})
+    client = JudgeClient(upstream, lambda: with_model("unused"))
+    pi = PromptInjectionControl(ClassifierRunner(MarkerClassifier()), client)
+    principal = PrincipalContext(
+        principal="anna@demo", agent="databot", mode=SessionMode.INTERACTIVE
+    )
+    verdicts = []
+    for model in ("lenient-judge", "strict-judge"):
+        with call_scope(CallScope(snapshot=with_model(model), principal=principal)):
+            verdicts.append(
+                await pi.evaluate(interaction(Channel.LLM, prompt(DOUBT_MARKER)), Stage.PRE, BLOCK)
+            )
+    assert [v.reason_code for v in verdicts] == ["judge_cleared", "prompt_injection_detected"]
+    assert upstream.models == ["lenient-judge", "strict-judge"]

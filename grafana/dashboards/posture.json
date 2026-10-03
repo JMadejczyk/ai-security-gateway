@@ -697,8 +697,7 @@
           },
           "expr": "topk(10, sum by (reason_code) (count_over_time({job=\"acl\", decision=~\"block|require_approval\"} | json reason_code=\"reason_code\" [$__range])))",
           "editorMode": "code",
-          "legendFormat": "{{reason_code}}",
-          "queryType": "range"
+          "queryType": "instant"
         }
       ],
       "fieldConfig": {
@@ -717,8 +716,7 @@
           },
           "mappings": [],
           "links": [],
-          "decimals": 0,
-          "displayName": "${__field.labels.reason_code}"
+          "decimals": 0
         },
         "overrides": []
       },
@@ -739,8 +737,71 @@
         "minVizHeight": 10,
         "maxVizHeight": 24
       },
-      "transformations": [],
-      "interval": "1m"
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {
+            "mode": "columns"
+          }
+        },
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "^Value.*$",
+            "renamePattern": "count"
+          }
+        },
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "reason_code",
+                "count"
+              ]
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "reason_code": 0,
+              "count": 1
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "count",
+                "desc": true
+              }
+            ]
+          }
+        },
+        {
+          "id": "rowsToFields",
+          "options": {
+            "mappings": [
+              {
+                "fieldName": "reason_code",
+                "handlerKey": "field.name"
+              },
+              {
+                "fieldName": "count",
+                "handlerKey": "field.value"
+              }
+            ]
+          }
+        }
+      ]
     },
     {
       "id": 9,
@@ -916,7 +977,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (agent, model) (rate(acl_tokens_total{}[$__rate_interval]))",
+          "expr": "sum by (agent, model) (rate(acl_tokens_total{}[$__rate_interval])) > 0",
           "editorMode": "code",
           "legendFormat": "{{agent}} {{model}}",
           "instant": false,

@@ -172,10 +172,13 @@ only. Grafana is published on `http://127.0.0.1:3300` (`ACL_GRAFANA_HOST_PORT`);
 `admin` with `ACL_GRAFANA_ADMIN_PASSWORD` from `.env`. Anonymous access and sign-up are off.
 
 - **Metrics.** Prometheus scrapes the operator listener's `/metrics` every 5 s (7 days kept).
-- **Audit log.** The gateway writes one JSON line per decision to
-  `/var/log/acl/audit.jsonl` on the `audit_log` volume (`ACL_AUDIT_PATH`). The file rotates at
-  50 MiB and keeps 4 old files (`ACL_AUDIT_MAX_BYTES`, `ACL_AUDIT_BACKUPS`). Alloy mounts the
-  volume read-only, with no Docker socket, and pushes the lines to Loki (7 days kept). Only
+- **Audit log.** The gateway writes one JSON line per decision to append-only segments
+  `/var/log/acl/audit-<UTC time>-<n>.jsonl` on the `audit_log` volume (`ACL_AUDIT_PATH` names
+  the base, `/var/log/acl/audit.jsonl`). It starts a new segment every 50 MiB and keeps 4 old
+  ones (`ACL_AUDIT_MAX_BYTES`, `ACL_AUDIT_BACKUPS`). A segment is never renamed, so Alloy,
+  which keys its read offset by path, resumes correctly after an outage of any length within
+  that retention. Alloy mounts the volume read-only, with no Docker socket, and pushes the
+  lines to Loki (7 days kept). Only
   `channel`, `decision`, `actor`, `mode` and `event` become Loki labels. Session ids,
   principals, resources and reason codes stay in the line; query them with `| json`.
 - **Policy changes.** Every reload attempt also writes a line,

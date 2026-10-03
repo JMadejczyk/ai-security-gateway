@@ -15,12 +15,13 @@ from typing import Any
 
 import pytest
 import yaml
-from conftest import REPO_ROOT
 
 import gateway.approvals.metrics
 import gateway.judges.client  # registers acl_judge_* on the shared registry
 from gateway.telemetry import REGISTRY
 from grafana.build_dashboards import DASHBOARDS_DIR, render_all
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 assert gateway.approvals.metrics  # registers acl_approvals_* and acl_kill_switch_active
 
@@ -233,7 +234,7 @@ def test_alloy_promotes_only_low_cardinality_labels() -> None:
     promoted = set(re.findall(r"(\w+)\s*=", labels_block.group(1)))
     assert promoted == ALLOY_LABELS - {"job"}
     assert '"job" = "acl"' in config
-    assert "/var/log/acl/audit.jsonl" in config
+    assert '"__path__" = "/var/log/acl/audit-*.jsonl"' in config
     code = "\n".join(line.split("//")[0] for line in config.splitlines())  # comments out
     assert "docker" not in code.lower()  # no discovery.docker / loki.source.docker, no socket
 
@@ -270,3 +271,24 @@ def test_grafana_provisioning_matches_the_dashboard_mount() -> None:
 
 def test_dashboard_files_are_the_only_ones_in_the_folder() -> None:
     assert {p.name for p in Path(DASHBOARDS_DIR).iterdir()} == set(render_all())
+
+
+@pytest.mark.parametrize(
+    ("uid", "title"),
+    [
+        ("acl-posture", "Top threat reason codes"),
+        ("acl-threats", "Highest-risk sessions"),
+        ("acl-session-trace", "Recent sessions"),
+    ],
+)
+def test_loki_summaries_are_instant_queries_over_the_whole_range(uid: str, title: str) -> None:
+    """Evaluated once at the end of the range: the query's topk is the final top K, and
+    nothing outside the range leaks in (a range query reduced to its last point would)."""
+    (panel,) = [p for p in DASHBOARDS[uid]["panels"] if p["title"] == title]
+    (target,) = panel["targets"]
+    assert target["queryType"] == "instant"
+    assert "[$__range]" in target["expr"]
+    assert target["expr"].startswith("topk(")
+    ids = [t["id"] for t in panel["transformations"]]
+    assert "reduce" not in ids  # no re-aggregation of the returned values over time
+    assert ids[:2] == ["labelsToFields", "merge"]

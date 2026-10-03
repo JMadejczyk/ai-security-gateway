@@ -94,7 +94,8 @@ services:
       # The pinned injection classifier (gateway/injection/model_manifest.json). Every file is
       # hashed at startup; missing or altered files and the gateway refuses to start.
       ACL_MODELS_DIR: /app/models
-      # Audit JSONL export (rotated by size), tailed read-only by alloy into Loki.
+      # Audit JSONL export: segments audit-<time>-<n>.jsonl next to this base path (never
+      # renamed), tailed read-only by alloy into Loki.
       ACL_AUDIT_PATH: /var/log/acl/audit.jsonl
     volumes:
       - type: volume

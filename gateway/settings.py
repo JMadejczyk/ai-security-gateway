@@ -39,7 +39,8 @@ class Settings(BaseSettings):
     operator_host: str = "127.0.0.1"
     operator_port: Port = 9090
     audit_path: Path | None = None  # JSONL export next to the stdout audit stream
-    # The export rotates at audit_max_bytes, keeping audit_backups old files (retention cap).
+    # The export is never-renamed segments next to audit_path (audit-<time>-<n>.jsonl): a new
+    # one every audit_max_bytes, audit_backups old ones kept (`telemetry.SegmentedFileHandler`).
     audit_max_bytes: int = Field(default=50 * 1024 * 1024, ge=64 * 1024)
     audit_backups: int = Field(default=4, ge=1, le=100)
     pins_dir: Path = Path("pins")  # operator-pinned MCP tool schemas: <pins_dir>/<server>.json

@@ -1,8 +1,10 @@
 """``tool_poisoning`` on its own: the listing screen and the tools/call check, fake classifier."""
 
 import asyncio
+import copy
+import json
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from injection_kit import DOUBT_MARKER, INJECT_MARKER, MarkerClassifier, ScriptedJudge
@@ -10,6 +12,7 @@ from injection_kit import DOUBT_MARKER, INJECT_MARKER, MarkerClassifier, Scripte
 from gateway.controls.prompt_injection import InjectionJudgement
 from gateway.controls.tool_pinning import PinnedListing, PinStatus, listing_scope
 from gateway.controls.tool_poisoning import (
+    MAX_CONCURRENT_JUDGES,
     MAX_LISTED_TOOLS,
     ToolPoisoningControl,
     definition_text,
@@ -17,10 +20,11 @@ from gateway.controls.tool_poisoning import (
 from gateway.core.envelope import Interaction
 from gateway.core.types import Action, Channel, ControlMode, Decision, Stage
 from gateway.injection.classifier import ClassifierRunner, InjectionScore, UnavailableClassifier
-from gateway.judges.client import JudgeResult
+from gateway.judges.client import JudgeClient, JudgeResult
 from gateway.policy.loader import PolicyLoadError
 from gateway.policy.schema import ToolPoisoningConfig
 from gateway.proxies.mcp import wire
+from gateway.upstream import Upstream, UpstreamResult
 
 BLOCK = ToolPoisoningConfig(mode=ControlMode.BLOCK)
 ALLOWED = pytest.mark.control("tool_poisoning", "allow")
@@ -414,3 +418,72 @@ async def test_a_poisoned_field_is_classified_on_its_own(snapshot, call):
     with listing_scope(listing(definition)):
         verdict = await screen.evaluate(call("fetch"), Stage.PRE, BLOCK)
     assert verdict.reason_code == "tool_poisoning_detected"
+
+
+# ------------------------------------------- judge cache vs policy reload (2026-10-04)
+
+
+class ModelUpstream(Upstream):
+    """A scripted LLM upstream for the real `JudgeClient`: the answer depends on the model
+    the judge asks, so a reused answer from another model is visible."""
+
+    def __init__(self, poisoned_by: dict[str, bool], delay_s: float = 0.0) -> None:
+        self.poisoned_by = poisoned_by
+        self.delay_s = delay_s
+        self.models: list[str] = []
+
+    async def execute(self, payload: object, snapshot: Any) -> UpstreamResult:
+        del snapshot
+        model = cast("dict[str, Any]", payload)["model"]
+        self.models.append(model)
+        await asyncio.sleep(self.delay_s)
+        verdict = {"is_injection": self.poisoned_by[model], "confidence": 0.9, "rationale": "r"}
+        body = {"choices": [{"message": {"role": "assistant", "content": json.dumps(verdict)}}]}
+        return UpstreamResult(body=body, elapsed_s=0.0)
+
+
+def with_judge_model(policy_doc: dict[str, Any], snapshot_from: Any, model: str) -> Any:
+    document = copy.deepcopy(policy_doc)
+    document["judges"] = {"model": model, "timeout_s": 5}
+    return snapshot_from(document)
+
+
+@DENIED
+async def test_a_reload_to_another_judge_model_asks_again(policy_doc, snapshot_from):
+    """Codex P2: a clearance from the old judge model was reused after a reload."""
+    old = with_judge_model(policy_doc, snapshot_from, "lenient-judge")
+    new = with_judge_model(policy_doc, snapshot_from, "strict-judge")
+    current = {"snapshot": old}
+    upstream = ModelUpstream({"lenient-judge": False, "strict-judge": True})
+    client = JudgeClient(upstream, lambda: current["snapshot"])
+    screen = ToolPoisoningControl(ClassifierRunner(MarkerClassifier()), client)
+    assert await screen.screen_listing("web", [DOUBTFUL], old) == set()  # old model: clean
+    current["snapshot"] = new
+    assert await screen.screen_listing("web", [DOUBTFUL], new) == {"fetch"}  # asked again
+    assert upstream.models == ["lenient-judge", "strict-judge"]
+    assert await screen.screen_listing("web", [DOUBTFUL], new) == {"fetch"}
+    assert upstream.models == ["lenient-judge", "strict-judge"]  # cached per configuration
+
+
+async def test_a_judge_call_started_before_a_reload_keeps_its_policy(policy_doc, snapshot_from):
+    """The listing timed out under the old policy with judge calls still queued (more than
+    `MAX_CONCURRENT_JUDGES`); they run after the reload, under the old model, and fill only
+    the old configuration's entries."""
+    old = with_judge_model(policy_doc, snapshot_from, "lenient-judge")
+    new = with_judge_model(policy_doc, snapshot_from, "strict-judge")
+    current = {"snapshot": old}
+    upstream = ModelUpstream({"lenient-judge": False, "strict-judge": True}, delay_s=0.2)
+    client = JudgeClient(upstream, lambda: current["snapshot"])
+    screen = ToolPoisoningControl(
+        ClassifierRunner(MarkerClassifier()), client, listing_budget_s=0.05
+    )
+    tools = [tool(f"t{i}", f"Tool {i}. {DOUBT_MARKER}") for i in range(MAX_CONCURRENT_JUDGES + 1)]
+    hidden = await screen.screen_listing("web", tools, old)
+    assert hidden == {t.name for t in tools}  # no answer in time
+    current["snapshot"] = new  # reload while calls are in flight or still queued
+    await asyncio.sleep(0.6)
+    assert upstream.models == ["lenient-judge"] * len(tools)  # each under its own policy
+    patient = ToolPoisoningControl(ClassifierRunner(MarkerClassifier()), client)
+    patient._answers = screen._answers  # the same cache, without the short deadline
+    assert await patient.screen_listing("web", tools, new) == {t.name for t in tools}
+    assert upstream.models.count("strict-judge") == len(tools)  # the new model was asked

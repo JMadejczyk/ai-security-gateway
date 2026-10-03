@@ -741,7 +741,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, control) (rate(acl_control_latency_seconds_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, control) (rate(acl_control_latency_seconds_bucket[$__rate_interval]))) > 0",
           "editorMode": "code",
           "legendFormat": "{{control}}",
           "instant": false,
@@ -816,7 +816,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, control) (rate(acl_control_latency_seconds_bucket[$__range])))",
+          "expr": "histogram_quantile(0.95, sum by (le, control) (rate(acl_control_latency_seconds_bucket[$__range]))) > 0",
           "editorMode": "code",
           "legendFormat": "{{control}}",
           "instant": true,

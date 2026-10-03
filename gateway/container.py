@@ -37,16 +37,15 @@ from gateway.controls.signatures import SignaturesControl
 from gateway.controls.sql_guard import SqlGuardControl
 from gateway.controls.tool_pinning import ToolPinningControl
 from gateway.controls.tool_poisoning import ToolPoisoningControl
-from gateway.core.catalog import CONTROL_CATALOG
 from gateway.core.types import Channel
 from gateway.feed.store import FeedStore
 from gateway.identity import DemoIdentities, DemoTokenIssuer, TokenVerifier
 from gateway.injection.classifier import ClassifierRunner, InjectionClassifier, load_classifier
 from gateway.judges import JudgeClient
 from gateway.judges.client import JudgeFactory
+from gateway.metric_series import initialize_metric_series
 from gateway.pipeline import ChannelRoute, DecisionRecorder, Pipeline, SessionGate
 from gateway.policy.evaluator import PolicyEvaluator
-from gateway.policy.loader import PolicySnapshot
 from gateway.policy.store import PolicyStore
 from gateway.proxies.llm import LLMProxy
 from gateway.proxies.mcp.downstream import MCPProxy
@@ -58,14 +57,9 @@ from gateway.proxies.mcp.upstream import MCPConnector
 from gateway.sessions import SessionStore
 from gateway.settings import Settings
 from gateway.state_stores import StateStores
-from gateway.telemetry import AuditLogger, PolicyReloadEvent, initialize_series
+from gateway.telemetry import AuditLogger, PolicyReloadEvent
 
 logger = logging.getLogger(__name__)
-
-
-def _initialize_metric_series(snapshot: PolicySnapshot) -> None:
-    """Zero series for the policy's agents and the catalog's controls (dashboards' increase())."""
-    initialize_series(agents=snapshot.policy.agents, controls=CONTROL_CATALOG)
 
 
 @dataclass(kw_only=True, eq=False)
@@ -112,8 +106,6 @@ class GatewayContainer:
         identities file error. ``resolver`` resolves ``egress`` destinations (tests inject a
         fake, so they make no DNS queries)."""
         policy_store = PolicyStore.from_path(settings.policy_path)
-        _initialize_metric_series(policy_store.current)
-        policy_store.subscribe(lambda _previous, current: _initialize_metric_series(current))
         feed_store = FeedStore.boot(lambda: policy_store.current)
         # prompt_injection is always active (omitted = profile default), so no verified model
         # means no gateway; tool_poisoning shares the model, its cache and its worker bound.
@@ -129,6 +121,10 @@ class GatewayContainer:
         )
         signatures = SignaturesControl(lambda: feed_store.current)
         identities = DemoIdentities.load(settings.identities_path) if settings.demo_tokens else None
+        # Zero series for every bounded label set (dashboards' increase()), again on reload.
+        humans = identities.subjects() if identities is not None else frozenset[str]()
+        initialize_metric_series(policy_store.current, humans)
+        policy_store.subscribe(lambda _old, current: initialize_metric_series(current, humans))
         verifier = TokenVerifier(settings.jwt_key, clock=clock)
         state = StateStores.from_settings(settings, clock=clock)
         sessions = state.sessions

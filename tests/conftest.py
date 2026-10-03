@@ -1,13 +1,15 @@
 """Shared fixtures: the root policy, snapshots built from edited copies, session contexts."""
 
 import copy
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+import respx
 import yaml
+from gateway_testkit import LLM_BASE, Harness, running_gateway
 
 from gateway.core.envelope import SessionContext
 from gateway.core.types import SessionMode
@@ -86,3 +88,20 @@ def make_ctx() -> CtxFactory:
         return SessionContext.model_validate(fields)
 
     return build
+
+
+# ------------------------------------------------------------------ gateway HTTP suites
+
+
+@pytest.fixture
+async def gateway(tmp_path: Path) -> AsyncIterator[Harness]:
+    """Both apps over one container (policy copy in tmp_path, fixed clock, captured audit)."""
+    async with running_gateway(tmp_path) as harness:
+        yield harness
+
+
+@pytest.fixture
+def llm_upstream() -> Iterator[respx.MockRouter]:
+    """Mocks the policy's LLM upstream; anything else the gateway calls is an error."""
+    with respx.mock(base_url=LLM_BASE, assert_all_called=False) as router:
+        yield router

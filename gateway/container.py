@@ -1,0 +1,118 @@
+"""Composition root: builds every long-lived component once and owns their lifecycle.
+
+Both listeners (agent and operator) share one container, so they see the same policy
+store, session state and upstream connection pool.
+"""
+
+import asyncio
+import contextlib
+import logging
+from collections.abc import AsyncGenerator, Mapping
+from dataclasses import dataclass, field
+from typing import Self, TextIO
+
+import httpx
+
+from gateway.adapters.llm import LLMAdapter
+from gateway.clock import Clock, utc_now
+from gateway.controls.registry import ControlRegistry
+from gateway.core.types import Channel
+from gateway.identity import DemoIdentities, DemoTokenIssuer, TokenVerifier
+from gateway.pipeline import ChannelRoute, DecisionRecorder, Pipeline, SessionGate
+from gateway.policy.store import PolicyStore
+from gateway.proxies.llm import LLMProxy
+from gateway.sessions import InMemorySessionStore, SessionStore
+from gateway.settings import Settings
+from gateway.telemetry import AuditLogger
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(kw_only=True, eq=False)
+class GatewayContainer:
+    settings: Settings
+    policy_store: PolicyStore
+    verifier: TokenVerifier
+    issuer: DemoTokenIssuer | None  # None when ACL_DEMO_TOKENS=0
+    sessions: SessionStore
+    gate: SessionGate
+    pipeline: Pipeline
+    llm: LLMProxy
+    audit: AuditLogger
+    clock: Clock
+    _users: int = field(default=0, init=False)
+    _watcher: asyncio.Task[None] | None = field(default=None, init=False)
+
+    @classmethod
+    def from_settings(
+        cls,
+        settings: Settings,
+        *,
+        clock: Clock = utc_now,
+        transport: httpx.AsyncBaseTransport | None = None,
+        env: Mapping[str, str] | None = None,
+        audit_stream: TextIO | None = None,
+    ) -> Self:
+        """Raises `PolicyLoadError` (no valid policy, no gateway) or an identities file error."""
+        policy_store = PolicyStore.from_path(settings.policy_path)
+        identities = DemoIdentities.load(settings.identities_path) if settings.demo_tokens else None
+        verifier = TokenVerifier(settings.jwt_key, clock=clock)
+        issuer = (
+            DemoTokenIssuer(identities, settings.jwt_key, verifier, clock=clock)
+            if identities is not None
+            else None
+        )
+        sessions = InMemorySessionStore(clock=clock)
+        gate = SessionGate(verifier, sessions)
+        llm = LLMProxy(env=env, transport=transport)
+        audit = AuditLogger(stream=audit_stream, path=settings.audit_path)
+        recorder = DecisionRecorder(
+            audit,
+            settings.internal_key_bytes,
+            identities.subjects() if identities is not None else frozenset(),
+        )
+        pipeline = Pipeline(
+            gate,
+            {Channel.LLM: ChannelRoute(adapter=LLMAdapter(), upstream=llm)},
+            ControlRegistry(),  # stage 5-10 controls register here
+            recorder,
+            clock=clock,
+        )
+        return cls(
+            settings=settings,
+            policy_store=policy_store,
+            verifier=verifier,
+            issuer=issuer,
+            sessions=sessions,
+            gate=gate,
+            pipeline=pipeline,
+            llm=llm,
+            audit=audit,
+            clock=clock,
+        )
+
+    @contextlib.asynccontextmanager
+    async def running(self) -> AsyncGenerator[Self]:
+        """Start shared resources on first entry and stop them on last exit.
+
+        Each listener's lifespan enters this, so two servers in one process share one start.
+        """
+        if self._users == 0:
+            await self.llm.start()
+            if self.settings.policy_watch:
+                self._watcher = asyncio.create_task(self.policy_store.watch())
+        self._users += 1
+        try:
+            yield self
+        finally:
+            self._users -= 1
+            if self._users == 0:
+                await self._stop()
+
+    async def _stop(self) -> None:
+        if self._watcher is not None:
+            self._watcher.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._watcher
+            self._watcher = None
+        await self.llm.aclose()

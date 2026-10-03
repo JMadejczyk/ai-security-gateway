@@ -13,9 +13,15 @@ session loses actions; an autonomous system gets throttled and sent to human app
 | --- | --- |
 | `gateway/core/` | Shared vocabulary: `Interaction`, `Verdict`, `Span`, `SessionContext`, the `Adapter` and `Control` interfaces, verdict merging, the control catalog |
 | `gateway/policy/` | Permission grammar, `policy.yaml` schema, `PolicyLoader`, the hot-reloading `PolicyStore`, the `PolicyEvaluator` (decision model) |
-| `gateway/telemetry.py` | Prometheus metrics (a dedicated registry) |
+| `gateway/identity.py` | JWT verification and delegation checks (`TokenVerifier`), the demo token issuer, `X-ACL-Principal` minting |
+| `gateway/sessions.py` | `SessionStore` (in-memory now): binding, lifetimes, per-session lock, risk decay, sticky taint |
+| `gateway/pipeline.py` | The step order every call goes through: authn, adapter, authz, pre controls, merge, upstream, post controls, persist, audit |
+| `gateway/adapters/`, `gateway/proxies/` | Per-channel normalization (`LLMAdapter`) and upstream clients (`LLMProxy`, SSE re-emission) |
+| `gateway/controls/` | The `ControlRegistry` new guardrails register with |
+| `gateway/main.py`, `gateway/__main__.py` | The agent and operator FastAPI apps; `python -m gateway` serves both |
+| `gateway/telemetry.py` | Prometheus metrics (a dedicated registry) and the JSON audit log |
 | `policy.yaml` | The policy the gateway runs with; it is validated, and reloaded on change |
-| `tests/` | `unit/`, `policy/`, `session_modes/`, `reload/` (plus docker-marked suites) |
+| `tests/` | `unit/`, `policy/`, `session_modes/`, `reload/`, `identity/`, `sessions/`, `llm/` (plus docker-marked suites) |
 
 ## Develop
 
@@ -30,6 +36,18 @@ make up        # docker compose up -d --build
 make down      # docker compose down
 ```
 
-The gateway refuses to start without a valid policy. A policy edit that fails validation
-is logged and counted (`acl_policy_reloads_total{result="invalid"}`), and the last valid
+Run the gateway outside compose (two listeners: agent API on 127.0.0.1:8080, operator API on
+127.0.0.1:9090; both overridable with `ACL_AGENT_HOST`/`_PORT` and `ACL_OPERATOR_HOST`/`_PORT`):
+
+```sh
+ACL_JWT_SECRET=... ACL_INTERNAL_KEY=... uv run python -m gateway   # both at least 32 bytes
+curl -s -X POST localhost:9090/auth/demo-token -H 'content-type: application/json' \
+  -d '{"sub": "anna@demo"}'                                         # ACL_DEMO_TOKENS=0 disables
+```
+
+`ACL_POLICY_PATH` and `ACL_IDENTITIES_PATH` default to `policy.yaml` and `demo/identities.yaml`;
+`ACL_AUDIT_PATH` adds a JSONL export next to the audit lines on stdout.
+
+The gateway refuses to start without a valid policy or strong secrets. A policy edit that
+fails validation is logged and counted (`acl_policy_reloads_total{result="invalid"}`), and the last valid
 version stays in force.

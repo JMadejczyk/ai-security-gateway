@@ -1,0 +1,97 @@
+# v1 of the spec put `when:` and `then:` on one line: not valid YAML.
+schema_version: 2
+profile: strict            # strict | balanced | permissive
+default: deny              # the only accepted value: anything not granted is forbidden
+
+upstreams:                 # internal networks, reachable only from the gateway
+  llm:
+    base_url: http://ollama:11434/v1        # or LiteLLM
+    api_key_env: null                       # env var holding the router key, if any
+  mcp:
+    sales_db:
+      url: http://mcp-postgres:8000/mcp
+      adapter: sql
+      trust: internal
+      tools:
+        query: { action: read }             # sql adapter derives resources from the parsed tables
+    web:
+      url: http://mcp-fetch:8000/mcp
+      adapter: http
+      trust: untrusted
+      tools:
+        fetch: { action: read, resource: "web:{url}" }     # http adapter reduces {url} to its host
+    reports:
+      url: http://mcp-files:8000/mcp
+      adapter: fs
+      trust: internal
+      tools:
+        write_report: { action: write, resource: "fs:reports/{name}" }
+
+roles:
+  analyst:  { allow: ["read:db:sales.*", "read:web:*", "write:fs:reports/*", "generate:model:*"] }
+  intern:   { allow: ["read:db:sales.orders", "read:db:sales.customers", "read:web:*",
+                      "write:fs:reports/*", "generate:model:qwen3:8b"] }
+  admin:    { allow: ["*:*"] }
+  ops-team: { allow: [] }                   # approvers; grants nothing by itself
+
+agents:
+  databot:
+    type: interactive
+    max_actions: [read, write, generate]
+    allow: ["read:db:sales.*", "read:web:*", "write:fs:reports/*", "generate:model:*"]
+    deny: ["egress:*"]
+    approvers: [ops-team]
+  nightly_etl:
+    type: autonomous                        # principal is svc:nightly_etl, U = this allow list
+    max_actions: [read, write, generate]
+    allow: ["read:db:sales.*", "read:web:*", "write:fs:reports/*", "generate:model:qwen3:8b"]
+    approvers: [ops-team]                   # must be a role defined above
+
+risk:
+  half_life_s: 600
+
+risk_rules:                                 # profile-independent session restrictions
+  interactive:
+    - when: { taint: true }   then: { deny_actions: [write, delete, egress] }
+    - when: { risk_gt: 0.5 }  then: { actions: [write], mode: require_approval, cooldown_s: 300 }
+    - when: { risk_gt: 0.8 }
+      then: { freeze_tools: true, duration_s: 300 }
+  autonomous:
+    - when: { taint: true }
+      then: { actions: [write, delete, egress], mode: require_approval }
+    - when: { risk_gt: 0.5 }
+      then: { throttle: { max_actions: 1, per_s: 10 }, alert: true }
+    - when: { risk_gt: 0.8 }
+      then: { actions: [write, delete, execute, egress], mode: require_approval, alert: true }
+
+approvals: { timeout_s: 600, on_timeout: deny }
+
+sessions: { idle_ttl_s: 3600, max_lifetime_s: 86400 }
+
+throttle: { backoff: exponential, base_s: 5, max_s: 300 }
+
+blocklist:                 # manual blocks, effective right after reload
+  users: []
+  agents: []
+  use_cases: []            # permission patterns, e.g. "egress:http:pastebin.com"
+
+limits:
+  max_request_bytes: 1048576
+  max_response_bytes: 4194304
+  upstream_timeout_s: 120
+
+controls:
+  model_allowlist:  { mode: block }
+  pii:              { mode: redact, threshold: 0.6,
+                      entities: [PL_PESEL, PL_NIP, IBAN_CODE, EMAIL_ADDRESS, PHONE_NUMBER] }
+  secrets:          { mode: block }
+  prompt_injection: { mode: block, threshold: 0.85, judge_band: [0.5, 0.85], risk_delta: 0.6 }
+  sql_guard:        { mode: block, max_cost: 10000, force_limit: 500, timeout_ms: 3000 }
+  signatures:       { mode: block, feed: http://feed:9000/signatures.json, refresh_s: 30 }
+  loop_detect:      { mode: block, max_repeats: 5, window_s: 60 }
+
+budgets:
+  per_user:    { daily_tokens: 200000, daily_cost_usd: 2.0 }
+  per_agent:   { daily_tokens: 1000000 }
+  per_session: { tool_calls: 50, gpu_seconds: 120 }
+  soft_limit_pct: 80

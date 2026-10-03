@@ -382,7 +382,7 @@ Payloads, SQL text, tool arguments and upstream errors are never logged. An entr
 | Session trace | security | Timeline of one session: decisions, effective permissions, risk score (`session_id` variable) |
 | Performance | judges, ops | p50/p95/p99 overhead per channel and per control, throughput |
 
-Dashboards and data sources are provisioned as files in the repo, so `docker compose up` brings up a ready Grafana.
+Dashboards and data sources are provisioned as files in the repo, so `docker compose up` brings up a ready Grafana. Prometheus scrapes the gateway's operator listener on the `ops` network. Audit entries reach Loki without the Docker socket: the gateway writes them to a JSONL file on a volume, and Grafana Alloy tails that volume read-only and pushes to Loki. Grafana, Prometheus, Loki and Alloy run only on `ops`; only Grafana is published, on `127.0.0.1` (default port 3300, since 3000 is commonly taken). Policy reloads appear as dashboard annotations from the audit/reload log lines in Loki.
 
 ## Test suite and demo
 
@@ -402,7 +402,7 @@ The competition rules weight the test suite at 20%, so every control has at leas
 - `tests/reload/`: changing `policy.yaml` mid-test changes the verdict without restart; a broken file does not break the working policy.
 - `tests/perf/`: p50/p95 overhead with a mocked upstream, written into the report.
 
-Output: JUnit XML + HTML report (`pytest-html`) summarizing positive and negative cases per control. Tests are written alongside each stage, not saved for the end: every stage in the schedule ends with its own passing tests.
+Output: JUnit XML + HTML report (`pytest-html`) summarizing positive and negative cases per control. Tests declare what they prove with a `control(<id>, outcome)` marker; a coverage check fails the run if any catalog control lacks an allow and a deny case, and the per-control table is written to `reports/controls.md` and embedded in the HTML report. `tests/perf/` writes `reports/perf.json` and `reports/perf.md`. Tests are written alongside each stage, not saved for the end: every stage in the schedule ends with its own passing tests.
 
 **Demo script (3 minutes):**
 
@@ -521,3 +521,4 @@ The honest pitch line: we do not claim to have invented taint or on-behalf-of, a
 - After the stage 5–10 review: `acl.set_principal` replaces a bare `set_config`; `Interaction.server`; all CTEs refused; `sql_guard` seals the final SQL; feed is a file path; GPU allowance as an upstream deadline; idempotent budget operations.
 - Stage 10–14 decisions: the injection classifier runs on ONNX Runtime and is fetched by a `models-init` profile with pinned hashes; one shared `JudgeClient` for all LLM judges, failing closed and not charged to agents; approvals and the kill switch live in Redis; session state and loop counters move to Redis behind the existing interfaces.
 - After the stage 10–14 review: operator tokens on their own audience; `sid_iat` and issuer-minted session ids; approval binding covers resources and the final operation digest, kill voids approvals by generation; tool quarantine until re-approval; prose-only, HTML-aware classification; strict judge response models; a session whose outcome could not be persisted stays fenced and resolves as tainted.
+- Stage 14–18 decisions: Loki ingestion via Alloy tailing the audit JSONL volume (no Docker socket); observability services on `ops` only, Grafana on 127.0.0.1:3300; `control(<id>, outcome)` test markers drive the per-control report and coverage check.

@@ -21,6 +21,10 @@ from gateway.identity import DemoIdentities, DemoTokenIssuer, TokenVerifier
 from gateway.pipeline import ChannelRoute, DecisionRecorder, Pipeline, SessionGate
 from gateway.policy.store import PolicyStore
 from gateway.proxies.llm import LLMProxy
+from gateway.proxies.mcp.downstream import MCPProxy
+from gateway.proxies.mcp.pins import PinnedSchemas
+from gateway.proxies.mcp.sessions import MCPSessionRegistry
+from gateway.proxies.mcp.upstream import MCPConnector
 from gateway.sessions import InMemorySessionStore, SessionStore
 from gateway.settings import Settings
 from gateway.telemetry import AuditLogger
@@ -38,6 +42,8 @@ class GatewayContainer:
     gate: SessionGate
     pipeline: Pipeline
     llm: LLMProxy
+    mcp: MCPProxy
+    mcp_connector: MCPConnector
     audit: AuditLogger
     clock: Clock
     _users: int = field(default=0, init=False)
@@ -71,11 +77,22 @@ class GatewayContainer:
             settings.internal_key_bytes,
             identities.subjects() if identities is not None else frozenset(),
         )
+        # MCP has no static route: each tools/call binds its server's adapter and the caller's
+        # own upstream session (MCPProxy passes the route to Pipeline.handle).
         pipeline = Pipeline(
             gate,
             {Channel.LLM: ChannelRoute(adapter=LLMAdapter(), upstream=llm)},
             ControlRegistry(),  # stage 5-10 controls register here
             recorder,
+            clock=clock,
+        )
+        mcp_connector = MCPConnector(settings.internal_key_bytes, clock=clock, transport=transport)
+        mcp = MCPProxy(
+            gate=gate,
+            pipeline=pipeline,
+            registry=MCPSessionRegistry(mcp_connector),
+            pins=PinnedSchemas(settings.pins_dir),
+            allowed_origins=frozenset(settings.mcp_allowed_origins),
             clock=clock,
         )
         return cls(
@@ -87,6 +104,8 @@ class GatewayContainer:
             gate=gate,
             pipeline=pipeline,
             llm=llm,
+            mcp=mcp,
+            mcp_connector=mcp_connector,
             audit=audit,
             clock=clock,
         )
@@ -99,6 +118,7 @@ class GatewayContainer:
         """
         if self._users == 0:
             await self.llm.start()
+            await self.mcp_connector.start()
             if self.settings.policy_watch:
                 self._watcher = asyncio.create_task(self.policy_store.watch())
         self._users += 1
@@ -115,4 +135,6 @@ class GatewayContainer:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._watcher
             self._watcher = None
+        await self.mcp.aclose()  # ends every upstream MCP session
+        await self.mcp_connector.aclose()
         await self.llm.aclose()

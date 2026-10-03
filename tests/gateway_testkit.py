@@ -147,13 +147,21 @@ class Harness:
 
 
 @asynccontextmanager
-async def running_gateway(tmp_path: Path, **settings: Any) -> AsyncIterator[Harness]:
+async def running_gateway(
+    tmp_path: Path, *, transport: httpx.AsyncBaseTransport | None = None, **settings: Any
+) -> AsyncIterator[Harness]:
+    """``transport`` carries every upstream call (LLM and MCP) when given."""
     policy_path = tmp_path / "policy.yaml"
     shutil.copy(ROOT_POLICY, policy_path)
     clock = MutableClock()
     audit = io.StringIO()
+    settings.setdefault("pins_dir", tmp_path / "pins")
     container = GatewayContainer.from_settings(
-        make_settings(policy_path, **settings), clock=clock, audit_stream=audit, env={}
+        make_settings(policy_path, **settings),
+        clock=clock,
+        audit_stream=audit,
+        env={},
+        transport=transport,
     )
     agent_app, operator_app = create_agent_app(container), create_operator_app(container)
     async with (

@@ -23,6 +23,9 @@ class UpstreamResult(FrozenModel):
     body: Any = Field(repr=False)  # complete, buffered result; post controls see all of it
     elapsed_s: float = Field(ge=0.0)  # upstream wall time, excluded from gateway overhead
     usage: TokenUsage | None = None
+    # The result came from an untrusted source (an MCP server with `trust: untrusted`): it
+    # taints the session even when post controls block or replace it (SPEC "Risk score and taint").
+    untrusted: bool = False
 
 
 class UpstreamError(RejectionError):

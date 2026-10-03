@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     operator_host: str = "127.0.0.1"
     operator_port: Port = 9090
     audit_path: Path | None = None  # JSONL export next to the stdout audit stream
+    pins_dir: Path = Path("pins")  # operator-pinned MCP tool schemas: <pins_dir>/<server>.json
+    # Origins allowed to call /mcp/{server}. Agents are not browsers: by default any request
+    # carrying an Origin header is refused (MCP transport security, DNS rebinding).
+    mcp_allowed_origins: tuple[str, ...] = ()
     policy_watch: bool = True  # reload policy.yaml on change (POST /admin/reload always works)
     log_level: str = "info"
 

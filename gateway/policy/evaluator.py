@@ -208,6 +208,23 @@ class PolicyEvaluator:
             cooldown_on_deny=_cooldown_to_start(matched, ctx, key, now),
         )
 
+    def removed_actions(
+        self, snapshot: PolicySnapshot, ctx: SessionContext, now: datetime
+    ) -> frozenset[Action]:
+        """Actions the session's risk rules currently remove (``deny_actions``).
+
+        For listings (MCP ``tools/list``): they hide what the session can no longer do at
+        all. Approvals, throttles and timers only condition a call and start nothing here.
+        """
+        policy = snapshot.policy
+        risk = ctx.risk_at(now, policy.risk.half_life_s)
+        return frozenset(
+            action
+            for rule in policy.risk_rules.for_mode(ctx.mode)
+            if rule.when.holds(risk=risk, taint=ctx.taint)
+            for action in rule.then.deny_actions
+        )
+
     def decide(  # noqa: PLR0913 -- the union of authorize() and session_restrictions() inputs
         self,
         snapshot: PolicySnapshot,

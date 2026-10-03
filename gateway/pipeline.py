@@ -69,6 +69,7 @@ logger = logging.getLogger(__name__)
 AUTHZ: Final = "authz"
 # Controls whose detections mean untrusted content reached the agent's context.
 TAINTING_CONTROLS: Final = frozenset({"prompt_injection"})
+APPROVAL_ID_CHARS: Final = 24
 
 
 class CallRequest(FrozenModel):
@@ -88,6 +89,7 @@ class PipelineOutcome(FrozenModel):
     reason_code: str
     message: str = ""
     session_id: str | None = None
+    approval_id: str | None = None  # set when the call is held for approval
     request: Any = Field(default=None, repr=False)  # final payload sent upstream
     result: Any = Field(default=None, repr=False)  # final result, set only when released
 
@@ -261,14 +263,18 @@ class Pipeline:
     def controls(self) -> ControlRegistry:
         return self._controls
 
-    async def handle(self, call: CallRequest, snapshot: PolicySnapshot) -> PipelineOutcome:
+    async def handle(
+        self, call: CallRequest, snapshot: PolicySnapshot, *, route: ChannelRoute | None = None
+    ) -> PipelineOutcome:
+        """Run ``call``; ``route`` overrides the channel's registered route for this call only
+        (the MCP proxy binds the adapter to the call's server and the upstream to its session)."""
         trace = _Trace(call=call, snapshot=snapshot, started=time.perf_counter())
         try:
             claims = trace.claims = self._gate.authenticate(call.token, snapshot)
             async with self._gate.session(claims, snapshot) as ctx:
                 trace.context = ctx
                 try:
-                    outcome = await self._run(trace, claims, ctx)
+                    outcome = await self._run(trace, claims, ctx, route)
                 except RejectionError as exc:
                     outcome = self._refusal(trace, exc)
                 await self._persist(trace)
@@ -280,13 +286,17 @@ class Pipeline:
     # ------------------------------------------------------------------------- steps
 
     async def _run(
-        self, trace: _Trace, claims: TokenClaims, ctx: SessionContext
+        self,
+        trace: _Trace,
+        claims: TokenClaims,
+        ctx: SessionContext,
+        route: ChannelRoute | None,
     ) -> PipelineOutcome:
         snapshot, call = trace.snapshot, trace.call
         limit = snapshot.policy.limits.max_request_bytes
         if len(call.body) > limit:
             raise RequestTooLargeError(limit)
-        route = self._channels.get(call.channel)
+        route = route if route is not None else self._channels.get(call.channel)
         if route is None:
             raise InvalidRequestError("unsupported_channel", "channel not served")
         raw = RawCall(channel=call.channel, data=_parse_json_object(call.body), server=call.server)
@@ -401,9 +411,27 @@ class Pipeline:
         return current, verdicts
 
     def _hold_for_approval(self, trace: _Trace, merged: MergedVerdict) -> PipelineOutcome:
-        """Seam for the approval queue (stages 10-14): until then an approval is a refusal."""
+        """Seam for the approval queue (stages 10-14): until then an approval is a refusal.
+
+        The ``approval_id`` is already bound to the one exact operation an approval will
+        authorize (principal, agent, session, server, payload digest, policy revision), so a
+        retry of the same pending call names the same id. The queue will persist it.
+        """
         held = self._outcome(trace, merged, reason_code="approval_required")
-        return held.model_copy(update={"message": "this call needs human approval"})
+        claims, call = trace.claims, trace.call
+        binding = {
+            "session_id": claims.session_id if claims else None,
+            "principal": claims.sub if claims else None,
+            "actor": claims.agent if claims else None,
+            "channel": call.channel,
+            "server": call.server,
+            "payload": trace.steps[0].original_payload if trace.steps else None,
+            "policy_revision": trace.snapshot.revision,
+        }
+        approval_id = f"apr-{self._recorder.digest(binding)[:APPROVAL_ID_CHARS]}"
+        return held.model_copy(
+            update={"message": "this call needs human approval", "approval_id": approval_id}
+        )
 
     async def _persist(self, trace: _Trace) -> None:
         """Every verdict's risk, taint and timers land before the result is released."""
@@ -420,9 +448,13 @@ class Pipeline:
             timer = restriction.cooldown_on_deny
             if timer is not None and timer.key and step.merged().decision is Decision.BLOCK:
                 cooldowns.append(Cooldown(key=timer.key, until=timer.until))
+        # A result from an untrusted source taints even when post controls blocked or replaced
+        # it: the content reached the gateway on the agent's behalf.
+        untrusted_result = trace.upstream is not None and trace.upstream.untrusted
         update = SessionUpdate(
             risk_delta=sum(v.risk_delta for v in verdicts),
-            taint=any(
+            taint=untrusted_result
+            or any(
                 v.control_id in TAINTING_CONTROLS and v.decision is not Decision.ALLOW
                 for v in verdicts
             ),

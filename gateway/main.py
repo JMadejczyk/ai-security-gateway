@@ -2,7 +2,8 @@
 
 - Agent API (``edge`` network): ``/v1/chat/completions``, ``/v1/models``, ``DELETE /v1/session``.
   Errors use the OpenAI shape ``{"error": {"message", "type", "code"}}`` with the reason code
-  as ``code`` and never any payload or upstream data.
+  as ``code`` and never any payload or upstream data. ``/mcp/{server}`` speaks MCP streamable
+  HTTP (`gateway.proxies.mcp.downstream`) and answers in JSON-RPC instead.
 - Operator API (``ops`` network only): ``/healthz``, ``/metrics``, ``/auth/demo-token``,
   ``/admin/reload``.
 
@@ -27,6 +28,7 @@ from gateway.errors import RejectionError, RequestTooLargeError
 from gateway.identity import DemoTokenRequest, IssuedToken
 from gateway.pipeline import CallRequest
 from gateway.proxies.llm import sse_events
+from gateway.proxies.mcp.downstream import MCPHttpRequest, MCPReply
 from gateway.telemetry import REGISTRY, ReloadResult, set_tainted_sessions
 
 ADMIN_ROLE: Final = "admin"
@@ -155,10 +157,39 @@ def create_agent_app(container: GatewayContainer) -> FastAPI:
         snapshot = container.policy_store.current
         async with container.gate.admit(bearer_token(request), snapshot) as (claims, _ctx):
             await container.sessions.end(claims.session_id)
+        await container.mcp.end_gateway_session(claims.session_id)
         set_tainted_sessions(await container.sessions.tainted_count())
         return JSONResponse({"session_id": claims.session_id, "ended": True})
 
+    @app.post("/mcp/{server}")
+    async def mcp_post(server: str, request: Request) -> Response:
+        snapshot = container.policy_store.current
+        body = await read_capped(request, snapshot.policy.limits.max_request_bytes)
+        reply = await container.mcp.post(server, _mcp_request(request, body), snapshot)
+        return _mcp_response(reply)
+
+    @app.delete("/mcp/{server}")
+    async def mcp_delete(server: str, request: Request) -> Response:
+        snapshot = container.policy_store.current
+        reply = await container.mcp.delete(server, _mcp_request(request), snapshot)
+        return _mcp_response(reply)
+
+    @app.get("/mcp/{server}")
+    async def mcp_get(server: str) -> Response:
+        del server
+        return _mcp_response(container.mcp.get())
+
     return app
+
+
+def _mcp_request(request: Request, body: bytes = b"") -> MCPHttpRequest:
+    return MCPHttpRequest(headers=dict(request.headers), token=bearer_token(request), body=body)
+
+
+def _mcp_response(reply: MCPReply) -> Response:
+    if reply.body is None:
+        return Response(status_code=reply.status, headers=dict(reply.headers))
+    return JSONResponse(reply.body, status_code=reply.status, headers=dict(reply.headers))
 
 
 # --------------------------------------------------------------------------- operator API

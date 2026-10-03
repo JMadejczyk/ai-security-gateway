@@ -32,21 +32,35 @@ append-only chat the windows over the history are the same every turn. A text lo
 the model window is classified in overlapping windows and scores as its best window
 (`gateway.injection.classifier`).
 
-**Tiers.** Score at or above ``threshold``: detected. Score inside ``judge_band`` (and below
-``threshold``): the best window of each such text goes to the LLM judge, which answers
-whether it tries to instruct an AI agent; at most `MAX_JUDGED` texts per call are judged.
-Below the band: clean. Judge verdicts are remembered by window text under a key of the judge
-configuration in effect (`judge_config_key`), so a policy reload that changes the judge
-model or this control's settings asks the judge again.
+**Tiers.** Text the agent authored and text it did not are decided differently:
+
+- *Untrusted text* (MCP results, LLM answers, and in a chat request the ``tool`` and
+  ``assistant`` messages, which can carry tool results): score at or above ``threshold`` is
+  detected by the classifier alone. Score inside ``judge_band``: the best window of each such
+  text goes to the LLM judge, which answers whether it tries to instruct an AI agent; at
+  most `MAX_JUDGED` texts per call are judged. Below the band: clean.
+- *Authored text* (the LLM request's ``user``, ``system`` and ``developer`` messages,
+  `authored_messages`): any score from the band up goes to the judge, because the
+  classifier flags harmless short questions ("What is a primary key?" scored 1.0). The
+  judge confirms (block) or clears (allow); with no answer within ``user_judge_timeout_s``
+  (timeout, error, garbled answer, no judge) the call is allowed, the session tainted and
+  the risk raised (``prompt_injection_unconfirmed``), so a real injection still loses the
+  session its write and egress rights. A window built from authored and untrusted pieces
+  is untrusted: the untrusted part decides.
+
+Judge verdicts are remembered by window text under a key of the judge configuration in
+effect (`judge_config_key`), so a policy reload that changes the judge model or this
+control's settings asks the judge again.
 
 **Verdicts.** A detection is ``block`` with ``prompt_injection_detected``, a score bucket
 (never text) in ``reason`` and the configured ``risk_delta``; under ``log_only`` the same
 verdict is recorded with ``enforced=False``. The pipeline taints the session on any
-non-allow verdict of this control (``TAINTING_CONTROLS``), blocked or not.
+non-allow verdict of this control (``TAINTING_CONTROLS``), blocked or not, and on the
+``allow`` of an unconfirmed authored hit, which carries ``taint=True`` and the risk delta.
 
-**Failing closed** (``block``, no risk added, since nothing was detected): the judge is
-unavailable or not configured (``judge_unavailable``), more uncertain texts than
-`MAX_JUDGED` (``judge_band_overflow``), more than ``max_chars`` characters of not yet
+**Failing closed** (``block``, no risk added, since nothing was detected): for untrusted
+text, the judge is unavailable or not configured (``judge_unavailable``), more uncertain
+texts than `MAX_JUDGED` (``judge_band_overflow``), more than ``max_chars`` characters of not yet
 classified text (``content_too_large_to_classify``), a segment that could not be decoded
 (``content_unscannable``), or no classifier (``classifier_unavailable``). Under ``log_only``
 these are recorded, not applied. Such a verdict still taints: content the gateway could not
@@ -58,10 +72,10 @@ import hashlib
 import itertools
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import ClassVar, Final, Protocol, Self, override
+from typing import Any, ClassVar, Final, Protocol, Self, cast, override
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -70,7 +84,7 @@ from gateway.controls.text import SegmentKind, TextExtractor, TextSegment
 from gateway.core.catalog import control_spec
 from gateway.core.envelope import Interaction, Verdict
 from gateway.core.interfaces import Control, ControlConfig
-from gateway.core.types import ControlKind, ControlMode, Decision, Stage
+from gateway.core.types import Channel, ControlKind, ControlMode, Decision, Stage
 from gateway.injection.classifier import (
     ClassifierRunner,
     ClassifierUnavailableError,
@@ -90,6 +104,11 @@ JUDGE_UNAVAILABLE: Final = "judge_unavailable"
 JUDGE_BAND_OVERFLOW: Final = "judge_band_overflow"
 TOO_LARGE: Final = "content_too_large_to_classify"
 UNSCANNABLE: Final = "content_unscannable"
+UNCONFIRMED: Final = "prompt_injection_unconfirmed"
+# Message roles whose text the agent itself authored (its user's prompt, its own system or
+# developer instructions). Hits there are confirmed by the judge; everything else (tool and
+# assistant messages, which can carry tool results) is decided by the classifier alone.
+AUTHORED_ROLES: Final = frozenset({"user", "system", "developer"})
 CLASSIFIER_UNAVAILABLE: Final = "classifier_unavailable"
 
 WINDOW_CHARS: Final = 1000  # rolling window over the pieces joined in document order
@@ -146,54 +165,122 @@ def rolling_windows(text: str) -> list[str]:
     return [text[start : start + WINDOW_CHARS] for start in starts]
 
 
-def _runs(pieces: Sequence[tuple[str, str]]) -> list[str]:
-    """The ``(separator, piece)`` pairs as continuous runs of text: short pieces whole, a
-    longer piece by its two edges only (its middle cannot be part of an instruction split
-    across pieces, and it is classified whole on its own). A run made of a single piece is
-    left out: that piece is classified on its own."""
-    runs: list[str] = []
-    current: list[str] = []
+@dataclass(frozen=True, slots=True)
+class _Piece:
+    separator: str  # joined before the piece (pieces of one segment), "" otherwise
+    text: str
+    authored: bool  # from a message the agent authored (`AUTHORED_ROLES`)
+
+
+@dataclass(frozen=True, slots=True)
+class _Run:
+    """Continuous joined text, and which parts of it are authored."""
+
+    text: str
+    spans: tuple[tuple[int, int, bool], ...]  # (start, end, authored) per piece
+
+    def authored(self, start: int, end: int) -> bool:
+        """True when every piece overlapping ``[start, end)`` is authored."""
+        return all(a for low, high, a in self.spans if low < end and high > start)
+
+
+def _runs(pieces: Sequence[_Piece]) -> list[_Run]:
+    """The pieces as continuous runs of text: short pieces whole, a longer piece by its two
+    edges only (its middle cannot be part of an instruction split across pieces, and it is
+    classified whole on its own). A run made of a single piece is left out: that piece is
+    classified on its own."""
+    runs: list[_Run] = []
+    current: list[tuple[str, bool]] = []  # (text, authored), separators attached
 
     def close() -> None:
-        if len(current) > 2:  # noqa: PLR2004 -- separator + piece: one piece only
-            runs.append("".join(current[1:]))  # no separator before the first piece
+        if len(current) > 1:
+            spans: list[tuple[int, int, bool]] = []
+            offset = 0
+            for text, authored in current:
+                spans.append((offset, offset + len(text), authored))
+                offset += len(text)
+            runs.append(_Run("".join(text for text, _ in current), tuple(spans)))
 
-    for separator, piece in pieces:
-        if len(piece) <= 2 * STREAM_EDGE_CHARS:
-            current += [separator, piece]
+    for piece in pieces:
+        separator = piece.separator if current else ""  # none before a run's first piece
+        if len(piece.text) <= 2 * STREAM_EDGE_CHARS:
+            current.append((separator + piece.text, piece.authored))
             continue
-        current += [separator, piece[:STREAM_EDGE_CHARS]]
+        current.append((separator + piece.text[:STREAM_EDGE_CHARS], piece.authored))
         close()
-        current = ["", piece[-STREAM_EDGE_CHARS:]]
+        current = [(piece.text[-STREAM_EDGE_CHARS:], piece.authored)]
     close()
     return runs
 
 
-def classified_texts(segments: Sequence[TextSegment]) -> list[str]:
-    """Texts to classify (see the module docstring): every prose piece, then the prose
-    windows over the pieces joined in document order. Pieces of different segments are
-    joined as written; the pieces of one segment by its `Fragments.separator`."""
+def provenance_texts(
+    segments: Sequence[TextSegment], authored: Callable[[TextSegment], bool] = lambda _: False
+) -> dict[str, bool]:
+    """Texts to classify (see the module docstring), each mapped to whether it is authored:
+    every prose piece, then the prose windows over the pieces joined in document order. A
+    window is authored only when every piece in it is; a text that occurs both authored and
+    not is not authored (the untrusted occurrence decides)."""
     pieces = [
-        (parts.separator if index else "", piece)
+        _Piece(parts.separator if index else "", piece, authored(segment))
         for segment in segments
         if segment.joinable and segment.kind in {SegmentKind.TEXT, SegmentKind.OPAQUE}
         for parts in (fragments(segment.text),)
         for index, piece in enumerate(parts.pieces)
     ]
-    units = [piece for _, piece in pieces if looks_like_prose(piece)]
-    windows = [
-        window
-        for run in _runs(pieces)
-        for window in rolling_windows(run)
-        if looks_like_prose(window)  # filtered as joined text, never fragment by fragment
-    ]
-    return list(dict.fromkeys([*units, *windows]))
+    found: dict[str, bool] = {}
+
+    def add(text: str, is_authored: bool) -> None:
+        found[text] = found.get(text, True) and is_authored
+
+    for piece in pieces:
+        if looks_like_prose(piece.text):
+            add(piece.text, piece.authored)
+    step = WINDOW_CHARS - WINDOW_OVERLAP_CHARS
+    for run in _runs(pieces):
+        for start in range(0, max(len(run.text) - WINDOW_OVERLAP_CHARS, 1), step):
+            window = run.text[start : start + WINDOW_CHARS]
+            if looks_like_prose(window):  # filtered as joined text, never fragment by fragment
+                add(window, run.authored(start, start + len(window)))
+    return found
+
+
+def classified_texts(segments: Sequence[TextSegment]) -> list[str]:
+    """Texts to classify, in order (see `provenance_texts`)."""
+    return list(provenance_texts(segments))
+
+
+def authored_messages(interaction: Interaction, stage: Stage) -> Callable[[TextSegment], bool]:
+    """Which segments the agent authored: on the LLM channel before the model, text inside a
+    ``messages[i]`` whose role is in `AUTHORED_ROLES`. Nothing anywhere else."""
+    payload: object = interaction.payload
+    if interaction.channel is not Channel.LLM or stage is not Stage.PRE:
+        return lambda _: False
+    messages = (
+        cast("dict[str, Any]", payload).get("messages") if isinstance(payload, dict) else None
+    )
+    if not isinstance(messages, list):
+        return lambda _: False
+    roles = {
+        str(index): cast("dict[str, Any]", message).get("role")
+        for index, message in enumerate(cast("list[Any]", messages))
+        if isinstance(message, dict)
+    }
+
+    def authored(segment: TextSegment) -> bool:
+        match segment.pointer.split("/")[1:3]:
+            case ["messages", index]:
+                return roles.get(index) in AUTHORED_ROLES
+            case _:
+                return False
+
+    return authored
 
 
 class Outcome(StrEnum):
     PASSED = "passed"  # nothing found
     DETECTED = "detected"  # an injection: adds the control's risk
     REFUSED = "refused"  # could not be shown clean: fails closed, adds no risk
+    UNCONFIRMED = "unconfirmed"  # an authored hit the judge could not confirm: allow + taint
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,13 +303,36 @@ class Finding:
     def refusal(cls, reason_code: str, reason: str) -> Self:
         return cls(Outcome.REFUSED, reason_code, reason)
 
+    @classmethod
+    def unconfirmed(cls, reason: str) -> Self:
+        return cls(Outcome.UNCONFIRMED, UNCONFIRMED, reason)
+
     @property
     def clean(self) -> bool:
         return self.outcome is Outcome.PASSED
 
 
+_SEVERITY: Final = {
+    Outcome.DETECTED: 0,
+    Outcome.REFUSED: 1,
+    Outcome.UNCONFIRMED: 2,
+    Outcome.PASSED: 3,
+}
+
+
+def worst(findings: Sequence[Finding]) -> Finding:
+    """A detection beats a refusal beats an unconfirmed hit beats a pass."""
+    return min(findings, key=lambda f: _SEVERITY[f.outcome])
+
+
 def finding_verdict(control_id: str, finding: Finding, cfg: ControlConfig) -> Verdict:
-    """``allow`` for a clean finding, else ``block`` (``enforced=False`` under log_only)."""
+    """``allow`` for a clean finding; ``allow`` that taints and adds risk for an unconfirmed
+    one; else ``block`` (``enforced=False`` under log_only)."""
+    risk = (
+        cfg.risk_delta
+        if cfg.risk_delta is not None
+        else control_spec(control_id).default_risk_delta
+    )
     if finding.clean:
         return Verdict(
             decision=Decision.ALLOW,
@@ -230,11 +340,15 @@ def finding_verdict(control_id: str, finding: Finding, cfg: ControlConfig) -> Ve
             reason_code=finding.reason_code,
             reason=finding.reason,
         )
-    risk = (
-        cfg.risk_delta
-        if cfg.risk_delta is not None
-        else control_spec(control_id).default_risk_delta
-    )
+    if finding.outcome is Outcome.UNCONFIRMED:
+        return Verdict(
+            decision=Decision.ALLOW,
+            control_id=control_id,
+            reason_code=finding.reason_code,
+            reason=finding.reason,
+            risk_delta=risk,
+            taint=True,
+        )
     return Verdict(
         decision=Decision.BLOCK,
         control_id=control_id,
@@ -313,7 +427,9 @@ class PromptInjectionControl(Control):
                 UNSCANNABLE, "a segment could not be decoded for classification"
             )
         else:
-            finding = await self.classify(classified_texts(segments), config)
+            texts = provenance_texts(segments, authored_messages(interaction, stage))
+            authored = frozenset(text for text, is_authored in texts.items() if is_authored)
+            finding = await self.classify(list(texts), config, authored=authored)
         if not finding.clean:
             logger.info(
                 "prompt_injection %s stage=%s channel=%s %s",
@@ -324,8 +440,15 @@ class PromptInjectionControl(Control):
             )
         return finding_verdict(self.id, finding, config)
 
-    async def classify(self, texts: Sequence[str], config: PromptInjectionConfig) -> Finding:
-        """Run both tiers over ``texts`` (see the module docstring)."""
+    async def classify(
+        self,
+        texts: Sequence[str],
+        config: PromptInjectionConfig,
+        *,
+        authored: Collection[str] = frozenset(),
+    ) -> Finding:
+        """Run both tiers over ``texts`` (see the module docstring); the ``authored`` ones go
+        to the judge on any hit, the others are decided by the classifier at ``threshold``."""
         if not texts:
             return Finding.passed(CLEAN)
         pending = sum(len(t) for t in self._runner.uncached(texts))
@@ -337,20 +460,54 @@ class PromptInjectionControl(Control):
             scores = await self._runner.scores(texts)
         except ClassifierUnavailableError:
             return Finding.refusal(CLASSIFIER_UNAVAILABLE, "the injection classifier is disabled")
-        top = max(s.score for s in scores)
-        if top >= config.threshold:
+        scored = list(zip(texts, scores, strict=True))
+        hard = [(t, s) for t, s in scored if t not in authored]
+        top = max((s.score for _, s in hard), default=0.0)
+        if top >= config.threshold:  # untrusted text: the classifier alone decides
             return Finding.detection(DETECTED, f"classifier score {score_bucket(top)}")
         low, high = config.judge_band
-        uncertain = sorted(
-            ((t, s) for t, s in zip(texts, scores, strict=True) if low <= s.score <= high),
-            key=lambda pair: pair[1].score,
-            reverse=True,
-        )
-        if not uncertain:
-            return Finding.passed(CLEAN)
-        windows = list(dict.fromkeys(text[s.start : s.end] or text for text, s in uncertain))
         key = judge_config_key(self.id, JUDGE_INSTRUCTIONS, config, call_snapshot())
-        return await self._judge_band(windows, uncertain[0][1], key)
+        uncertain = _by_score([(t, s) for t, s in hard if low <= s.score <= high])
+        flagged = _by_score([(t, s) for t, s in scored if t in authored and s.score >= low])
+        findings: list[Finding] = []
+        if uncertain:
+            findings.append(await self._judge_band(_windows(uncertain), uncertain[0][1], key))
+        if flagged and not any(f.outcome is Outcome.DETECTED for f in findings):
+            timeout = config.user_judge_timeout_s
+            findings.append(
+                await self._judge_authored(_windows(flagged), flagged[0][1], key, timeout)
+            )
+        return worst(findings) if findings else Finding.passed(CLEAN)
+
+    async def _judge_authored(
+        self, windows: list[str], top: InjectionScore, key: str, timeout_s: float
+    ) -> Finding:
+        """A hit on text the agent authored: the judge confirms (block) or clears (allow).
+        Without an answer in ``timeout_s`` for every window (timeout, error, garbled answer,
+        no judge, too many to judge) the call is allowed and the session tainted."""
+        bucket = score_bucket(top.score)
+        answers: dict[str, bool] = {}
+        for window in windows:
+            if (known := self._judged.get(key, window)) is not None:
+                answers[window] = known
+        unjudged = [w for w in windows if w not in answers]
+        failures: list[str] = []
+        judge = self._judge
+        if unjudged and judge is None:
+            failures.append("not_configured")
+        elif len(unjudged) > MAX_JUDGED:
+            failures.append("too_many_texts")
+        elif unjudged and judge is not None:
+            fresh, failures = await _gather_within(judge, unjudged, timeout_s)
+            for window, is_injection in fresh.items():
+                self._judged.put(key, window, is_injection)
+            answers.update(fresh)
+        if any(answers.values()):
+            return Finding.detection(DETECTED, f"judge: injection; classifier score {bucket}")
+        if len(answers) < len(windows):
+            reasons = ",".join(sorted(set(failures))) or "no_answer"
+            return Finding.unconfirmed(f"judge {reasons}; classifier score {bucket}")
+        return Finding.passed(JUDGE_CLEARED, f"judge: no injection; classifier score {bucket}")
 
     async def _judge_band(self, windows: list[str], top: InjectionScore, key: str) -> Finding:
         """Decide from this request's own answers: remembered ones are copied out first, so
@@ -387,6 +544,39 @@ class PromptInjectionControl(Control):
             reasons = ",".join(sorted(set(failures))) or "no_answer"
             return Finding.refusal(JUDGE_UNAVAILABLE, f"judge {reasons}; classifier score {bucket}")
         return Finding.passed(JUDGE_CLEARED, f"judge: no injection; classifier score {bucket}")
+
+
+async def _gather_within(
+    judge: InjectionJudge, windows: Sequence[str], timeout_s: float
+) -> tuple[dict[str, bool], list[str]]:
+    """(answers, failure reasons) of judging ``windows`` with one deadline; late calls are
+    cancelled and count as ``timeout``."""
+    tasks = {w: asyncio.ensure_future(_ask(judge, w)) for w in windows}
+    _, late = await asyncio.wait(tasks.values(), timeout=timeout_s)
+    for task in late:
+        task.cancel()
+    await asyncio.gather(*late, return_exceptions=True)  # wait for the cancellations to land
+    answers: dict[str, bool] = {}
+    failures: list[str] = []
+    for window, task in tasks.items():
+        if task in late:
+            failures.append("timeout")
+        elif isinstance(error := task.exception(), JudgeUnavailableError):
+            failures.append(error.reason.value)
+        elif error is not None:
+            raise error  # a bug, not an unavailable judge: the pipeline fails closed
+        else:
+            answers[window] = task.result().is_injection
+    return answers, failures
+
+
+def _by_score(pairs: list[tuple[str, InjectionScore]]) -> list[tuple[str, InjectionScore]]:
+    return sorted(pairs, key=lambda pair: pair[1].score, reverse=True)
+
+
+def _windows(pairs: Sequence[tuple[str, InjectionScore]]) -> list[str]:
+    """The best-scoring window of each text, distinct, highest score first."""
+    return list(dict.fromkeys(text[s.start : s.end] or text for text, s in pairs))
 
 
 async def _ask(judge: InjectionJudge, window: str) -> InjectionJudgement:

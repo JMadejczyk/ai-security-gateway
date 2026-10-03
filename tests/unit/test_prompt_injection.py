@@ -15,8 +15,10 @@ from gateway.controls.prompt_injection import (
     STREAM_EDGE_CHARS,
     WINDOW_CHARS,
     WINDOW_OVERLAP_CHARS,
+    InjectionJudge,
     InjectionJudgement,
     PromptInjectionControl,
+    authored_messages,
     classified_texts,
     rolling_windows,
     score_bucket,
@@ -29,6 +31,7 @@ from gateway.injection.classifier import ClassifierRunner, InjectionScore, Unava
 from gateway.injection.prose import looks_like_prose
 from gateway.judges.client import JudgeClient, JudgeResult
 from gateway.policy.evaluator import PrincipalContext
+from gateway.policy.loader import PolicyLoadError
 from gateway.policy.schema import PromptInjectionConfig
 from gateway.upstream import Upstream, UpstreamResult
 
@@ -70,13 +73,22 @@ def interaction(make_ctx):
 
 
 def control(
-    classifier: MarkerClassifier | None = None, judge: ScriptedJudge | None = None
+    classifier: MarkerClassifier | None = None, judge: InjectionJudge | None = None
 ) -> PromptInjectionControl:
     return PromptInjectionControl(ClassifierRunner(classifier or MarkerClassifier()), judge)
 
 
 def prompt(*texts: str) -> dict[str, Any]:
     messages = [{"role": "user", "content": text} for text in texts]
+    return {"model": "qwen3:8b", "messages": messages}
+
+
+def history(*texts: str) -> dict[str, Any]:
+    """Tool messages in a chat history: tool results, on the classifier-only (hard) path."""
+    messages = [
+        {"role": "tool", "tool_call_id": f"call-{i}", "content": text}
+        for i, text in enumerate(texts)
+    ]
     return {"model": "qwen3:8b", "messages": messages}
 
 
@@ -107,7 +119,7 @@ MODE_CASES = [
         "llm-pre-injection-block",
         Channel.LLM,
         Stage.PRE,
-        prompt(f"Hi {INJECT_MARKER}"),
+        history(f"Hi {INJECT_MARKER}"),
         None,
         BLOCK,
         Decision.BLOCK,
@@ -118,7 +130,7 @@ MODE_CASES = [
         "llm-pre-injection-log",
         Channel.LLM,
         Stage.PRE,
-        prompt(f"Hi {INJECT_MARKER}"),
+        history(f"Hi {INJECT_MARKER}"),
         None,
         LOG_ONLY,
         Decision.BLOCK,
@@ -242,7 +254,7 @@ async def test_threshold(interaction, score, threshold, decision, reason_code):
     classifier = MarkerClassifier({"needle": score})
     cfg = BLOCK.model_copy(update={"threshold": threshold, "judge_band": (0.1, 0.2)})
     verdict = await control(classifier).evaluate(
-        interaction(Channel.LLM, prompt("a needle in the haystack")), Stage.PRE, cfg
+        interaction(Channel.LLM, history("a needle in the haystack")), Stage.PRE, cfg
     )
     assert (verdict.decision, verdict.reason_code) == (decision, reason_code)
 
@@ -300,7 +312,7 @@ async def test_judge_band(interaction, judge, decision, reason_code, risk):
 @LOGGED
 async def test_judge_unavailable_is_recorded_not_applied_under_log_only(interaction):
     verdict = await control(judge=ScriptedJudge(None)).evaluate(
-        interaction(Channel.LLM, prompt(DOUBT_MARKER)), Stage.PRE, LOG_ONLY
+        interaction(Channel.LLM, history(DOUBT_MARKER)), Stage.PRE, LOG_ONLY
     )
     assert (verdict.decision, verdict.enforced, verdict.reason_code) == (
         Decision.BLOCK,
@@ -326,7 +338,7 @@ async def test_too_many_uncertain_texts_fail_closed(interaction):
     texts = [f"text {i} {DOUBT_MARKER}" for i in range(MAX_JUDGED + 1)]
     judge = ScriptedJudge(NO)
     verdict = await control(judge=judge).evaluate(
-        interaction(Channel.LLM, prompt(*texts)), Stage.PRE, BLOCK
+        interaction(Channel.LLM, history(*texts)), Stage.PRE, BLOCK
     )
     assert (verdict.decision, verdict.reason_code) == (Decision.BLOCK, "judge_band_overflow")
     assert judge.contents == []
@@ -336,7 +348,7 @@ async def test_too_many_uncertain_texts_fail_closed(interaction):
 async def test_a_clear_detection_never_asks_the_judge(interaction):
     judge = ScriptedJudge(NO)
     verdict = await control(judge=judge).evaluate(
-        interaction(Channel.LLM, prompt(DOUBT_MARKER, INJECT_MARKER)), Stage.PRE, BLOCK
+        interaction(Channel.LLM, history(DOUBT_MARKER, INJECT_MARKER)), Stage.PRE, BLOCK
     )
     assert verdict.reason_code == "prompt_injection_detected"
     assert judge.contents == []
@@ -391,7 +403,7 @@ async def test_an_instruction_split_across_messages_is_seen_whole(interaction):
     half = len(INJECT_MARKER) // 2
     verdict = await control().evaluate(
         interaction(
-            Channel.LLM, prompt(f"Note: {INJECT_MARKER[:half]}", f"{INJECT_MARKER[half:]} ok")
+            Channel.LLM, history(f"Note: {INJECT_MARKER[:half]}", f"{INJECT_MARKER[half:]} ok")
         ),
         Stage.PRE,
         BLOCK,
@@ -561,9 +573,9 @@ def test_the_judgement_model_refuses_unknown_keys():
         InjectionJudgement.model_validate({"is_injection": False, "confidence": 1.0, "err": 1})
 
 
-def one_char_parts(text: str) -> dict[str, Any]:
+def one_char_parts(text: str, role: str = "tool") -> dict[str, Any]:
     parts = [{"type": "text", "text": char} for char in text]
-    return {"model": "qwen3:8b", "messages": [{"role": "user", "content": parts}]}
+    return {"model": "qwen3:8b", "messages": [{"role": role, "content": parts}]}
 
 
 @DENIED
@@ -777,7 +789,7 @@ async def test_an_instruction_split_one_character_per_message_is_seen(interactio
     left nothing longer than two characters to classify."""
     payload = {
         "model": "qwen3:8b",
-        "messages": [{"role": "user", "content": char} for char in f"Note: {INJECT_MARKER}."],
+        "messages": [{"role": "tool", "content": char} for char in f"Note: {INJECT_MARKER}."],
     }
     verdict = await control().evaluate(interaction(Channel.LLM, payload), Stage.PRE, BLOCK)
     assert verdict.reason_code == "prompt_injection_detected"
@@ -915,3 +927,178 @@ async def test_a_reload_to_another_judge_model_asks_the_judge_again(
             )
     assert [v.reason_code for v in verdicts] == ["judge_cleared", "prompt_injection_detected"]
     assert upstream.models == ["lenient-judge", "strict-judge"]
+
+
+# ------------------------------- the user's own prompt: judge confirms, taint on timeout
+
+YES_JUDGE_ANSWER = InjectionJudgement(is_injection=True, confidence=0.9, rationale="override")
+NO_JUDGE_ANSWER = InjectionJudgement(is_injection=False, confidence=0.9, rationale="a question")
+
+
+def chat_with(*messages: tuple[str, str]) -> dict[str, Any]:
+    return {"model": "qwen3:8b", "messages": [{"role": r, "content": c} for r, c in messages]}
+
+
+class HangingJudge:
+    def __init__(self) -> None:
+        self.cancelled = False
+
+    async def judge(self, *, control_id, instructions, content, response_model):
+        del control_id, instructions, content, response_model
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        raise AssertionError  # pragma: no cover
+
+
+AUTHORED_CASES = [
+    pytest.param("user", INJECT_MARKER, ScriptedJudge(YES_JUDGE_ANSWER), Decision.BLOCK,
+                 "prompt_injection_detected", 0.6, False, id="hit-judge-confirms", marks=DENIED),
+    pytest.param("user", INJECT_MARKER, ScriptedJudge(NO_JUDGE_ANSWER), Decision.ALLOW,
+                 "judge_cleared", 0.0, False, id="hit-judge-clears", marks=ALLOWED),
+    pytest.param("user", INJECT_MARKER, ScriptedJudge(None, JudgeResult.TIMEOUT), Decision.ALLOW,
+                 "prompt_injection_unconfirmed", 0.6, True, id="hit-judge-timeout", marks=ALLOWED),
+    pytest.param("user", INJECT_MARKER, ScriptedJudge(None, JudgeResult.SCHEMA_MISMATCH),
+                 Decision.ALLOW, "prompt_injection_unconfirmed", 0.6, True, id="hit-judge-garbled",
+                 marks=ALLOWED),
+    pytest.param("user", INJECT_MARKER, None, Decision.ALLOW, "prompt_injection_unconfirmed", 0.6,
+                 True, id="hit-no-judge", marks=ALLOWED),
+    pytest.param("system", INJECT_MARKER, ScriptedJudge(YES_JUDGE_ANSWER), Decision.BLOCK,
+                 "prompt_injection_detected", 0.6, False, id="system-hit-confirmed", marks=DENIED),
+    pytest.param("developer", INJECT_MARKER, ScriptedJudge(NO_JUDGE_ANSWER), Decision.ALLOW,
+                 "judge_cleared", 0.0, False, id="developer-hit-cleared", marks=ALLOWED),
+    pytest.param("user", DOUBT_MARKER, ScriptedJudge(None, JudgeResult.TIMEOUT), Decision.ALLOW,
+                 "prompt_injection_unconfirmed", 0.6, True, id="band-judge-timeout", marks=ALLOWED),
+    pytest.param("user", DOUBT_MARKER, ScriptedJudge(YES_JUDGE_ANSWER), Decision.BLOCK,
+                 "prompt_injection_detected", 0.6, False, id="band-judge-confirms", marks=DENIED),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("role", "text", "judge", "decision", "reason_code", "risk", "taint"), AUTHORED_CASES
+)
+async def test_hits_on_authored_text_go_to_the_judge(
+    interaction, role, text, judge, decision, reason_code, risk, taint
+):
+    verdict = await control(judge=judge).evaluate(
+        interaction(Channel.LLM, chat_with((role, f"Please {text} now"))), Stage.PRE, BLOCK
+    )
+    assert (verdict.decision, verdict.reason_code, verdict.risk_delta, verdict.taint) == (
+        decision,
+        reason_code,
+        risk,
+        taint,
+    )
+    if judge is not None:
+        assert len(judge.contents) == 1
+
+
+@ALLOWED
+async def test_a_judge_slower_than_user_judge_timeout_allows_and_taints(interaction):
+    judge = HangingJudge()
+    cfg = BLOCK.model_copy(update={"user_judge_timeout_s": 0.05})
+    started = time.perf_counter()
+    verdict = await control(judge=judge).evaluate(
+        interaction(Channel.LLM, chat_with(("user", INJECT_MARKER))), Stage.PRE, cfg
+    )
+    assert time.perf_counter() - started < 0.5
+    assert (verdict.decision, verdict.reason_code, verdict.taint) == (
+        Decision.ALLOW,
+        "prompt_injection_unconfirmed",
+        True,
+    )
+    assert "judge timeout" in verdict.reason
+    assert judge.cancelled  # the late judge call does not keep running
+
+
+@DENIED
+async def test_a_tool_message_in_history_still_hard_blocks_without_the_judge(interaction):
+    judge = ScriptedJudge(NO_JUDGE_ANSWER)
+    payload = chat_with(("user", "Summarise the page."), ("tool", f"Page text {INJECT_MARKER}"))
+    verdict = await control(judge=judge).evaluate(
+        interaction(Channel.LLM, payload), Stage.PRE, BLOCK
+    )
+    assert (verdict.decision, verdict.reason_code) == (Decision.BLOCK, "prompt_injection_detected")
+    assert judge.contents == []
+
+
+@DENIED
+async def test_an_assistant_message_in_history_stays_on_the_hard_path(interaction):
+    judge = ScriptedJudge(NO_JUDGE_ANSWER)
+    payload = chat_with(("assistant", f"I read: {INJECT_MARKER}"), ("user", "Continue please"))
+    verdict = await control(judge=judge).evaluate(
+        interaction(Channel.LLM, payload), Stage.PRE, BLOCK
+    )
+    assert verdict.reason_code == "prompt_injection_detected"
+    assert judge.contents == []
+
+
+@DENIED
+async def test_a_window_mixing_user_and_tool_text_stays_hard(interaction):
+    """Half the instruction in the user's message, half in a tool result: the only text that
+    holds it whole is a window over both, and part of it is untrusted, so no judge."""
+    half = len(INJECT_MARKER) // 2
+    judge = ScriptedJudge(NO_JUDGE_ANSWER)
+    payload = chat_with(
+        ("user", f"Note: {INJECT_MARKER[:half]}"), ("tool", f"{INJECT_MARKER[half:]} ok")
+    )
+    verdict = await control(judge=judge).evaluate(
+        interaction(Channel.LLM, payload), Stage.PRE, BLOCK
+    )
+    assert verdict.reason_code == "prompt_injection_detected"
+    assert judge.contents == []
+
+
+@ALLOWED
+async def test_a_window_over_user_messages_only_goes_to_the_judge(interaction):
+    half = len(INJECT_MARKER) // 2
+    judge = ScriptedJudge(NO_JUDGE_ANSWER)
+    payload = chat_with(
+        ("user", f"Note: {INJECT_MARKER[:half]}"), ("user", f"{INJECT_MARKER[half:]} ok")
+    )
+    verdict = await control(judge=judge).evaluate(
+        interaction(Channel.LLM, payload), Stage.PRE, BLOCK
+    )
+    assert verdict.reason_code == "judge_cleared"
+
+
+@DENIED
+async def test_mcp_results_and_llm_answers_are_unchanged(interaction):
+    judge = ScriptedJudge(NO_JUDGE_ANSWER)
+    pi = control(judge=judge)
+    mcp = await pi.evaluate(interaction(Channel.MCP, result=page(HIDDEN)), Stage.POST, BLOCK)
+    llm = await pi.evaluate(
+        interaction(Channel.LLM, result=answer(INJECT_MARKER)), Stage.POST, BLOCK
+    )
+    assert mcp.reason_code == llm.reason_code == "prompt_injection_detected"
+    assert judge.contents == []
+
+
+def test_authored_messages_by_role():
+    payload = chat_with(("system", "a"), ("user", "b"), ("assistant", "c"), ("tool", "d"))
+    authored = authored_messages(
+        Interaction.model_construct(channel=Channel.LLM, payload=payload), Stage.PRE
+    )
+    pointers = [f"/messages/{i}/content" for i in range(4)]
+    assert [authored(TextSegment(p, "x", key="content")) for p in pointers] == [
+        True,
+        True,
+        False,
+        False,
+    ]
+    assert not authored(TextSegment("/tools/0/function/description", "x", key="description"))
+    post = authored_messages(
+        Interaction.model_construct(channel=Channel.LLM, payload=payload), Stage.POST
+    )
+    assert not post(TextSegment("/messages/1/content", "x", key="content"))
+
+
+def test_user_judge_timeout_must_fit_the_judge_timeout(policy_doc, snapshot_from):
+    policy_doc["judges"] = {"model": "qwen3:8b", "timeout_s": 10}
+    policy_doc["controls"]["prompt_injection"]["user_judge_timeout_s"] = 15
+    with pytest.raises(PolicyLoadError, match="user_judge_timeout_s"):
+        snapshot_from(policy_doc)
+    policy_doc["controls"]["prompt_injection"]["user_judge_timeout_s"] = 5
+    assert snapshot_from(policy_doc).policy.controls.prompt_injection.user_judge_timeout_s == 5

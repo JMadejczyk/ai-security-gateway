@@ -79,6 +79,11 @@ class Verdict(FrozenModel):
     # names flags does not hold the released result: its approval obligation moves to the
     # matching MCP ``tools/call`` instead (SPEC "Intent vs enforcement").
     flags: tuple[FlaggedToolCall, ...] = ()
+    # Taint the session even though the decision lets the call through: the control could not
+    # show the content is clean and chose to allow it (``prompt_injection`` when the judge
+    # cannot confirm a hit on the user's own prompt). A non-allow verdict of a tainting
+    # control taints anyway; this is for allow verdicts. Recorded on the audit verdict.
+    taint: bool = False
 
 
 class Cooldown(FrozenModel):

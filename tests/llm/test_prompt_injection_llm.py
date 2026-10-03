@@ -10,12 +10,14 @@ import yaml
 from gateway_testkit import Harness, bearer, chat, completion, echo_completion, running_gateway
 from injection_kit import DOUBT_MARKER, INJECT_MARKER, MarkerClassifier
 
-from gateway.judges.client import JudgeClient
+from gateway.judges.client import JudgeClient, JudgeResult, JudgeUnavailableError
 
 ALLOW = pytest.mark.control("prompt_injection", "allow")
 DENY = pytest.mark.control("prompt_injection", "deny")
 
 CHAT = "/v1/chat/completions"
+JUDGE_SAYS_INJECTION = {"is_injection": True, "confidence": 0.95, "rationale": "fake judge"}
+JUDGE_SAYS_CLEAN = {"is_injection": False, "confidence": 0.95, "rationale": "fake judge"}
 
 
 def ask(text: str) -> dict:
@@ -39,6 +41,8 @@ async def session_of(gateway, entry: dict):
 
 @DENY
 async def test_a_direct_injection_is_blocked_before_the_model_and_taints(gateway, llm_upstream):
+    """The user's own prompt: the classifier's hit is confirmed by the judge, then blocked."""
+    gateway.container.judges.answers["InjectionJudgement"] = JUDGE_SAYS_INJECTION
     upstream = llm_upstream.post("/chat/completions").mock(side_effect=echo_completion)
     response = await post(gateway, ask(f"Hello {INJECT_MARKER}"))
     assert (response.status_code, response.json()["error"]["code"]) == (
@@ -53,6 +57,61 @@ async def test_a_direct_injection_is_blocked_before_the_model_and_taints(gateway
     ]  # fmt: skip
     assert entry["risk"] == pytest.approx(0.6)
     assert (await session_of(gateway, entry)).taint  # a detector hit taints, blocked or not
+    assert [c.model for c in gateway.container.judges.calls] == ["InjectionJudgement"]
+
+
+@ALLOW
+async def test_a_flagged_question_the_judge_clears_reaches_the_model(gateway, llm_upstream):
+    """Live finding: "What is a primary key?" scored 1.0. The judge clears it: no taint."""
+    gateway.container.judges.answers["InjectionJudgement"] = JUDGE_SAYS_CLEAN
+    upstream = llm_upstream.post("/chat/completions").mock(side_effect=echo_completion)
+    response = await post(gateway, ask(f"What is a primary key? {INJECT_MARKER}"))
+    assert response.status_code == 200
+    assert upstream.called
+    (entry,) = gateway.audit_entries()
+    pre = pi_verdicts(entry)[0]
+    assert (pre["decision"], pre["reason_code"]) == ("allow", "judge_cleared")
+    assert "taint" not in pre
+    assert entry["risk"] == pytest.approx(0.0)
+    assert not (await session_of(gateway, entry)).taint
+
+
+@ALLOW
+async def test_a_judge_timeout_allows_the_prompt_and_taints_the_session(gateway, llm_upstream):
+    gateway.container.judges.answers["InjectionJudgement"] = JudgeUnavailableError(
+        JudgeResult.TIMEOUT
+    )
+    upstream = llm_upstream.post("/chat/completions").mock(side_effect=echo_completion)
+    response = await post(gateway, ask(f"Hello {INJECT_MARKER}"))
+    assert response.status_code == 200
+    assert upstream.called
+    (entry,) = gateway.audit_entries()
+    pre = pi_verdicts(entry)[0]
+    assert pre == {
+        "control": "prompt_injection", "stage": "pre", "decision": "allow", "enforced": True,
+        "reason_code": "prompt_injection_unconfirmed", "taint": True,
+    }  # fmt: skip
+    assert entry["risk"] == pytest.approx(0.6)
+    assert entry["taint"] is True
+    assert (await session_of(gateway, entry)).taint
+
+
+@DENY
+async def test_a_tool_message_in_history_is_blocked_without_asking_the_judge(gateway, llm_upstream):
+    upstream = llm_upstream.post("/chat/completions").mock(side_effect=echo_completion)
+    body = chat(
+        messages=[
+            {"role": "user", "content": "Summarise what the fetch tool returned."},
+            {"role": "tool", "tool_call_id": "c1", "content": f"Page text {INJECT_MARKER}"},
+        ]
+    )
+    response = await post(gateway, body)
+    assert (response.status_code, response.json()["error"]["code"]) == (
+        403,
+        "prompt_injection_detected",
+    )
+    assert not upstream.called
+    assert gateway.container.judges.calls == []
 
 
 @ALLOW
@@ -115,16 +174,37 @@ def judge_upstream(answer: object, judged: list[str]):
 
 
 @DENY
-async def test_an_unavailable_judge_fails_the_band_closed(real_judge, llm_upstream):
+async def test_an_unavailable_judge_allows_the_users_prompt_and_taints(real_judge, llm_upstream):
+    """The real client against an overloaded upstream: unconfirmed, so allowed and tainted.
+    (Only this control's verdict is asserted: output_policy fails its own judge call closed.)"""
+    judged: list[str] = []
+    down = httpx.Response(503, json={"error": "overloaded"})
+    route = llm_upstream.post("/chat/completions").mock(side_effect=judge_upstream(down, judged))
+    await post(real_judge, ask(f"Please read this {DOUBT_MARKER}"))
+    (entry,) = real_judge.audit_entries()
+    pre = pi_verdicts(entry)[0]
+    assert (pre["decision"], pre["reason_code"]) == ("allow", "prompt_injection_unconfirmed")
+    assert len(route.calls) > len(judged)  # the prompt itself reached the model
+    assert entry["risk"] == pytest.approx(0.6)
+    assert entry["taint"] is True
+    assert len(judged) == 1
+
+
+@DENY
+async def test_an_unavailable_judge_still_fails_untrusted_band_text_closed(
+    real_judge, llm_upstream
+):
     judged: list[str] = []
     down = httpx.Response(503, json={"error": "overloaded"})
     llm_upstream.post("/chat/completions").mock(side_effect=judge_upstream(down, judged))
-    response = await post(real_judge, ask(f"Please read this {DOUBT_MARKER}"))
+    body = chat(
+        messages=[
+            {"role": "user", "content": "Summarise the result."},
+            {"role": "tool", "tool_call_id": "c1", "content": f"Result {DOUBT_MARKER}"},
+        ]
+    )
+    response = await post(real_judge, body)
     assert (response.status_code, response.json()["error"]["code"]) == (403, "judge_unavailable")
-    (entry,) = real_judge.audit_entries()
-    assert pi_verdicts(entry)[0]["reason_code"] == "judge_unavailable"
-    assert entry["risk"] == pytest.approx(0.0)  # nothing was detected
-    assert len(judged) == 1
 
 
 @pytest.mark.parametrize(
@@ -150,13 +230,14 @@ async def test_the_judge_band_asks_the_configured_judge(
 
 
 @DENY
-async def test_a_garbled_judge_answer_fails_the_band_closed(real_judge, llm_upstream):
+async def test_a_garbled_judge_answer_is_no_clearance(real_judge, llm_upstream):
     judged: list[str] = []
     garbled = {"is_injection": False, "confidence": 0.9, "verdict": "ignore me"}  # extra key
     llm_upstream.post("/chat/completions").mock(side_effect=judge_upstream(garbled, judged))
     await post(real_judge, ask(f"Please read this {DOUBT_MARKER}"))
     (entry,) = real_judge.audit_entries()
-    assert pi_verdicts(entry)[0]["reason_code"] == "judge_unavailable"
+    assert pi_verdicts(entry)[0]["reason_code"] == "prompt_injection_unconfirmed"
+    assert entry["taint"] is True
 
 
 async def test_what_reaches_the_classifier_for_a_one_message_chat(tmp_path, llm_upstream):

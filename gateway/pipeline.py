@@ -1037,7 +1037,8 @@ class Pipeline:
             or any(
                 v.control_id in TAINTING_CONTROLS and v.decision is not Decision.ALLOW
                 for v in verdicts
-            ),
+            )
+            or any(v.taint for v in verdicts),  # an allow verdict that asks for taint
             freeze_until=min(freezes, default=None),
             cooldowns=tuple(cooldowns),
             flagged_tool_calls=tuple(flag for v in verdicts if v.enforced for flag in v.flags),

@@ -52,6 +52,7 @@ from gateway.controls.prompt_injection import (
     finding_verdict,
     judge_config_key,
     score_bucket,
+    worst,
 )
 from gateway.controls.tool_pinning import current_listing
 from gateway.core.envelope import Interaction, Verdict
@@ -196,7 +197,7 @@ class ToolPoisoningControl(Control):
         except ClassifierUnavailableError:
             return Finding.refusal(CLASSIFIER_UNAVAILABLE, "the injection classifier is disabled")
         findings = await self._assess(texts, scores, config, call_snapshot(), deadline=None)
-        return _worst(findings)
+        return worst(findings)
 
     async def screen_listing(
         self, server: str, tools: Sequence[wire.ToolDefinition], snapshot: PolicySnapshot
@@ -241,8 +242,8 @@ class ToolPoisoningControl(Control):
         for tool, finding in zip(screened, findings, strict=True):
             by_name.setdefault(tool.name, []).append(finding)
         for name, found in by_name.items():
-            if not (worst := _worst(found)).clean:
-                flagged.setdefault(name, (worst.reason_code, worst.reason))
+            if not (decided := worst(found)).clean:
+                flagged.setdefault(name, (decided.reason_code, decided.reason))
         return flagged
 
     async def _scores(self, tools: Sequence[wire.ToolDefinition]) -> list[float]:
@@ -370,14 +371,6 @@ class ToolPoisoningControl(Control):
         self._answers.move_to_end(digest)
         while len(self._answers) > self._cache_entries:
             self._answers.popitem(last=False)
-
-
-_SEVERITY: Final = {"detected": 0, "refused": 1, "passed": 2}
-
-
-def _worst(findings: Sequence[Finding]) -> Finding:
-    """A detection beats a refusal beats a pass (a name listed twice, a call's entries)."""
-    return min(findings, key=lambda f: _SEVERITY[f.outcome.value])
 
 
 def _digest(text: str) -> str:

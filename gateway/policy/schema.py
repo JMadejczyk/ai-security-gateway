@@ -392,6 +392,11 @@ class PromptInjectionConfig(ControlConfig):
     # Characters of not yet classified text one call may carry; more fails closed. The model
     # runs at roughly 5 KB/s on 4 CPU threads, so this also bounds the added latency.
     max_chars: Annotated[int, Field(gt=0, le=10_000_000)] = 50_000
+    # How long a classifier hit on the user's own prompt waits for the judge before the call
+    # is allowed and the session tainted (`prompt_injection_unconfirmed`). The judge's own
+    # `judges.timeout_s` still applies, so the effective wait is the smaller of the two; set
+    # explicitly, it must not exceed `judges.timeout_s`.
+    user_judge_timeout_s: Annotated[float, Field(gt=0.0, le=300.0)] = 15.0
 
     @field_validator("judge_band")
     @classmethod
@@ -602,11 +607,29 @@ class Policy(FrozenModel):
         injection = controls.prompt_injection
         if injection is not None and "judge_band" in injection.model_fields_set:
             configured.append("prompt_injection.judge_band")
+        if injection is not None and "user_judge_timeout_s" in injection.model_fields_set:
+            configured.append("prompt_injection.user_judge_timeout_s")
         poisoning = controls.tool_poisoning
         if poisoning is not None and "judge_band" in poisoning.model_fields_set:
             configured.append("tool_poisoning.judge_band")
         if configured:
             msg = f"{configured} need an LLM judge: add a `judges:` section (judges.model)"
+            raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _user_judge_timeout_within_the_judge_timeout(self) -> Self:
+        injection, judges = self.controls.prompt_injection, self.judges
+        if (
+            injection is not None
+            and judges is not None
+            and "user_judge_timeout_s" in injection.model_fields_set
+            and injection.user_judge_timeout_s > judges.timeout_s
+        ):
+            msg = (
+                f"prompt_injection.user_judge_timeout_s ({injection.user_judge_timeout_s}) "
+                f"must not exceed judges.timeout_s ({judges.timeout_s})"
+            )
             raise ValueError(msg)
         return self
 

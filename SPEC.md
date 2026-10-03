@@ -182,7 +182,7 @@ The MCP proxy supports a pinned protocol version (`2025-06-18`) and a tools-only
 
 ## Control catalog
 
-Deterministic controls always run and are cheap (target p95 < 5 ms combined, excluding Presidio's NLP pass, which is measured separately). Semantic controls run in tiers: a small classifier on every input, and an LLM judge only when the classifier score falls in the uncertain band. Controls marked *mandatory* enforce in every profile and reject `mode: log_only`.
+Deterministic controls always run and are cheap (target p95 < 5 ms combined, excluding Presidio's NLP pass, which is measured separately). Semantic controls run in tiers: a small classifier on every input, and an LLM judge when the classifier score falls in the uncertain band. **Exception for text the agent authored** (LLM pre stage, `user`/`system`/`developer` messages): any classifier hit at or above the band goes to the judge, because the classifier misfires on short definitional questions ("What is a primary key?" scores 1.0). The judge confirming blocks; the judge clearing allows; no answer within `user_judge_timeout_s` allows the call but taints the session and adds risk (`prompt_injection_unconfirmed`). Tool results, assistant/tool messages in the history and mixed windows keep the hard threshold and never wait for the judge. A verdict may request taint without blocking (`Verdict.taint`). Controls marked *mandatory* enforce in every profile and reject `mode: log_only`.
 
 **Streaming.** Post controls need the complete output, and an SSE chunk that has reached the agent cannot be retracted. For `stream: true` the LLM proxy therefore calls the upstream **non-streaming**, runs every post control on the full response (text and `tool_calls`), and then re-emits the approved result to the agent as OpenAI-compatible SSE chunks ending in `data: [DONE]`. Agents that expect streaming keep working; first-token latency equals full-response latency. Responses are bounded (`limits.max_response_bytes`).
 
@@ -320,7 +320,7 @@ pricing:                   # USD; local models are priced by GPU wall-time estim
 budgets:
   per_user:    { daily_tokens: 200000, daily_cost_usd: 2.0 }
   per_agent:   { daily_tokens: 1000000 }
-  per_session: { tool_calls: 50, gpu_seconds: 120 }
+  per_session: { tool_calls: 50, gpu_seconds: 900 }   # CPU inference: ~10-70 s per call
   soft_limit_pct: 80
 ```
 
@@ -522,3 +522,4 @@ The honest pitch line: we do not claim to have invented taint or on-behalf-of, a
 - Stage 10–14 decisions: the injection classifier runs on ONNX Runtime and is fetched by a `models-init` profile with pinned hashes; one shared `JudgeClient` for all LLM judges, failing closed and not charged to agents; approvals and the kill switch live in Redis; session state and loop counters move to Redis behind the existing interfaces.
 - After the stage 10–14 review: operator tokens on their own audience; `sid_iat` and issuer-minted session ids; approval binding covers resources and the final operation digest, kill voids approvals by generation; tool quarantine until re-approval; prose-only, HTML-aware classification; strict judge response models; a session whose outcome could not be persisted stays fenced and resolves as tainted.
 - Stage 14–18 decisions: Loki ingestion via Alloy tailing the audit JSONL volume (no Docker socket); observability services on `ops` only, Grafana on 127.0.0.1:3300; `control(<id>, outcome)` test markers drive the per-control report and coverage check.
+- After the first real-model run: judges send `reasoning_effort: none`; Ollama keeps two cache slots; per-session GPU budget 900 s for CPU inference; classifier hits on agent-authored prompts are judge-confirmed and taint on timeout instead of blocking outright.

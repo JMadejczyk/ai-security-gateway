@@ -11,7 +11,8 @@ assembled at import, so neither the corpus nor this file carries a scanner-shape
 
 ``fake_injection`` lists substrings that the deterministic `MarkerClassifier` scores as an
 injection (0.99); ``fake_doubt`` substrings score 0.6, inside the judge band, where the fake LLM
-judge decides (``setup.tool_judge`` scripts its ``tool_poisoning`` answer). The same payload
+judge decides (``setup.tool_judge`` scripts its ``tool_poisoning`` answer,
+``setup.prompt_judge`` its answer about a hit on the user's own prompt). The same payload
 runs again with the real pinned classifier (``test_attack_real_model``, marked ``model``) when
 the case sets ``real_model``.
 """
@@ -49,6 +50,7 @@ from plugins.control_report import ControlClaim
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from gateway.injection.classifier import InjectionClassifier
+from gateway.judges.client import JudgeResult, JudgeUnavailableError
 from gateway.sessions import SessionUpdate
 
 # tests/mcp is not on this directory's import path (and not a package): load its harness by
@@ -159,6 +161,9 @@ class Setup(_Strict):
     vary: str | None = None  # suffix this argument with the attempt number
     # What the (fake) LLM judge answers tool_poisoning for a definition in its judge band.
     tool_judge: Literal["poisoned", "clean"] | None = None
+    # What it answers prompt_injection about a hit on the user's own prompt (``timeout``: no
+    # answer in time, so the prompt is allowed and the session tainted).
+    prompt_judge: Literal["injection", "clean", "timeout"] | None = None
 
 
 Channel = Literal["llm_prompt", "llm_response", "mcp_call", "mcp_listing", "scenario"]
@@ -339,20 +344,34 @@ async def raise_risk(gateway: Harness, token: str, risk: float | None) -> None:
     )
 
 
-def script_tool_judge(gateway: Harness, verdict: Literal["poisoned", "clean"] | None) -> None:
-    """Make the fake judge answer ``tool_poisoning`` with ``verdict``; every other judge-backed
-    control keeps the default answer (`judge_kit.DEFAULT_ANSWERS`)."""
-    if verdict is None:
+def script_judge(gateway: Harness, setup: Setup) -> None:
+    """Make the fake judge answer ``tool_poisoning`` (``setup.tool_judge``) and
+    ``prompt_injection`` (``setup.prompt_judge``) as the case says; anything unscripted keeps
+    the default answer (`judge_kit.DEFAULT_ANSWERS`)."""
+    if setup.tool_judge is None and setup.prompt_judge is None:
         return
     judges: Any = gateway.container.judges  # the harness's FakeJudgeClient
     default = DEFAULT_ANSWERS["InjectionJudgement"]
-    answer = {"is_injection": verdict == "poisoned", "confidence": 0.9, "rationale": "scripted"}
+    scripted: dict[str, object] = {}
+    if setup.tool_judge is not None:
+        scripted["tool_poisoning"] = _verdict(setup.tool_judge == "poisoned")
+    if setup.prompt_judge == "timeout":
+        scripted["prompt_injection"] = JudgeUnavailableError(JudgeResult.TIMEOUT)
+    elif setup.prompt_judge is not None:
+        scripted["prompt_injection"] = _verdict(setup.prompt_judge == "injection")
 
     def judge(control_id: str, content: str) -> object:
         del content
-        return answer if control_id == "tool_poisoning" else default
+        answer = scripted.get(control_id, default)
+        if isinstance(answer, JudgeUnavailableError):
+            raise answer
+        return answer
 
     judges.answers["InjectionJudgement"] = judge
+
+
+def _verdict(is_injection: bool) -> dict[str, object]:
+    return {"is_injection": is_injection, "confidence": 0.9, "rationale": "scripted"}
 
 
 def _describe(servers: dict[str, Any], describe: Describe) -> None:
@@ -396,7 +415,7 @@ async def mcp_stack(
             log.plan_cost = setup.plan_cost
         async with running_gateway(tmp_path, transport=transport, classifier=classifier) as gw:
             gw.resolver.answers.update(setup.dns)
-            script_tool_judge(gw, setup.tool_judge)
+            script_judge(gw, setup)
             apply_policy(gw, setup.policy)
             yield mcp_harness.MCPStack(gw, transport, log)
 
@@ -407,6 +426,7 @@ async def llm_gateway(
 ) -> AsyncIterator[tuple[Harness, respx.MockRouter]]:
     async with running_gateway(tmp_path, classifier=classifier) as gateway:
         apply_policy(gateway, case.setup.policy)
+        script_judge(gateway, case.setup)
         with respx.mock(base_url=LLM_BASE, assert_all_called=False) as router:
             yield gateway, router
 

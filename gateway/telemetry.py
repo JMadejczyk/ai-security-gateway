@@ -308,6 +308,8 @@ class AuditVerdict(FrozenModel):
     decision: Decision
     enforced: bool
     reason_code: str
+    # Present (true) only on a verdict that tainted the session while allowing the call.
+    taint: bool = Field(default=False, exclude_if=lambda taint: not taint)
 
     @classmethod
     def of(cls, verdict: Verdict, stage: Stage) -> "AuditVerdict":
@@ -317,6 +319,7 @@ class AuditVerdict(FrozenModel):
             decision=verdict.decision,
             enforced=verdict.enforced,
             reason_code=verdict.reason_code,
+            taint=verdict.taint,
         )
 
 

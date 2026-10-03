@@ -8,13 +8,17 @@ alone, so the ``signatures`` feed cannot be what catches them.
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
+import httpx
 import pytest
-from gateway_testkit import running_gateway
+from gateway_testkit import bearer, chat, echo_completion, running_gateway
 from injection_kit import INJECT_MARKER, MarkerClassifier
 from mcp_harness import MCPStack, connect, connect_all, error_text
 from pin_kit import capture_pins, write_pins
 from upstreams import running_upstreams
+
+from gateway.judges.client import JudgeResult, JudgeUnavailableError
 
 PI_ALLOW = pytest.mark.control("prompt_injection", "allow")
 PI_DENY = pytest.mark.control("prompt_injection", "deny")
@@ -172,3 +176,50 @@ async def test_clean_tools_stay_listed_and_callable(stack):
     assert await web.tools() == ["fetch"]
     stack.log.fetch_page = "<html><body>ok</body></html>"
     assert (await web.call("fetch", url="https://example.com/"))["isError"] is False
+
+
+# --------------------- the user's own prompt: an unconfirmed hit taints the whole session
+
+
+async def unconfirmed_prompt(stack: MCPStack, token: str) -> dict:
+    """An LLM request whose user prompt the classifier flags while the judge times out."""
+    routes: dict[str, Any] = stack.transport._routes
+    routes["ollama"] = httpx.MockTransport(echo_completion)  # the LLM upstream
+    judges: Any = stack.gateway.container.judges  # the testkit's FakeJudgeClient
+    judges.answers["InjectionJudgement"] = JudgeUnavailableError(JudgeResult.TIMEOUT)
+    body = chat(messages=[{"role": "user", "content": f"Hello {INJECT_MARKER}"}])
+    response = await stack.gateway.agent.post(
+        "/v1/chat/completions", json=body, headers=bearer(token)
+    )
+    assert response.status_code == 200, response.text  # allowed: unconfirmed, not detected
+    entry = stack.gateway.audit_entries()[-1]
+    unconfirmed = {
+        "control": "prompt_injection", "stage": "pre", "decision": "allow", "enforced": True,
+        "reason_code": "prompt_injection_unconfirmed", "taint": True,
+    }  # fmt: skip
+    assert unconfirmed in entry["verdicts"]
+    assert entry["taint"] is True
+    assert entry["risk"] >= 0.6
+    return entry
+
+
+@PI_ALLOW
+@AUTHZ_DENY
+async def test_an_unconfirmed_prompt_costs_databot_its_report_write(stack):
+    (reports,) = await connect_all(stack, ANNA, "reports")
+    before = await reports.call("write_report", name="q3.md", content="Q3 summary")
+    assert before["isError"] is False
+    await unconfirmed_prompt(stack, reports.token or "")
+    after = await reports.call("write_report", name="q4.md", content="Q4 summary")
+    assert error_text(after) == "action_removed_by_session_risk"
+    assert [c.arguments["name"] for c in stack.log.of("write_report")] == ["q3.md"]
+
+
+@PI_ALLOW
+@AUTHZ_HOLD
+async def test_an_unconfirmed_prompt_holds_nightly_etl_writes_for_approval(stack):
+    (reports,) = await connect_all(stack, ETL, "reports")
+    await unconfirmed_prompt(stack, reports.token or "")
+    held = await reports.call("write_report", name="nightly.md", content="nightly totals")
+    assert error_text(held).startswith("approval_required")
+    assert stack.log.of("write_report") == []

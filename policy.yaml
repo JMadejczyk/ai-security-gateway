@@ -105,7 +105,10 @@ pricing:                   # USD; local models are priced by GPU wall-time estim
 budgets:
   per_user:    { daily_tokens: 200000, daily_cost_usd: 2.0 }
   per_agent:   { daily_tokens: 1000000 }
-  per_session: { tool_calls: 50, gpu_seconds: 120 }
+  # CPU-only qwen3:8b takes ~10-70 s of upstream time per call, so 120 s allowed only ~5
+  # calls per session. GPU time is still charged at its real duration, and each call is
+  # held only up to its allowance (limits.upstream_timeout_s, or what is left if less).
+  per_session: { tool_calls: 50, gpu_seconds: 900 }
   soft_limit_pct: 80
 
 # LLM judges (intent_judge, output_policy, the prompt_injection judge band) call

@@ -20,7 +20,14 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from gateway.policy.loader import PolicySnapshot
-from gateway.upstream import TokenUsage, Upstream, UpstreamError, UpstreamResult
+from gateway.upstream import (
+    TokenUsage,
+    Upstream,
+    UpstreamError,
+    UpstreamResult,
+    refuse_encoded,
+    wire_chunks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +149,8 @@ class LLMProxy(Upstream):
         return [card.model_dump(mode="json") for card in models.data]
 
     def _headers(self, snapshot: PolicySnapshot) -> dict[str, str]:
-        headers = {"accept": "application/json"}
+        # identity only: a compressed body would be inflated before the size cap could see it.
+        headers = {"accept": "application/json", "accept-encoding": "identity"}
         key_env = snapshot.policy.upstreams.llm.api_key_env
         if key_env is not None:
             key = self._env.get(key_env)
@@ -172,7 +180,8 @@ class LLMProxy(Upstream):
                 if not response.is_success:
                     logger.warning("upstream %s %s answered %d", method, path, response.status_code)
                     raise UpstreamError("upstream_error")
-                async for chunk in response.aiter_bytes():
+                refuse_encoded(response)
+                async for chunk in wire_chunks(response):
                     raw += chunk
                     if len(raw) > limits.max_response_bytes:
                         raise UpstreamError("upstream_response_too_large")

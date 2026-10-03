@@ -11,6 +11,7 @@ Every refusal is a `TokenError` with a structured reason code.
 """
 
 import secrets
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -274,26 +275,41 @@ def new_session_id() -> str:
     return f"s-{secrets.token_urlsafe(12)}"
 
 
+class RetiredSessionError(RejectionError):
+    status_code = 409
+
+    def __init__(self) -> None:
+        super().__init__("session_ended", "that session has ended; omit session_id for a new one")
+
+
+type RetiredCheck = Callable[[str], Awaitable[bool]]
+"""Whether a session id has ever ended or expired (`SessionStore.is_retired`)."""
+
+
 class DemoTokenIssuer:
-    """Issues tokens for the predefined demo identities only."""
+    """Issues tokens for the predefined demo identities only, never for a retired session."""
 
     def __init__(
         self,
         identities: DemoIdentities,
         key: bytes,
         verifier: TokenVerifier,
+        is_retired: RetiredCheck,
         *,
         clock: Clock = utc_now,
     ) -> None:
         self._identities = identities
         self._key = key
         self._verifier = verifier
+        self._is_retired = is_retired
         self._clock = clock
 
-    def issue(self, request: DemoTokenRequest, snapshot: PolicySnapshot) -> IssuedToken:
+    async def issue(self, request: DemoTokenRequest, snapshot: PolicySnapshot) -> IssuedToken:
         identity = self._identities.identities.get(request.sub)
         if identity is None:
             raise UnknownIdentityError
+        if request.session_id is not None and await self._is_retired(request.session_id):
+            raise RetiredSessionError
         now = self._clock()
         claims = TokenClaims(
             iss=ISSUER,

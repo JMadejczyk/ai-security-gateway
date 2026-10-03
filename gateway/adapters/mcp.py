@@ -13,7 +13,10 @@ How an argument enters a resource template depends on the adapter:
 
 - ``generic``: the value is one percent-encoded segment (it can never add ``/``, ``*`` or
   whitespace to the resource);
-- ``http``: ``{url}`` is reduced to its host; the URL must be http(s) without user info;
+- ``http``: ``{url}`` is reduced to its host, canonicalized exactly as httpx (and so the
+  demo fetcher) puts it on the wire: IDNA 2008, lower case, no user info, no trailing dot.
+  The canonical URL replaces the agent's in the forwarded arguments, so the host that was
+  authorized is the host that gets fetched (``faß.de`` is ``xn--fa-hia.de``, not ``fass.de``);
 - ``fs``: a relative path, normalized first (no ``..``, ``.``, empty segments, absolute paths,
   backslashes or control characters), then percent-encoded per segment. Normalizing first
   matters: the permission ``write:fs:reports/*`` would otherwise accept ``reports/../x``;
@@ -27,8 +30,9 @@ from collections.abc import Mapping
 from enum import StrEnum
 from ipaddress import ip_address
 from typing import Any, ClassVar, Final
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 
+import httpx
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 from jsonschema.validators import validator_for
@@ -49,6 +53,7 @@ _PLACEHOLDER: Final = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _LABEL: Final = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 _HOSTNAME: Final = re.compile(rf"{_LABEL}(?:\.{_LABEL})*")
 MAX_HOSTNAME: Final = 253
+MAX_PORT: Final = 65535
 SQL_ARGUMENT: Final = "sql"
 
 
@@ -114,6 +119,8 @@ class GenericMCPAdapter(Adapter):
         if schema is None:
             raise _rejected(ToolCallReason.TOOL_NOT_ADVERTISED)
         validate_arguments(schema, call.arguments)
+        arguments = self.canonical_arguments(call.arguments)
+        payload = {"name": call.name, "arguments": arguments}
         return [
             Interaction(
                 session_id=ctx.session_id,
@@ -123,11 +130,15 @@ class GenericMCPAdapter(Adapter):
                 channel=Channel.MCP,
                 action=tool.action,
                 resource=resource,
-                payload=call.payload(),
+                payload=payload,
                 context=ctx,
             )
-            for resource in self.resources(tool, call.arguments)
+            for resource in self.resources(tool, arguments)
         ]
+
+    def canonical_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """The arguments as they will be forwarded; resources are derived from these."""
+        return arguments
 
     def resources(self, tool: McpTool, arguments: Mapping[str, Any]) -> list[str]:
         """Concrete resources of one call: the tool's template with every argument rendered."""
@@ -155,6 +166,12 @@ class HttpMCPAdapter(GenericMCPAdapter):
 
     kind: ClassVar[str] = "http"
     URL_ARGUMENT: ClassVar[str] = "url"
+
+    def canonical_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        url = arguments.get(self.URL_ARGUMENT)
+        if not isinstance(url, str):
+            return arguments
+        return {**arguments, self.URL_ARGUMENT: str(canonical_url(url))}
 
     def render(self, name: str, value: str) -> str:
         if name != self.URL_ARGUMENT:
@@ -184,31 +201,35 @@ class SqlMCPAdapter(GenericMCPAdapter):
         return [_concrete(f"db:{table}", sql=True) for table in referenced_tables(sql)]
 
 
-def url_host(url: str) -> str:
-    """The lower-case host of an absolute http(s) URL; anything ambiguous is refused."""
+def canonical_url(url: str) -> httpx.URL:
+    """An absolute http(s) URL parsed the way httpx sends it; anything ambiguous is refused.
+
+    httpx (and the demo fetcher, which uses it) encodes hosts with IDNA 2008. Parsing with
+    the same library, rather than ``urlsplit`` plus Python's IDNA 2003 codec, removes the
+    parser differential: the host checked here is byte for byte the one on the wire.
+    """
     if _has_control_chars(url) or any(ch.isspace() or ch == "\\" for ch in url):
         raise _rejected()
     try:
-        parts = urlsplit(url)
-        _ = parts.port  # raises ValueError for a malformed port
-    except ValueError:
+        parsed = httpx.URL(url)
+        host = parsed.raw_host.decode("ascii")
+    except (httpx.InvalidURL, UnicodeError):
         raise _rejected() from None
-    if parts.scheme.lower() not in {"http", "https"} or "@" in parts.netloc:
+    if parsed.scheme not in {"http", "https"} or parsed.userinfo:
         raise _rejected()
-    host = (parts.hostname or "").rstrip(".")
-    if not host:
+    if parsed.port is not None and not 0 < parsed.port <= MAX_PORT:
         raise _rejected()
     try:
-        return str(ip_address(host))
+        ip_address(host)
     except ValueError:
-        pass
-    try:
-        ascii_host = host.encode("idna").decode("ascii").lower()
-    except UnicodeError:
-        raise _rejected() from None
-    if len(ascii_host) > MAX_HOSTNAME or not _HOSTNAME.fullmatch(ascii_host):
-        raise _rejected()
-    return ascii_host
+        if len(host) > MAX_HOSTNAME or not _HOSTNAME.fullmatch(host):
+            raise _rejected() from None  # empty, trailing dot, upper case, odd characters
+    return parsed
+
+
+def url_host(url: str) -> str:
+    """The canonical (ASCII, lower-case) host of an absolute http(s) URL."""
+    return canonical_url(url).raw_host.decode("ascii")
 
 
 def normalized_path(path: str) -> str:

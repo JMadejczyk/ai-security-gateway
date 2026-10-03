@@ -24,7 +24,9 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator
+from contextvars import ContextVar
 from http import HTTPStatus
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from typing import Any, Final, Literal, cast
 from urllib.parse import urlsplit
 
@@ -36,13 +38,23 @@ from gateway.identity import mint_principal_assertion
 from gateway.policy.loader import PolicySnapshot
 from gateway.policy.schema import McpServer
 from gateway.proxies.mcp import wire
-from gateway.upstream import Upstream, UpstreamError, UpstreamResult
+from gateway.upstream import (
+    Upstream,
+    UpstreamError,
+    UpstreamResult,
+    refuse_encoded,
+    wire_chunks,
+)
 
 logger = logging.getLogger(__name__)
 
 CLIENT_INFO: Final = {"name": "ai-control-layer", "version": "0.1.0"}
 MAX_TOOL_PAGES: Final = 20  # tools/list pagination bound
 CLOSE_TIMEOUT_S: Final = 5.0
+# Set once a request of the current `_call` (per task) may have reached the upstream: from
+# then on a failure may carry upstream content (an error text, a malformed or oversized body)
+# or hide a call that ran. Only a refused connection proves nothing was sent.
+_SENT: ContextVar[bool] = ContextVar("mcp_upstream_sent", default=False)
 _LOG_TEXT_CHARS: Final = 200
 
 type Trust = Literal["internal", "untrusted"]
@@ -70,8 +82,14 @@ class MCPConnector:
     async def start(self) -> None:
         if self._client is None:
             # trust_env=False: no proxy or netrc settings from the environment.
+            # No cookies, ever: the pool is shared by every principal's upstream sessions, and
+            # a cookie set in one would otherwise be sent in another (allowed_domains=[] makes
+            # the jar refuse to store or return any cookie).
             self._client = httpx.AsyncClient(
-                transport=self._transport, follow_redirects=False, trust_env=False
+                transport=self._transport,
+                follow_redirects=False,
+                trust_env=False,
+                cookies=CookieJar(policy=DefaultCookiePolicy(allowed_domains=[])),
             )
 
     async def aclose(self) -> None:
@@ -166,7 +184,9 @@ class MCPUpstream(Upstream):
         try:
             wire.CallToolResult.model_validate(body)
         except ValidationError:
-            raise UpstreamError("upstream_invalid_response") from None
+            failure = UpstreamError("upstream_invalid_response")
+            failure.untrusted = self.trust == "untrusted"  # the malformed body was received
+            raise failure from None
         return UpstreamResult(body=body, elapsed_s=elapsed, untrusted=self.trust == "untrusted")
 
     async def list_tools(self, snapshot: PolicySnapshot) -> list[wire.ToolDefinition]:
@@ -233,6 +253,25 @@ class MCPUpstream(Upstream):
         *,
         retry_lost_session: bool,
     ) -> dict[str, Any]:
+        """One request in an initialized session. Every failure is an `UpstreamError`; it has
+        ``untrusted=True`` when the server is untrusted and a request may have reached it, so
+        the pipeline taints the session as it would for a result."""
+        sent = _SENT.set(False)
+        try:
+            return await self._call_once(method, params, snapshot, retry_lost_session)
+        except UpstreamError as exc:
+            exc.untrusted = self.trust == "untrusted" and _SENT.get()
+            raise
+        finally:
+            _SENT.reset(sent)
+
+    async def _call_once(
+        self,
+        method: str,
+        params: dict[str, Any] | None,
+        snapshot: PolicySnapshot,
+        retry_lost_session: bool,
+    ) -> dict[str, Any]:
         limits = snapshot.policy.limits
         try:
             async with asyncio.timeout(limits.upstream_timeout_s):
@@ -288,12 +327,13 @@ class MCPUpstream(Upstream):
             message["params"] = params
         answer = await self._exchange(message, snapshot, request_id=request_id)
         if isinstance(answer, wire.JsonRpcError):
+            # Length only: an upstream error message may echo the arguments (the payload).
             logger.warning(
-                "MCP server %s answered %s with error %d: %r",
+                "MCP server %s answered %s with error %d (message of %d chars)",
                 self.server,
                 method,
                 answer.error.code,
-                answer.error.message[:_LOG_TEXT_CHARS],
+                len(answer.error.message),
             )
             raise UpstreamError("upstream_rpc_error")
         return answer.result
@@ -315,6 +355,8 @@ class MCPUpstream(Upstream):
     ) -> wire.JsonRpcResult | wire.JsonRpcError | None:
         """POST one message; return the response to ``request_id`` (None for notifications)."""
         limits = snapshot.policy.limits
+        previously_sent = _SENT.get()
+        _SENT.set(True)
         try:
             async with self._connector.client.stream(
                 "POST",
@@ -324,6 +366,10 @@ class MCPUpstream(Upstream):
                 timeout=limits.upstream_timeout_s,
             ) as response:
                 return await self._answer(response, snapshot, request_id)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            _SENT.set(previously_sent)  # the connection was refused: this request never left
+            logger.warning("MCP server %s unreachable: %s", self.server, type(exc).__name__)
+            raise UpstreamError("upstream_unreachable") from None
         except httpx.TimeoutException:
             raise UpstreamError("upstream_timeout") from None
         except httpx.HTTPError as exc:
@@ -342,6 +388,7 @@ class MCPUpstream(Upstream):
             self._session_id = issued
         if request_id is None:
             return None  # a notification: 202 Accepted, no body expected
+        refuse_encoded(response)
         media = response.headers.get("content-type", "").partition(";")[0].strip().lower()
         max_bytes = snapshot.policy.limits.max_response_bytes
         if media == "application/json":
@@ -395,6 +442,7 @@ class MCPUpstream(Upstream):
     def _headers(self) -> dict[str, str]:
         headers = {
             "accept": "application/json, text/event-stream",
+            "accept-encoding": "identity",  # see refuse_encoded: the size cap reads wire bytes
             "content-type": "application/json",
         }
         if self._session_id is not None:
@@ -411,7 +459,7 @@ class MCPUpstream(Upstream):
 
 async def _capped(response: httpx.Response, max_bytes: int) -> AsyncIterator[bytes]:
     received = 0
-    async for chunk in response.aiter_bytes():
+    async for chunk in wire_chunks(response):
         received += len(chunk)
         if received > max_bytes:
             raise UpstreamError("upstream_response_too_large")

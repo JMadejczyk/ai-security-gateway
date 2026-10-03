@@ -110,7 +110,7 @@ def test_missing_or_non_string_argument_is_invalid(generic, ctx, arguments):
     [
         ("https://Example.COM/a?b=c", "example.com"),
         ("http://example.com:8443/x", "example.com"),
-        ("http://example.com./", "example.com"),
+        ("https://faß.de/", "xn--fa-hia.de"),  # IDNA 2008, as httpx sends it (not fass.de)
         ("http://93.184.216.34/", "93.184.216.34"),
         ("http://[2001:db8::1]:80/", "2001:db8::1"),
         ("https://bücher.de/", "xn--bcher-kva.de"),
@@ -134,6 +134,7 @@ def test_url_reduced_to_host(url, host):
         "http://example.com:99999/",
         "http://ex*ample.com/",
         "http://example.com\n.evil/",
+        "http://example.com./",  # a trailing dot would authorize a different spelling
     ],
 )
 def test_bad_urls_refused(url):
@@ -146,6 +147,16 @@ def test_http_adapter_resource_is_the_host(servers, ctx):
     adapter = mcp_adapter("web", servers["web"], {"fetch": FETCH_SCHEMA})
     [interaction] = adapter.normalize(raw("web", "fetch", url="https://news.example.com/x"), ctx)
     assert (interaction.action, interaction.resource) == (Action.READ, "web:news.example.com")
+
+
+def test_http_adapter_forwards_the_url_it_authorized(servers, ctx):
+    """The fetcher gets the canonical URL, so the host it connects to is the one checked."""
+    adapter = mcp_adapter("web", servers["web"], {"fetch": FETCH_SCHEMA})
+    [interaction] = adapter.normalize(raw("web", "fetch", url="https://Faß.DE/a?b=ç"), ctx)
+    assert interaction.resource == "web:xn--fa-hia.de"
+    forwarded = interaction.payload["arguments"]["url"]
+    assert forwarded.startswith("https://xn--fa-hia.de/a?b=")
+    assert url_host(forwarded) == "xn--fa-hia.de"
 
 
 # --------------------------------------------------------------------------- fs path
@@ -198,12 +209,19 @@ def test_fs_subdirectories_are_normalized_not_refused():
             "select c.name, o.total from sales.customers c join sales.orders o on o.cid = c.id",
             ("sales.customers", "sales.orders"),
         ),
-        ("SELECT * FROM customers", ("public.customers",)),
         ("SELECT * FROM Sales.Customers", ("sales.customers",)),  # unquoted folds to lower
+        ('SELECT * FROM "sales"."customers"', ("sales.customers",)),  # quoted lower = same
         ("SELECT * FROM (SELECT * FROM sales.payments) p", ("sales.payments",)),
-        ("WITH t AS (SELECT * FROM sales.orders) SELECT * FROM t", ("sales.orders",)),
+        (
+            "SELECT count(*), sum(total), avg(total), min(total), max(total), lower(name),"
+            " upper(name), length(name), coalesce(total, 0), nullif(total, 0), round(total, 2),"
+            " abs(total), date_trunc('month', created), extract(year FROM created), now(),"
+            " current_date, CAST(total AS int), total::text,"
+            " CASE WHEN total > 1 THEN 1 ELSE 0 END FROM sales.orders",
+            ("sales.orders",),
+        ),
     ],
-    ids=["single", "join", "unqualified", "case", "subquery", "cte"],
+    ids=["single", "join", "case", "quoted", "subquery", "allowlisted-functions"],
 )
 def test_sql_tables(sql, tables):
     assert referenced_tables(sql) == tables
@@ -240,6 +258,31 @@ def test_sql_join_becomes_two_interactions(servers, ctx):
         "SELECT 1 FROM sales.orders UNION SELECT 2 FROM sales.payments",
         "this is not sql (((",
         "",
+        # Functions outside the allowlist; some read tables this check never sees.
+        "SELECT query_to_xml($$SELECT * FROM sales.payments$$, true, false, '') "
+        "FROM sales.customers",
+        "SELECT query_to_xml($$SELECT set_config('app.user_id', 'root@demo', true)$$, "
+        "true, false, '') FROM sales.customers",
+        "SELECT pg_read_file('/etc/passwd') FROM sales.orders",
+        "SELECT dblink('host=x', 'SELECT 1') FROM sales.orders",
+        "SELECT made_up_function(total) FROM sales.orders",
+        # CTEs (a CTE name can hide a real table in another scope).
+        "WITH t AS (SELECT * FROM sales.orders) SELECT * FROM t",
+        "WITH unused AS (SELECT 1) SELECT * FROM sales.customers",
+        "SELECT p.relname FROM pg_class p CROSS JOIN "
+        "(WITH pg_class AS (SELECT 1) SELECT * FROM sales.customers LIMIT 1) c",
+        # Unqualified tables: the upstream's search_path decides what they are.
+        "SELECT * FROM customers",
+        # System catalogs.
+        "SELECT * FROM pg_catalog.pg_class",
+        "SELECT * FROM information_schema.tables",
+        "SELECT * FROM pg_toast.pg_toast_1",
+        # Identifiers that would collapse two tables into one resource, or are ambiguous.
+        'SELECT * FROM "public.sales".customers',
+        'SELECT * FROM public."sales.customers"',
+        'SELECT * FROM sales."Customers"',
+        'SELECT * FROM sales."cust omers"',
+        'SELECT * FROM sales."a:b"',
     ],
 )
 def test_unsupported_sql_refused(servers, ctx, sql):
@@ -247,6 +290,19 @@ def test_unsupported_sql_refused(servers, ctx, sql):
     with pytest.raises(RejectionError) as exc:
         adapter.normalize(raw("sales_db", "query", sql=sql), ctx)
     assert reason(exc) == "unsupported_sql"
+
+
+def test_unqualified_tables_say_why():
+    with pytest.raises(RejectionError) as exc:
+        referenced_tables("SELECT * FROM customers")
+    assert exc.value.message == "tables must be schema-qualified"
+
+
+def test_distinct_quoted_tables_never_share_a_resource():
+    """Before the identifier check both derived ``public.sales.customers``."""
+    for sql in ('SELECT * FROM "public.sales".customers', 'SELECT * FROM public."sales.customers"'):
+        with pytest.raises(RejectionError):
+            referenced_tables(sql)
 
 
 # --------------------------------------------------------------- mapping and schemas

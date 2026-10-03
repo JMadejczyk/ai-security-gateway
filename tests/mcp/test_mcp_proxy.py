@@ -7,6 +7,7 @@ session binding and teardown, and generic upstream failures.
 """
 
 import json
+from datetime import timedelta
 
 import jwt
 import pytest
@@ -14,6 +15,7 @@ from gateway_testkit import INTERNAL_KEY, bearer, running_gateway
 from mcp_harness import PROTOCOL, MCPClient, MCPStack, connect, connect_all, error_text
 from upstreams import INJECTION_PAGE, RoutingTransport, running_upstreams
 
+from gateway.sessions import SessionUpdate
 from gateway.telemetry import REGISTRY
 
 ANNA, BARTEK, ETL = "anna@demo", "bartek@demo", "svc:nightly_etl"
@@ -427,3 +429,61 @@ async def test_unreachable_upstream_is_a_generic_error(stack: MCPStack, tmp_path
     assert error_text(await web.call("fetch", url="https://example.com")) == "upstream_unreachable"
     listing = await web.request("tools/list")
     assert listing.json()["error"]["data"]["reason_code"] == "upstream_unreachable"
+
+
+async def test_untrusted_upstream_error_still_taints(stack: MCPStack):
+    """The request reached the untrusted server; its answer (here an error) reached us."""
+    web, reports = await connect_all(stack, ANNA, "web", "reports")
+    stack.transport.rpc_error_tool_calls.add("mcp-fetch")
+    result = await web.call("fetch", url="https://example.com/outlook")
+    assert error_text(result) == "upstream_rpc_error"
+    assert RoutingTransport.LEAK not in json.dumps(result)
+    session_id = stack.gateway.audit_entries()[-1]["session_id"]
+    session = await stack.gateway.container.sessions.get(session_id)
+    assert session is not None
+    assert session.taint
+
+    denied = await reports.call("write_report", name="after.md", content="x")
+    assert error_text(denied) == "action_removed_by_session_risk"
+    assert stack.log.of("write_report") == []
+
+
+async def test_trusted_upstream_error_does_not_taint(stack: MCPStack):
+    sales, reports = await connect_all(stack, ANNA, "sales_db", "reports")
+    stack.transport.rpc_error_tool_calls.add("mcp-postgres")
+    assert error_text(await sales.call("query", sql=COUNT_CUSTOMERS)) == "upstream_rpc_error"
+    assert (await reports.call("write_report", name="ok.md", content="x"))["isError"] is False
+
+
+async def test_fetch_receives_the_canonical_url_it_was_authorized_for(stack: MCPStack):
+    web = await connect(stack, ANNA, "web")
+    await web.call("fetch", url="https://faß.de/seite")
+    [call] = stack.log.of("fetch")
+    assert call.arguments["url"] == "https://xn--fa-hia.de/seite"
+    entry = stack.gateway.audit_entries()[-1]
+    assert entry["resource"] == "web:xn--fa-hia.de"
+
+
+async def frozen_session(stack: MCPStack, update: SessionUpdate) -> MCPClient:
+    """anna on sales_db in session ``s-frozen``, with ``update`` applied to that session."""
+    token = await stack.gateway.token(ANNA, session_id="s-frozen")
+    sales = MCPClient(stack.gateway.agent, token, "sales_db")
+    assert (await sales.initialize()).status_code == 200
+    await stack.gateway.container.sessions.apply("s-frozen", update, half_life_s=600)
+    return sales
+
+
+async def test_no_tools_listed_while_the_freeze_threshold_holds(stack: MCPStack):
+    sales = await frozen_session(stack, SessionUpdate(risk_delta=0.9))  # risk > 0.8
+    assert await sales.tools() == []
+    session = await stack.gateway.container.sessions.get("s-frozen")
+    assert session is not None
+    assert session.freeze_until is None  # listing never starts the freeze timer
+
+
+async def test_no_tools_listed_while_a_freeze_runs(stack: MCPStack):
+    until = stack.gateway.clock() + timedelta(seconds=120)
+    sales = await frozen_session(stack, SessionUpdate(freeze_until=until))  # risk stays 0
+    assert await sales.tools() == []
+    stack.gateway.clock.advance(121)
+    assert await sales.tools() == ["query"]

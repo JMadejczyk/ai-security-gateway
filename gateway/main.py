@@ -26,9 +26,9 @@ from gateway.container import GatewayContainer
 from gateway.core.types import Action, Channel, Decision
 from gateway.errors import RejectionError, RequestTooLargeError
 from gateway.identity import DemoTokenRequest, IssuedToken
-from gateway.pipeline import CallRequest
+from gateway.pipeline import CallRequest, PipelineOutcome
 from gateway.proxies.llm import sse_events
-from gateway.proxies.mcp.downstream import MCPHttpRequest, MCPReply
+from gateway.proxies.mcp.downstream import MCPHttpRequest, MCPReply, refusal_reply
 from gateway.telemetry import REGISTRY, ReloadResult, set_tainted_sessions
 
 ADMIN_ROLE: Final = "admin"
@@ -45,12 +45,25 @@ _ERROR_TYPES: Final = {
 }
 
 
-def error_response(status: int, code: str, message: str) -> JSONResponse:
+def error_response(
+    status: int, code: str, message: str, *, retry_after_s: int | None = None
+) -> JSONResponse:
     """An OpenAI-style error; ``code`` is the structured reason code."""
     kind = _ERROR_TYPES.get(HTTPStatus(status), "api_error")
-    headers = {"www-authenticate": "Bearer"} if status == HTTPStatus.UNAUTHORIZED else None
+    headers = {"www-authenticate": "Bearer"} if status == HTTPStatus.UNAUTHORIZED else {}
+    if retry_after_s is not None:
+        headers["retry-after"] = str(retry_after_s)
     body = {"error": {"message": message, "type": kind, "code": code}}
     return JSONResponse(body, status_code=status, headers=headers)
+
+
+def outcome_error(outcome: PipelineOutcome) -> JSONResponse:
+    return error_response(
+        outcome.status_code,
+        outcome.reason_code,
+        outcome.message,
+        retry_after_s=outcome.retry_after_s,
+    )
 
 
 def bearer_token(request: Request) -> str | None:
@@ -113,11 +126,16 @@ def create_agent_app(container: GatewayContainer) -> FastAPI:
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:
         snapshot = container.policy_store.current  # the one snapshot this call reads
-        body = await read_capped(request, snapshot.policy.limits.max_request_bytes)
-        call = CallRequest(channel=Channel.LLM, token=bearer_token(request), body=body)
+        token = bearer_token(request)
+        try:
+            body = await read_capped(request, snapshot.policy.limits.max_request_bytes)
+        except RequestTooLargeError as exc:
+            early = CallRequest(channel=Channel.LLM, token=token, body=b"")
+            return outcome_error(container.pipeline.record_refusal(early, snapshot, exc))
+        call = CallRequest(channel=Channel.LLM, token=token, body=body)
         outcome = await container.pipeline.handle(call, snapshot)
         if not outcome.released:
-            return error_response(outcome.status_code, outcome.reason_code, outcome.message)
+            return outcome_error(outcome)
         result: dict[str, Any] = outcome.result
         sent = ChatCompletionRequest.model_validate(outcome.request)
         if sent.stream:
@@ -164,7 +182,17 @@ def create_agent_app(container: GatewayContainer) -> FastAPI:
     @app.post("/mcp/{server}")
     async def mcp_post(server: str, request: Request) -> Response:
         snapshot = container.policy_store.current
-        body = await read_capped(request, snapshot.policy.limits.max_request_bytes)
+        try:
+            body = await read_capped(request, snapshot.policy.limits.max_request_bytes)
+        except RequestTooLargeError as exc:
+            known = server if server in snapshot.policy.upstreams.mcp else None
+            early = CallRequest(
+                channel=Channel.MCP, token=bearer_token(request), body=b"", server=known
+            )
+            outcome = container.pipeline.record_refusal(early, snapshot, exc)
+            return _mcp_response(
+                refusal_reply(outcome.status_code, outcome.reason_code, outcome.message)
+            )
         reply = await container.mcp.post(server, _mcp_request(request, body), snapshot)
         return _mcp_response(reply)
 
@@ -217,7 +245,7 @@ def create_operator_app(container: GatewayContainer) -> FastAPI:
 
         @app.post("/auth/demo-token")
         async def demo_token(body: DemoTokenRequest) -> IssuedToken:
-            return issuer.issue(body, container.policy_store.current)
+            return await issuer.issue(body, container.policy_store.current)
 
     @app.post("/admin/reload")
     async def reload_policy(request: Request) -> Response:

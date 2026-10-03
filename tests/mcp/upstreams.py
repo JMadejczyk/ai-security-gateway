@@ -153,7 +153,8 @@ class RoutingTransport(httpx.AsyncBaseTransport):
     """Sends each request to the in-process app for its host; records every request.
 
     ``fail_tool_calls`` makes a host answer ``tools/call`` with an HTTP 500 whose body would
-    leak internals if the gateway ever relayed it.
+    leak internals if the gateway ever relayed it; ``rpc_error_tool_calls`` makes it answer
+    with a JSON-RPC error instead.
     """
 
     LEAK = "SECRET-UPSTREAM-STACKTRACE"
@@ -162,6 +163,7 @@ class RoutingTransport(httpx.AsyncBaseTransport):
         self._routes = {host: httpx.ASGITransport(app=app) for host, app in apps.items()}
         self.requests: list[httpx.Request] = []
         self.fail_tool_calls: set[str] = set()
+        self.rpc_error_tool_calls: set[str] = set()
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -170,6 +172,11 @@ class RoutingTransport(httpx.AsyncBaseTransport):
             raise httpx.ConnectError("no route to host", request=request)
         if request.url.host in self.fail_tool_calls and self._method(request) == "tools/call":
             return httpx.Response(500, text=self.LEAK, request=request)
+        if request.url.host in self.rpc_error_tool_calls and self._method(request) == "tools/call":
+            message_id = json.loads(request.content)["id"]
+            error = {"code": -32603, "message": self.LEAK}
+            body = {"jsonrpc": "2.0", "id": message_id, "error": error}
+            return httpx.Response(200, json=body, request=request)
         return await route.handle_async_request(request)
 
     @staticmethod

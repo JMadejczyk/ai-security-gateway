@@ -225,6 +225,21 @@ class PolicyEvaluator:
             for action in rule.then.deny_actions
         )
 
+    def tools_frozen(self, snapshot: PolicySnapshot, ctx: SessionContext, now: datetime) -> bool:
+        """Would a tool call be refused as ``tools_frozen`` right now?
+
+        True while a freeze is running, and while a ``freeze_tools`` rule's threshold holds
+        (the next call would start one). Read-only: unlike a call, it never starts the timer.
+        """
+        if ctx.is_frozen(now):
+            return True
+        policy = snapshot.policy
+        risk = ctx.risk_at(now, policy.risk.half_life_s)
+        return any(
+            rule.then.freeze_tools and rule.when.holds(risk=risk, taint=ctx.taint)
+            for rule in policy.risk_rules.for_mode(ctx.mode)
+        )
+
     def decide(  # noqa: PLR0913 -- the union of authorize() and session_restrictions() inputs
         self,
         snapshot: PolicySnapshot,

@@ -24,6 +24,7 @@ from gateway.identity import (
     UnknownIdentityError,
     mint_principal_assertion,
 )
+from gateway.sessions import InMemorySessionStore
 
 
 @pytest.fixture
@@ -37,9 +38,18 @@ def verifier(clock) -> TokenVerifier:
 
 
 @pytest.fixture
-def issuer(verifier, clock) -> DemoTokenIssuer:
+def sessions(clock) -> InMemorySessionStore:
+    return InMemorySessionStore(clock=clock)
+
+
+@pytest.fixture
+def issuer(verifier, sessions, clock) -> DemoTokenIssuer:
     return DemoTokenIssuer(
-        DemoIdentities.load(IDENTITIES), JWT_SECRET.encode(), verifier, clock=clock
+        DemoIdentities.load(IDENTITIES),
+        JWT_SECRET.encode(),
+        verifier,
+        sessions.is_retired,
+        clock=clock,
     )
 
 
@@ -187,16 +197,18 @@ def test_agent_principals_list_is_enforced(verifier, snapshot_from, policy_doc, 
 # --------------------------------------------------------------------------- demo issuer
 
 
-def test_demo_issuer_issues_verifiable_tokens_with_fresh_sessions(issuer, verifier, snapshot):
-    first = issuer.issue(DemoTokenRequest(sub="anna@demo"), snapshot)
-    second = issuer.issue(DemoTokenRequest(sub="anna@demo"), snapshot)
+async def test_demo_issuer_issues_verifiable_tokens_with_fresh_sessions(issuer, verifier, snapshot):
+    first = await issuer.issue(DemoTokenRequest(sub="anna@demo"), snapshot)
+    second = await issuer.issue(DemoTokenRequest(sub="anna@demo"), snapshot)
     assert first.session_id != second.session_id
     verified = verifier.verify(first.access_token, snapshot)
     assert (verified.sub, verified.agent, verified.roles) == ("anna@demo", "databot", ("analyst",))
 
 
-def test_demo_issuer_keeps_a_requested_session(issuer, snapshot):
-    issued = issuer.issue(DemoTokenRequest(sub="svc:nightly_etl", session_id="s-etl-1"), snapshot)
+async def test_demo_issuer_keeps_a_requested_session(issuer, snapshot):
+    issued = await issuer.issue(
+        DemoTokenRequest(sub="svc:nightly_etl", session_id="s-etl-1"), snapshot
+    )
     assert (issued.session_id, issued.agent, issued.mode) == (
         "s-etl-1",
         "nightly_etl",
@@ -204,14 +216,14 @@ def test_demo_issuer_keeps_a_requested_session(issuer, snapshot):
     )
 
 
-def test_demo_issuer_refuses_unknown_identity(issuer, snapshot):
+async def test_demo_issuer_refuses_unknown_identity(issuer, snapshot):
     with pytest.raises(UnknownIdentityError):
-        issuer.issue(DemoTokenRequest(sub="mallory@demo"), snapshot)
+        await issuer.issue(DemoTokenRequest(sub="mallory@demo"), snapshot)
 
 
-def test_demo_issuer_refuses_a_delegation_the_policy_rejects(issuer, snapshot):
+async def test_demo_issuer_refuses_a_delegation_the_policy_rejects(issuer, snapshot):
     with pytest.raises(TokenError) as caught:
-        issuer.issue(DemoTokenRequest(sub="anna@demo", agent="nightly_etl"), snapshot)
+        await issuer.issue(DemoTokenRequest(sub="anna@demo", agent="nightly_etl"), snapshot)
     assert caught.value.reason is TokenReason.MODE_MISMATCH
 
 

@@ -85,6 +85,18 @@ TAINTED_SESSIONS = Gauge(
     "Live sessions whose context received untrusted content.",
     registry=REGISTRY,
 )
+THROTTLED = Counter(
+    "acl_throttled",
+    "Calls rejected by a throttle cap, by agent.",
+    ["agent"],
+    registry=REGISTRY,
+)
+ALERTS = Counter(
+    "acl_alerts",
+    "Risk-rule alerts raised, by rule (`<mode>.<index>` into risk_rules: bounded by the policy).",
+    ["rule"],
+    registry=REGISTRY,
+)
 SESSION_RISK = Histogram(
     "acl_session_risk",
     "Session risk after each call (per-session values live in the audit log, never labels).",
@@ -125,6 +137,14 @@ def record_overhead(channel: Channel, seconds: float) -> None:
 def record_tokens(user: str, agent: str, model: str, tokens: int) -> None:
     if tokens > 0:
         TOKENS.labels(user=user, agent=agent, model=model).inc(tokens)
+
+
+def record_throttled(agent: str) -> None:
+    THROTTLED.labels(agent=agent).inc()
+
+
+def record_alert(rule: str) -> None:
+    ALERTS.labels(rule=rule).inc()
 
 
 def record_session(risk: float, tainted_sessions: int) -> None:

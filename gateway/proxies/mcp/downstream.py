@@ -121,7 +121,7 @@ class MCPProxy:
         except _ProtocolError as exc:
             return exc.reply
         except RejectionError as exc:
-            return await self._refused(exc, claims)
+            return await self._refused(exc, claims, request, server, snapshot)
 
     async def delete(
         self, server: str, request: MCPHttpRequest, snapshot: PolicySnapshot
@@ -137,7 +137,7 @@ class MCPProxy:
         except _ProtocolError as exc:
             return exc.reply
         except RejectionError as exc:
-            return await self._refused(exc, claims)
+            return await self._refused(exc, claims, request, server, snapshot)
 
     @staticmethod
     def get() -> MCPReply:
@@ -204,7 +204,8 @@ class MCPProxy:
         snapshot: PolicySnapshot,
     ) -> MCPReply:
         """Only tools that are mapped, within the agent's ``max_actions`` and not currently
-        removed by session restrictions. Resource checks wait for ``tools/call``."""
+        removed by session restrictions; none while tools are frozen. Listing never starts a
+        session timer. Resource checks wait for ``tools/call``."""
         async with self._gate.admit(request.token, snapshot) as (claims, ctx):
             upstream = await self._registry.upstream(session, snapshot)
             try:
@@ -214,8 +215,11 @@ class MCPProxy:
                     message, wire.INTERNAL_ERROR, exc.message, {"reason_code": exc.reason_code}
                 )
             agent = snapshot.policy.agents.get(claims.agent)
-            removed = self._pipeline.evaluator.removed_actions(snapshot, ctx, self._clock())
+            evaluator, now = self._pipeline.evaluator, self._clock()
+            removed = evaluator.removed_actions(snapshot, ctx, now)
             usable = frozenset(agent.max_actions) - removed if agent else frozenset[Action]()
+            if evaluator.tools_frozen(snapshot, ctx, now):  # every tool call would be refused
+                usable = frozenset[Action]()
             listed = [
                 tool.as_wire()
                 for tool in tools
@@ -256,7 +260,14 @@ class MCPProxy:
         outcome = await self._pipeline.handle(call, snapshot, route=route)
         if outcome.status_code == HTTPStatus.UNAUTHORIZED:  # token or session gone mid-call
             await self._end_if_session_over(outcome.reason_code, outcome.session_id)
-            return _refusal_reply(outcome.status_code, outcome.reason_code, outcome.message)
+            return refusal_reply(outcome.status_code, outcome.reason_code, outcome.message)
+        if outcome.status_code == HTTPStatus.TOO_MANY_REQUESTS:  # throttled: retry later
+            return refusal_reply(
+                outcome.status_code,
+                outcome.reason_code,
+                outcome.message,
+                retry_after_s=outcome.retry_after_s,
+            )
         return MCPReply(HTTPStatus.OK, wire.result(message.id, _tool_result(outcome)))
 
     # -------------------------------------------------------------------- admission
@@ -281,10 +292,21 @@ class MCPProxy:
             raise _ProtocolError(400, wire.INVALID_REQUEST, "Mcp-Session-Id header is required")
         return self._registry.get(session_id, claims, server)
 
-    async def _refused(self, exc: RejectionError, claims: TokenClaims | None) -> MCPReply:
+    async def _refused(
+        self,
+        exc: RejectionError,
+        claims: TokenClaims | None,
+        request: MCPHttpRequest,
+        server: str,
+        snapshot: PolicySnapshot,
+    ) -> MCPReply:
+        """Refusals before the pipeline (token, origin, server, session) are audited too."""
         if isinstance(exc, SessionError) and claims is not None:
             await self._end_if_session_over(exc.reason_code, claims.session_id)
-        return _refusal_reply(exc.status_code, exc.reason_code, exc.message)
+        known = server if server in snapshot.policy.upstreams.mcp else None
+        call = CallRequest(channel=Channel.MCP, token=request.token, body=b"", server=known)
+        self._pipeline.record_refusal(call, snapshot, exc)
+        return refusal_reply(exc.status_code, exc.reason_code, exc.message)
 
     async def _end_if_session_over(self, reason_code: str, gateway_session: str | None) -> None:
         if reason_code == SessionReason.ENDED and gateway_session is not None:
@@ -334,9 +356,14 @@ def _rpc_error(message: wire.JsonRpcRequest, code: int, text: str, data: object 
     return MCPReply(HTTPStatus.OK, wire.error(message.id, code, text, data))
 
 
-def _refusal_reply(status: int, reason_code: str, message: str) -> MCPReply:
+def refusal_reply(
+    status: int, reason_code: str, message: str, *, retry_after_s: int | None = None
+) -> MCPReply:
+    """A refusal before (or instead of) a tool result: a JSON-RPC error carrying a reason code."""
     body = wire.error(None, wire.GATEWAY_REFUSAL, message, {"reason_code": reason_code})
     headers = {"www-authenticate": "Bearer"} if status == HTTPStatus.UNAUTHORIZED else {}
+    if retry_after_s is not None:
+        headers["retry-after"] = str(retry_after_s)
     return MCPReply(status, body, headers)
 
 

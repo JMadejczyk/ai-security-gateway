@@ -45,31 +45,37 @@ from gateway.errors import InvalidRequestError, RejectionError, RequestTooLargeE
 from gateway.identity import TokenClaims, TokenVerifier
 from gateway.policy.evaluator import AccessDecision, PolicyEvaluator, PrincipalContext
 from gateway.policy.loader import PolicySnapshot
-from gateway.policy.permissions import PermissionSet
-from gateway.policy.schema import service_principal
+from gateway.policy.permissions import PermissionSet, Resource
+from gateway.policy.schema import Throttle, service_principal
 from gateway.redaction import apply_redactions
 from gateway.sessions import SessionBinding, SessionStore, SessionUpdate
 from gateway.telemetry import (
+    OTHER_LABEL,
     AuditEntry,
     AuditLatency,
     AuditLogger,
     AuditVerdict,
     bounded,
     payload_hmac,
+    record_alert,
     record_overhead,
     record_request,
     record_session,
+    record_throttled,
     record_tokens,
     record_verdicts,
 )
+from gateway.throttle import ThrottledError, Throttler
 from gateway.upstream import Upstream, UpstreamError, UpstreamResult
 
 logger = logging.getLogger(__name__)
+alert_logger = logging.getLogger("gateway.alerts")
 
 AUTHZ: Final = "authz"
 # Controls whose detections mean untrusted content reached the agent's context.
 TAINTING_CONTROLS: Final = frozenset({"prompt_injection"})
 APPROVAL_ID_CHARS: Final = 24
+REWRITE_UNAUTHORIZED: Final = "rewrite_unauthorized"
 
 
 class CallRequest(FrozenModel):
@@ -90,6 +96,7 @@ class PipelineOutcome(FrozenModel):
     message: str = ""
     session_id: str | None = None
     approval_id: str | None = None  # set when the call is held for approval
+    retry_after_s: int | None = None  # set when the call is throttled (HTTP 429)
     request: Any = Field(default=None, repr=False)  # final payload sent upstream
     result: Any = Field(default=None, repr=False)  # final result, set only when released
 
@@ -176,6 +183,17 @@ class _Step:
         return merge_verdicts([v for _, v in self.verdicts])
 
 
+@dataclass(frozen=True, slots=True)
+class _Admitted:
+    """Who is calling and through which route, fixed once the call is admitted."""
+
+    claims: TokenClaims
+    ctx: SessionContext
+    principal: PrincipalContext
+    route: ChannelRoute
+    now: datetime
+
+
 @dataclass(slots=True)
 class _Trace:
     """Everything one call accumulates for persistence and the audit entry."""
@@ -186,7 +204,11 @@ class _Trace:
     claims: TokenClaims | None = None
     context: SessionContext | None = None
     steps: list[_Step] = field(default_factory=list[_Step])
+    executed: list[Interaction] = field(default_factory=list[Interaction])  # what ran upstream
     upstream: UpstreamResult | None = None
+    # The upstream failed after untrusted content may have reached the gateway (an error text,
+    # a malformed or oversized body, a timeout after the request was sent): it taints.
+    untrusted_failure: bool = False
 
     def verdicts(self) -> list[Verdict]:
         return [v for step in self.steps for _, v in step.verdicts]
@@ -236,6 +258,25 @@ def _effective_scope(snapshot: PolicySnapshot, step: _Step) -> tuple[str, ...]:
     return tuple(PermissionSet.parse(grants).restricted_to(usable).as_strings())
 
 
+def _model_label(executed: Sequence[Interaction]) -> str:
+    """``acl_tokens_total``'s model: the model the call was authorized for and ran with.
+
+    Never the upstream's own ``model`` string, which the gateway does not control.
+    """
+    for interaction in executed:
+        resource = Resource.parse(interaction.resource)
+        if resource.namespace == "model":
+            return resource.identifier
+    return OTHER_LABEL
+
+
+def _throttles(steps: Sequence[_Step]) -> list[Throttle]:
+    caps: list[Throttle] = []
+    for step in steps:
+        caps.extend(cap for cap in step.access.restriction.throttles if cap not in caps)
+    return caps
+
+
 class Pipeline:
     """Runs one call through every step and returns what the agent gets."""
 
@@ -254,6 +295,7 @@ class Pipeline:
         self._recorder = recorder
         self._clock = clock
         self._evaluator = PolicyEvaluator()
+        self._throttler = Throttler()
 
     @property
     def evaluator(self) -> PolicyEvaluator:
@@ -283,6 +325,20 @@ class Pipeline:
         self._record(trace, outcome)
         return outcome
 
+    def record_refusal(
+        self, call: CallRequest, snapshot: PolicySnapshot, exc: RejectionError
+    ) -> PipelineOutcome:
+        """Audit and count a call an entry point refused before it reached `handle`
+        (e.g. a body over ``max_request_bytes``): with identity if the bearer verifies."""
+        trace = _Trace(call=call, snapshot=snapshot, started=time.perf_counter())
+        try:
+            trace.claims = self._gate.authenticate(call.token, snapshot)
+        except RejectionError:
+            trace.claims = None
+        outcome = self._refusal(trace, exc)
+        self._record(trace, outcome)
+        return outcome
+
     # ------------------------------------------------------------------------- steps
 
     async def _run(
@@ -292,6 +348,24 @@ class Pipeline:
         ctx: SessionContext,
         route: ChannelRoute | None,
     ) -> PipelineOutcome:
+        route, interactions = self._normalize(trace, ctx, route)
+        call = _Admitted(
+            claims=claims,
+            ctx=ctx,
+            principal=claims.principal_context(),
+            route=route,
+            now=self._clock(),
+        )
+        prepared = await self._prepare(trace, call, interactions)
+        if isinstance(prepared, PipelineOutcome):
+            return prepared
+        payload, merged = prepared
+        return await self._execute(trace, call, payload, merged)
+
+    def _normalize(
+        self, trace: _Trace, ctx: SessionContext, route: ChannelRoute | None
+    ) -> tuple[ChannelRoute, list[Interaction]]:
+        """Step 2: size cap, channel route, JSON body, adapter."""
         snapshot, call = trace.snapshot, trace.call
         limit = snapshot.policy.limits.max_request_bytes
         if len(call.body) > limit:
@@ -305,11 +379,18 @@ class Pipeline:
         interactions = route.adapter.normalize(raw, ctx)
         if not interactions:
             raise InvalidRequestError("empty_request", "the request names no operation")
+        return route, interactions
+
+    async def _prepare(
+        self, trace: _Trace, call: _Admitted, interactions: list[Interaction]
+    ) -> tuple[object, MergedVerdict] | PipelineOutcome:
+        """Steps 3-5 plus the rewrite check and throttling: the final payload, or a refusal."""
+        snapshot = trace.snapshot
         original = interactions[0].payload
 
         # Step 3: base authorization and session restrictions.
-        principal, now = claims.principal_context(), self._clock()
-        trace.steps = [self._authorize(snapshot, principal, ctx, i, now) for i in interactions]
+        trace.steps = [self._authorize(snapshot, call, i) for i in interactions]
+        self._raise_alerts(trace, call.ctx)
         if any(step.access.decision is Decision.BLOCK for step in trace.steps):
             return self._outcome(trace, merge_verdicts(trace.verdicts()))
 
@@ -325,14 +406,32 @@ class Pipeline:
         if merged.requires_approval:
             return self._hold_for_approval(trace, merged)
         payload = _final(original, [s.interaction.payload for s in trace.steps], merged)
+        trace.executed = [step.interaction for step in trace.steps]
+        if payload != original:  # what runs upstream is authorized too, not just what was asked
+            refused = self._authorize_rewrite(trace, call, payload)
+            if refused is not None:
+                return refused
 
-        # Step 6: execute once.
+        # Throttle obligations: every cap, before anything executes.
+        if caps := _throttles(trace.steps):
+            agent = call.claims.agent
+            try:
+                self._throttler.admit(agent, caps, snapshot.policy.throttle, call.now)
+            except ThrottledError:
+                record_throttled(self._recorder.agent_label(agent, snapshot))
+                raise
+        return payload, merged
+
+    async def _execute(
+        self, trace: _Trace, call: _Admitted, payload: object, merged: MergedVerdict
+    ) -> PipelineOutcome:
+        """Steps 6-7: run once upstream, then post controls on the complete result."""
+        snapshot = trace.snapshot
         try:
-            trace.upstream = await route.upstream.execute(payload, snapshot)
+            trace.upstream = await call.route.upstream.execute(payload, snapshot)
         except UpstreamError as exc:
+            trace.untrusted_failure = exc.untrusted
             return self._refusal(trace, exc, decision=merged.decision)
-
-        # Step 7: post controls on the complete result.
         post: list[Verdict] = []
         for step in trace.steps:
             with_result = step.interaction.model_copy(
@@ -351,21 +450,16 @@ class Pipeline:
         return self._outcome(trace, overall, request=payload, result=result)
 
     def _authorize(
-        self,
-        snapshot: PolicySnapshot,
-        principal: PrincipalContext,
-        ctx: SessionContext,
-        interaction: Interaction,
-        now: datetime,
+        self, snapshot: PolicySnapshot, call: _Admitted, interaction: Interaction
     ) -> _Step:
         access = self._evaluator.decide(
             snapshot,
-            principal,
-            ctx,
+            call.principal,
+            call.ctx,
             channel=interaction.channel,
             action=interaction.action,
             resource=interaction.resource,
-            now=now,
+            now=call.now,
         )
         denied = access.decision is Decision.BLOCK
         verdict = Verdict(
@@ -377,6 +471,74 @@ class Pipeline:
         step = _Step(interaction=interaction, access=access, original_payload=interaction.payload)
         step.add(Stage.PRE, [verdict])
         return step
+
+    def _authorize_rewrite(
+        self, trace: _Trace, call: _Admitted, payload: object
+    ) -> PipelineOutcome | None:
+        """Re-normalize the rewritten payload and authorize every interaction it yields.
+
+        A control may rewrite a call into one its caller could never make (another model,
+        another table); anything not plainly allowed blocks the call. None = proceed.
+        """
+        snapshot = trace.snapshot
+        original = trace.steps[0].original_payload
+        rewritten: list[Interaction] = []
+        if isinstance(payload, dict):
+            data = cast("dict[str, Any]", payload)
+            raw = RawCall(channel=trace.call.channel, data=data, server=trace.call.server)
+            try:
+                rewritten = call.route.adapter.normalize(raw, call.ctx)
+            except RejectionError:
+                rewritten = []
+        refusals = [
+            step
+            for step in (self._authorize(snapshot, call, i) for i in rewritten)
+            if step.access.decision is not Decision.ALLOW
+        ]
+        if rewritten and not refusals:
+            trace.executed = rewritten
+            return None
+        refused = Verdict(
+            decision=Decision.BLOCK,
+            control_id=AUTHZ,
+            reason_code=REWRITE_UNAUTHORIZED,
+            risk_delta=snapshot.policy.control_risk_delta(AUTHZ),
+        )
+        if not refusals:  # the rewrite is not even a valid call: refuse it on the first step
+            trace.steps[0].add(Stage.PRE, [refused])
+        for step in refusals:  # audited under the resource the rewrite would have reached
+            step.original_payload = original
+            step.verdicts = [(Stage.PRE, refused)]
+            trace.steps.append(step)
+        return self._outcome(
+            trace, merge_verdicts(trace.verdicts()), reason_code=REWRITE_UNAUTHORIZED
+        )
+
+    def _raise_alerts(self, trace: _Trace, ctx: SessionContext) -> None:
+        """One structured alert line and counter per risk rule with ``alert: true`` that holds."""
+        rules = trace.snapshot.policy.risk_rules.for_mode(ctx.mode)
+        raised: dict[str, float] = {}
+        for step in trace.steps:
+            restriction = step.access.restriction
+            for index in restriction.matched_rules:
+                if rules[index].then.alert:
+                    raised.setdefault(f"{ctx.mode.value}.{index}", restriction.risk)
+        for rule, risk in raised.items():
+            record_alert(rule)
+            alert_logger.warning(
+                json.dumps(
+                    {
+                        "event": "risk_rule_alert",
+                        "rule": rule,
+                        "session_id": ctx.session_id,
+                        "principal": ctx.principal,
+                        "agent": ctx.actor,
+                        "risk": round(risk, 4),
+                        "policy_revision": trace.snapshot.revision,
+                    },
+                    sort_keys=True,
+                )
+            )
 
     async def _run_controls(
         self, snapshot: PolicySnapshot, interaction: Interaction, stage: Stage
@@ -393,8 +555,14 @@ class Pipeline:
             started = time.perf_counter()
             try:
                 verdict = await control.evaluate(current, stage, cfg)
-            except Exception:  # a broken control fails closed
-                logger.exception("control %s failed", control.id)
+            except Exception as exc:  # a broken control fails closed
+                # Type name only: exception messages and tracebacks may quote the payload.
+                logger.error(  # noqa: TRY400 -- deliberately no traceback
+                    "control_error control=%s error=%s session=%s",
+                    control.id,
+                    type(exc).__name__,
+                    interaction.session_id,
+                )
                 verdict = Verdict(
                     decision=Decision.BLOCK, control_id=control.id, reason_code="control_error"
                 )
@@ -449,8 +617,11 @@ class Pipeline:
             if timer is not None and timer.key and step.merged().decision is Decision.BLOCK:
                 cooldowns.append(Cooldown(key=timer.key, until=timer.until))
         # A result from an untrusted source taints even when post controls blocked or replaced
-        # it: the content reached the gateway on the agent's behalf.
-        untrusted_result = trace.upstream is not None and trace.upstream.untrusted
+        # it, and so does a failure after the request reached it: the content reached the
+        # gateway on the agent's behalf.
+        untrusted_result = trace.untrusted_failure or (
+            trace.upstream is not None and trace.upstream.untrusted
+        )
         update = SessionUpdate(
             risk_delta=sum(v.risk_delta for v in verdicts),
             taint=untrusted_result
@@ -511,6 +682,7 @@ class Pipeline:
             reason_code=exc.reason_code,
             message=exc.message,
             session_id=trace.claims.session_id if trace.claims else None,
+            retry_after_s=exc.retry_after_s if isinstance(exc, ThrottledError) else None,
         )
 
     def _record(self, trace: _Trace, outcome: PipelineOutcome) -> None:
@@ -526,7 +698,7 @@ class Pipeline:
         record_verdicts(trace.verdicts())
         if trace.upstream is not None and trace.upstream.usage is not None:
             usage = trace.upstream.usage
-            record_tokens(user, agent, usage.model, usage.total_tokens)
+            record_tokens(user, agent, _model_label(trace.executed), usage.total_tokens)
 
         latency = AuditLatency(
             total=total * 1000,

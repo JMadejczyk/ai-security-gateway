@@ -63,12 +63,14 @@ class GatewayContainer:
         policy_store = PolicyStore.from_path(settings.policy_path)
         identities = DemoIdentities.load(settings.identities_path) if settings.demo_tokens else None
         verifier = TokenVerifier(settings.jwt_key, clock=clock)
+        sessions = InMemorySessionStore(clock=clock)
         issuer = (
-            DemoTokenIssuer(identities, settings.jwt_key, verifier, clock=clock)
+            DemoTokenIssuer(
+                identities, settings.jwt_key, verifier, sessions.is_retired, clock=clock
+            )
             if identities is not None
             else None
         )
-        sessions = InMemorySessionStore(clock=clock)
         gate = SessionGate(verifier, sessions)
         llm = LLMProxy(env=env, transport=transport)
         audit = AuditLogger(stream=audit_stream, path=settings.audit_path)

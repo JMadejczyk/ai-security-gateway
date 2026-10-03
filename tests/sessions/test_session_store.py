@@ -187,3 +187,44 @@ async def test_lock_does_not_serialize_different_sessions(store):
     release_a.set()
     await task
     assert events == ["b ran while a held its lock"]
+
+
+async def test_retired_ids_stay_retired_past_every_lifetime(store, clock):
+    await open_anna(store)
+    await bump(store, 0.5, taint=True)
+    await store.end("s-1")
+    clock.advance(LIMITS.max_lifetime_s + 3600 + 1)  # past the session and token lifetimes
+    await open_anna(store, "s-other")  # any activity that would prune old tombstones
+    assert await store.is_retired("s-1")
+    with pytest.raises(SessionError, match="session_ended"):
+        await open_anna(store)
+
+
+async def test_expired_ids_are_retired_too(store, clock):
+    limits = Sessions(idle_ttl_s=60, max_lifetime_s=120)
+    await open_anna(store, limits=limits)
+    assert not await store.is_retired("s-1")
+    clock.advance(10_000)
+    assert await store.is_retired("s-1")
+    with pytest.raises(SessionError, match="session_ended"):
+        await open_anna(store, limits=limits)
+
+
+async def test_a_session_in_use_is_not_retired_under_its_call(store, clock):
+    limits = Sessions(idle_ttl_s=60, max_lifetime_s=86400)
+    await open_anna(store, limits=limits)
+    async with store.lock("s-1"):  # a call of s-1 is in flight
+        clock.advance(61)
+        await open_anna(store, "s-2", limits=limits)  # another session's call retires stale ones
+        state = await bump(store, 0.3, taint=True)  # the in-flight call persists its state
+    assert state.taint
+    reopened = await open_anna(store, limits=limits)
+    assert (reopened.taint, reopened.risk) == (True, pytest.approx(0.3))
+
+
+async def test_an_idle_session_nobody_uses_is_still_retired(store, clock):
+    limits = Sessions(idle_ttl_s=60, max_lifetime_s=86400)
+    await open_anna(store, limits=limits)
+    clock.advance(61)
+    await open_anna(store, "s-2", limits=limits)
+    assert await store.get("s-1") is None

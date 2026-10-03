@@ -121,6 +121,11 @@ class SessionStore(ABC):
         """End the session for good; later tokens naming it are refused."""
 
     @abstractmethod
+    async def is_retired(self, session_id: str) -> bool:
+        """True once the session ended or expired. A retired id is never live again: its
+        taint and risk must not come back clean under a fresh session."""
+
+    @abstractmethod
     async def tainted_count(self) -> int:
         """Number of live tainted sessions (the ``acl_tainted_sessions`` gauge)."""
 
@@ -132,12 +137,19 @@ class _LockEntry:
 
 
 class InMemorySessionStore(SessionStore):
-    """Single-process store. Expired sessions are retired lazily, when next touched."""
+    """Single-process store. Expired sessions are retired lazily, when next touched, and
+    never while a call holds or waits for their lock: that call persists its state first.
+
+    Tombstones of ended and expired sessions are kept for the life of the process (a short
+    string each), so an id can never be revived with clean state, however late a token naming
+    it arrives. A shared store must keep them at least ``max(sessions.max_lifetime_s, maximum
+    token lifetime)`` and the demo issuer must keep refusing retired ids.
+    """
 
     def __init__(self, *, clock: Clock = utc_now) -> None:
         self._clock = clock
         self._sessions: dict[str, SessionContext] = {}
-        self._ended: dict[str, datetime] = {}  # tombstones: session_id -> ended at
+        self._ended: dict[str, datetime] = {}  # tombstones: session_id -> retired at
         self._locks: dict[str, _LockEntry] = {}
         self._limits = Sessions()
 
@@ -161,7 +173,11 @@ class InMemorySessionStore(SessionStore):
     ) -> SessionContext:
         now = self._clock()
         self._limits = limits
-        self._retire_expired(now)
+        self._retire_expired(now)  # other sessions; those in use are skipped
+        current = self._sessions.get(session_id)
+        if current is not None and self._expired(current, now):
+            # The caller holds this session's lock to admit a new call: nothing is in flight.
+            self._retire(session_id, now)
         if session_id in self._ended:
             raise SessionError(SessionReason.ENDED)
         ctx = self._sessions.get(session_id)
@@ -197,8 +213,11 @@ class InMemorySessionStore(SessionStore):
         return updated
 
     async def end(self, session_id: str) -> None:
-        self._sessions.pop(session_id, None)
-        self._ended[session_id] = self._clock()
+        self._retire(session_id, self._clock())
+
+    async def is_retired(self, session_id: str) -> bool:
+        self._retire_expired(self._clock())
+        return session_id in self._ended
 
     async def tainted_count(self) -> int:
         self._retire_expired(self._clock())
@@ -209,13 +228,11 @@ class InMemorySessionStore(SessionStore):
         too_old = now - ctx.created_at >= timedelta(seconds=self._limits.max_lifetime_s)
         return idle or too_old
 
+    def _retire(self, session_id: str, now: datetime) -> None:
+        self._sessions.pop(session_id, None)
+        self._ended.setdefault(session_id, now)
+
     def _retire_expired(self, now: datetime) -> None:
         for session_id, ctx in list(self._sessions.items()):
-            if self._expired(ctx, now):
-                del self._sessions[session_id]
-                self._ended[session_id] = now
-        # A tombstone outliving every possible session lifetime protects nothing more.
-        horizon = now - timedelta(seconds=self._limits.max_lifetime_s)
-        for session_id, ended_at in list(self._ended.items()):
-            if ended_at < horizon:
-                del self._ended[session_id]
+            if session_id not in self._locks and self._expired(ctx, now):
+                self._retire(session_id, now)

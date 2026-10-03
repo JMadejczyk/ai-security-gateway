@@ -1,13 +1,18 @@
 """The upstream side of the pipeline: one `Upstream` per channel executes an approved call."""
 
+import logging
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from typing import Any
 
+import httpx
 from pydantic import Field
 
 from gateway.core.envelope import FrozenModel
 from gateway.errors import RejectionError
 from gateway.policy.loader import PolicySnapshot
+
+logger = logging.getLogger(__name__)
 
 
 class TokenUsage(FrozenModel):
@@ -32,6 +37,9 @@ class UpstreamError(RejectionError):
     """The upstream failed. The agent gets a generic message: upstream text never leaks."""
 
     status_code = 502
+    # True when content from an untrusted source may have reached the gateway before the
+    # failure (an error message, a malformed or oversized body): it taints like a result.
+    untrusted: bool = False
 
     def __init__(self, reason_code: str) -> None:
         super().__init__(reason_code, "the upstream service failed to answer")
@@ -42,3 +50,21 @@ class Upstream(ABC):
 
     @abstractmethod
     async def execute(self, payload: object, snapshot: PolicySnapshot) -> UpstreamResult: ...
+
+
+def refuse_encoded(response: httpx.Response) -> None:
+    """Refuse a content-coded body: inflating it would bypass ``max_response_bytes`` (a few
+    KiB of gzip can expand to gigabytes). Upstream requests ask for ``identity``."""
+    encoding = response.headers.get("content-encoding", "").strip().lower()
+    if encoding not in {"", "identity"}:
+        logger.warning("upstream answered with content-encoding %r", encoding[:32])
+        raise UpstreamError("upstream_encoding_refused")
+
+
+async def wire_chunks(response: httpx.Response) -> AsyncIterator[bytes]:
+    """The body as received, never decompressed, for counting against a byte cap."""
+    if response.is_stream_consumed:  # already buffered by the transport (e.g. in tests)
+        yield response.content
+        return
+    async for chunk in response.aiter_raw():
+        yield chunk

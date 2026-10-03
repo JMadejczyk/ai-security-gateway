@@ -37,10 +37,12 @@ The LLM proxy sees intent (a `tool_call` in the model's response); the MCP proxy
 - `edge` network (`internal: true`): the agent and the gateway's agent listener (`:8080`, serving `/v1` and `/mcp`). The gateway is the only service the agent can resolve or reach, and the agent has no internet access.
 - `ops` network: the gateway's operator listener (`:9090`, serving `/auth/demo-token`, `/admin/*`, `/metrics`), Prometheus, Loki, Grafana Alloy and Grafana. Only this listener and Grafana are published, on `127.0.0.1`.
 - `llm_backend` network (`internal: true`): the gateway and Ollama (and LiteLLM if used).
-- `mcp_backend` network (`internal: true`): the gateway and the internal MCP servers (`mcp-postgres`) plus Postgres.
+- `mcp_backend` network (`internal: true`): the gateway and the internal MCP servers (`mcp-postgres`, `mcp-files`) plus Postgres.
 - `mcp_untrusted` network (`internal: true`): the gateway and `mcp-fetch`. A compromised fetch server cannot reach Postgres or Ollama.
-- `state` network (`internal: true`): the gateway and Redis (`redis:7.2`, BSD-3). Budgets, loop-detection counters and (later) session state live here.
+- `state` network (`internal: true`): the gateway and Redis (`redis:7.2`, BSD-3). Session state, budgets, loop-detection counters, approvals and the kill switch live here.
 - `fetch_egress` network: `mcp-fetch` only, the one runtime network with outbound internet. (Kept separate from `mcp_untrusted` because Docker routes a container's published ports via its default-route network; a non-internal network shared with the gateway would capture the gateway's host port mapping.)
+- `bootstrap` network (external): only the one-shot `ollama-init` and `models-init` jobs, which pull models into volumes before lock-down.
+- `demo_web` network (`internal: true`, demo overlay `demo/compose.demo.yml` only): `mcp-fetch` and a static `demo-web` page for demo scene 2. The overlay sets two exact-name exemptions from the private-address rule, `ACL_EGRESS_DEMO_HOSTS` (gateway, audited as `egress_demo_host`) and `ACL_FETCH_DEMO_HOSTS` (mcp-fetch); both are empty by default, and tests pin that.
 - No upstream publishes a port to the host. No container gets the Docker socket, `privileged` or host networking.
 
 The router key (e.g. the LiteLLM master key) is known only to the gateway; gateway bearer tokens are never forwarded upstream. Ollama models are pulled before the network is locked down (an init step on a separate, temporary network). In production this maps to network policies or mTLS between the gateway and upstreams. The threat boundary excludes a hostile host or Docker administrator. The bypass tests run **from inside the agent container** against Ollama, MCP servers and Postgres. An employee connecting straight to a public provider API is a matter of company egress policy, outside this project's scope.
@@ -120,7 +122,7 @@ The core knows nothing about SQL or any specific provider. Every interaction is 
 5. Merge verdicts → allow / redact / block / require\_approval, plus obligations.
 6. Execute on the upstream (model, MCP server) **once** for the original request, only if every interaction passed.
 7. `post` controls on the complete (buffered) result: redact, set taint, check the model that actually answered.
-8. Audit and metrics; persist session state (risk deltas from every verdict, including blocked calls) before releasing the result.
+8. Persist session state (risk deltas from every verdict, including blocked calls), then audit and metrics, all before releasing the result.
 
 Every decision reads one immutable policy snapshot taken at step 1, so a reload mid-call never mixes two policy versions.
 
@@ -410,7 +412,7 @@ Output: JUnit XML + HTML report (`pytest-html`) summarizing positive and negativ
 2. DataBot writes a report (allowed: `write:fs:reports/*`). It then reads a page with hidden injection through the `web` tool. The session is tainted, the same report write is now blocked, and the risk score rises in Grafana.
 3. The same injection hits the autonomous `nightly_etl`. The write is not blocked; it waits in the approval queue, and the process slows down instead of stopping. An operator approves it and the exact call goes through once.
 4. The agent generates a heavy query. `sql_guard` rejects it after `EXPLAIN`.
-5. A prompt with a PESEL number is answered with the PESEL redacted. A second prompt with an API key is blocked.
+5. A prompt with a PESEL number is answered with the PESEL redacted. A second prompt with an API key is blocked. (On CPU the output_policy judge can time out and hold the answer back; the redaction still shows in the audit.)
 6. From inside the agent container, a direct call to Ollama does not connect.
 7. A judge raises `max_cost` in `policy.yaml` or adds a signature to the feed. The same request gets a different verdict, and the audit entry shows the new policy revision or feed version; a policy change also shows as a Grafana annotation.
 
@@ -439,12 +441,12 @@ ai-control-layer/
     core/              # Interaction, Verdict, Span, SessionContext, Adapter, Control, verdict merging
     pipeline.py        # step order
     identity.py        # JWT verification, delegation checks, demo token issuer
-    sessions.py        # session store (in-memory now, Redis later), binding, per-session lock
+    sessions.py        # session store ABC + in-memory store; redis_sessions.py: Redis store, distributed lock
     policy/            # schema, permission grammar, loader, hot reload, evaluator
     proxies/           # llm.py, mcp.py
     adapters/          # generic_mcp, sql, http, fs, llm
     controls/          # one class = one file
-    approvals.py       # approval queue, throttling, kill switch
+    approvals/         # approval queue, kill switch, operator API (throttle.py: throttling)
     telemetry.py       # metrics, audit
   config/            # mounted read-only as a directory so hot reload sees editor saves
     policy.yaml
@@ -452,7 +454,7 @@ ai-control-layer/
   demo/                # agent, identities, database seed, MCP servers
   grafana/             # dashboards/, provisioning/
   tests/
-  docker-compose.yml   # edge / llm_backend / mcp_backend / mcp_untrusted networks
+  docker-compose.yml   # edge / ops / llm_backend / mcp_backend / mcp_untrusted / fetch_egress / state / bootstrap networks
   pyproject.toml       # uv, ruff, pyright, pytest config
   Makefile             # up, test, lint, demo, report
 ```
@@ -524,3 +526,4 @@ The honest pitch line: we do not claim to have invented taint or on-behalf-of, a
 - After the stage 10–14 review: operator tokens on their own audience; `sid_iat` and issuer-minted session ids; approval binding covers resources and the final operation digest, kill voids approvals by generation; tool quarantine until re-approval; prose-only, HTML-aware classification; strict judge response models; a session whose outcome could not be persisted stays fenced and resolves as tainted.
 - Stage 14–18 decisions: Loki ingestion via Alloy tailing the audit JSONL volume (no Docker socket); observability services on `ops` only, Grafana on 127.0.0.1:3300; `control(<id>, outcome)` test markers drive the per-control report and coverage check.
 - After the first real-model run: judges send `reasoning_effort: none`; Ollama keeps two cache slots; per-session GPU budget 900 s for CPU inference; classifier hits on agent-authored prompts are judge-confirmed and taint on timeout instead of blocking outright.
+- Stage 18–22: the demo overlay's exact-name egress/fetch exemptions (off by default, audited); spec layout and network list synced with the code.

@@ -2,12 +2,19 @@
 autonomous one (approval, throttle), and nothing here ever widens base authorization."""
 
 from datetime import timedelta
+from typing import Any
 
 import pytest
 
 from gateway.core.envelope import Cooldown
 from gateway.core.types import Action, Channel, Decision, SessionMode
-from gateway.policy.evaluator import AuthzReason, PrincipalContext, RestrictionReason
+from gateway.policy.evaluator import (
+    AccessDecision,
+    PolicyEvaluator,
+    PrincipalContext,
+    RestrictionReason,
+    SessionRestriction,
+)
 from gateway.policy.schema import Throttle
 
 INT, AU = SessionMode.INTERACTIVE, SessionMode.AUTONOMOUS
@@ -190,13 +197,13 @@ def test_autonomous_elevated_risk_throttles_and_alerts(restrict, autonomous):
     result = restrict(autonomous(risk=0.6), Action.READ, "db:sales.orders")
     assert not result.denied
     assert not result.requires_approval
-    assert result.throttle == Throttle(max_actions=1, per_s=10)
+    assert result.throttles == (Throttle(max_actions=1, per_s=10),)
     assert result.alert
 
 
 def test_autonomous_at_threshold_is_not_throttled(restrict, autonomous):
     result = restrict(autonomous(risk=0.5), Action.READ, "db:sales.orders")
-    assert result.throttle is None
+    assert result.throttles == ()
     assert not result.alert
 
 
@@ -218,7 +225,7 @@ def test_autonomous_high_risk_queues_everything_but_read_and_generate(
     assert result.requires_approval is needs_approval
     assert not result.denied  # autonomous agents never lose rights, they wait
     assert result.alert
-    assert result.throttle is not None
+    assert result.throttles == (Throttle(max_actions=1, per_s=10),)
 
 
 # --------------------------------------------------------------- restrictions only narrow
@@ -284,25 +291,112 @@ def test_restrictions_never_turn_a_base_denied_call_into_allowed(
     assert decision.reason_code == decision.authorization.reason_code  # never an approval
 
 
-@pytest.mark.parametrize("state", SESSIONS)
-def test_restrictions_only_remove_or_condition_allowed_calls(
-    evaluator, snapshot, make_ctx, now, state
+# Explicit expectations for base-allowed calls: (decision, reason, throttles, alert) per
+# session state. Columns: clean, risk 0.6, risk 0.95, taint, taint + risk 0.95.
+STATES: list[dict[str, Any]] = [
+    {"risk": 0.0},
+    {"risk": 0.6},
+    {"risk": 0.95},
+    {"taint": True},
+    {"taint": True, "risk": 0.95},
+]
+STATE_IDS = ["clean", "risk0.6", "risk0.95", "taint", "taint+risk0.95"]
+THR = (Throttle(max_actions=1, per_s=10),)
+OK = (Decision.ALLOW, "allowed", (), False)
+ASK = (Decision.REQUIRE_APPROVAL, "session_requires_approval", (), False)
+FROZEN = (Decision.BLOCK, "tools_frozen", (), False)
+REMOVED = (Decision.BLOCK, "action_removed_by_session_risk", (), False)
+OK_THR = (Decision.ALLOW, "allowed", THR, True)
+ASK_THR = (Decision.REQUIRE_APPROVAL, "session_requires_approval", THR, True)
+
+type Expected = tuple[Decision, str, tuple[Throttle, ...], bool]
+CALLS: list[tuple[PrincipalContext, SessionMode, Channel, Action, str, list[Expected]]] = [
+    (ANNA, INT, MCP, Action.WRITE, REPORT, [OK, ASK, FROZEN, REMOVED, FROZEN]),
+    (ANNA, INT, MCP, Action.READ, "db:sales.orders", [OK, OK, FROZEN, OK, FROZEN]),
+    (ANNA, INT, LLM, Action.GENERATE, "model:qwen3:8b", [OK, OK, OK, OK, OK]),
+    (ETL, AU, MCP, Action.WRITE, "fs:reports/nightly.md", [OK, OK_THR, ASK_THR, ASK, ASK_THR]),
+    (ETL, AU, MCP, Action.READ, "db:sales.orders", [OK, OK_THR, OK_THR, OK, OK_THR]),
+    (ETL, AU, LLM, Action.GENERATE, "model:qwen3:8b", [OK, OK_THR, OK_THR, OK, OK_THR]),
+]
+ROWS = [
+    pytest.param(
+        principal,
+        mode,
+        channel,
+        action,
+        resource,
+        state,
+        expected,
+        id=f"{mode}-{action}-{state_id}",
+    )
+    for principal, mode, channel, action, resource, column in CALLS
+    for state, state_id, expected in zip(STATES, STATE_IDS, column, strict=True)
+]
+
+
+def observed(evaluator, snapshot, make_ctx, now, row) -> Expected:
+    principal, mode, channel, action, resource, state, _ = row
+    ctx = make_ctx(mode, principal=principal.principal, actor=principal.agent, **state)
+    decision = evaluator.decide(
+        snapshot, principal, ctx, channel=channel, action=action, resource=resource, now=now
+    )
+    restriction = decision.restriction
+    return (decision.decision, decision.reason_code, restriction.throttles, restriction.alert)
+
+
+@pytest.mark.parametrize(
+    ("principal", "mode", "channel", "action", "resource", "state", "expected"), ROWS
+)
+def test_restrictions_on_allowed_calls_match_the_reaction_table(
+    evaluator, snapshot, make_ctx, now, principal, mode, channel, action, resource, state, expected
 ):
-    for principal, mode, action, resource in [
-        (ANNA, INT, Action.WRITE, REPORT),
-        (ANNA, INT, Action.READ, "db:sales.orders"),
-        (ETL, AU, Action.WRITE, "fs:reports/nightly.md"),
-    ]:
-        ctx = make_ctx(mode, principal=principal.principal, actor=principal.agent, **state)
-        decision = evaluator.decide(
-            snapshot, principal, ctx, channel=MCP, action=action, resource=resource, now=now
+    assert evaluator.authorize(snapshot, principal, action, resource).allowed
+    row = (principal, mode, channel, action, resource, state, expected)
+    assert observed(evaluator, snapshot, make_ctx, now, row) == expected
+
+
+class _AlwaysAllow(PolicyEvaluator):
+    """Stub that ignores session state; the table above must catch it."""
+
+    def decide(self, snapshot, principal, ctx, *, channel, action, resource, now):
+        return AccessDecision(
+            decision=Decision.ALLOW,
+            reason_code="allowed",
+            authorization=self.authorize(snapshot, principal, action, resource),
+            restriction=SessionRestriction(risk=0.0),
         )
-        assert decision.authorization.reason_code is AuthzReason.ALLOWED
-        assert decision.decision in {Decision.ALLOW, Decision.BLOCK, Decision.REQUIRE_APPROVAL}
-        if state == {"risk": 0.0}:
-            assert decision.decision is Decision.ALLOW
-        if mode is AU:
-            assert decision.decision is not Decision.BLOCK  # autonomous: conditioned, not denied
+
+
+def test_reaction_table_rejects_an_always_allow_evaluator(snapshot, make_ctx, now):
+    stub = _AlwaysAllow()
+    wrong = [
+        row.id
+        for row in ROWS
+        if observed(stub, snapshot, make_ctx, now, row.values) != row.values[-1]
+    ]
+    # Every row whose expectation is anything but a plain allow must be caught.
+    assert len(wrong) == sum(1 for row in ROWS if row.values[-1] != OK)
+    assert len(wrong) >= 15
+
+
+def test_all_matching_throttles_are_returned(evaluator, policy_doc, snapshot_from, make_ctx, now):
+    policy_doc["risk_rules"]["autonomous"] = [
+        {"when": {"risk_gt": 0.5}, "then": {"throttle": {"max_actions": 1, "per_s": 1}}},
+        {"when": {"risk_gt": 0.5}, "then": {"throttle": {"max_actions": 10, "per_s": 60}}},
+        {"when": {"risk_gt": 0.5}, "then": {"throttle": {"max_actions": 1, "per_s": 1}}},
+    ]
+    result = evaluator.session_restrictions(
+        snapshot_from(policy_doc),
+        make_ctx(AU, principal="svc:nightly_etl", actor="nightly_etl", risk=0.6),
+        channel=MCP,
+        action=Action.READ,
+        resource="db:sales.orders",
+        now=now,
+    )
+    assert result.throttles == (
+        Throttle(max_actions=1, per_s=1),
+        Throttle(max_actions=10, per_s=60),
+    )
 
 
 def test_base_deny_still_reports_the_cooldown_it_triggers(evaluator, snapshot, interactive, now):

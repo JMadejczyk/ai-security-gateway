@@ -214,3 +214,72 @@ async def test_watcher_ignores_invalid_edit_and_sibling_files(store, policy_path
 
     assert reloads(ReloadResult.INVALID) > invalid_before
     assert store.current is before
+
+
+BAD_EDITS = {
+    "use-cases-null": ("  use_cases: []", "  use_cases: null"),
+    "infinite-freeze": (
+        "then: { freeze_tools: true, duration_s: 300 }",
+        "then: { freeze_tools: true, duration_s: .inf }",
+    ),
+    "deep-nesting": ("profile: strict", "profile: " + "[" * 1000 + "]" * 1000),
+}
+
+
+@pytest.mark.parametrize("breakage", list(BAD_EDITS.values()), ids=list(BAD_EDITS))
+def test_malformed_edit_is_invalid_then_valid_edit_recovers(store, policy_path, breakage):
+    before = store.current
+    original = policy_path.read_text()
+    edit(policy_path, *breakage)
+    outcome = store.reload()
+    assert outcome.result is ReloadResult.INVALID
+    assert store.current is before
+
+    policy_path.write_text(original.replace(*GRANT_PAYMENTS))
+    assert store.reload().result is ReloadResult.OK
+    assert bartek_may_read_payments(store.current)
+
+
+def test_unexpected_loader_exception_is_an_invalid_reload(store, monkeypatch):
+    before = store.current
+
+    def broken_load(_path: Path) -> PolicySnapshot:
+        raise RuntimeError("loader bug")
+
+    monkeypatch.setattr(store._loader, "load", broken_load)
+    outcome = store.reload()
+    assert outcome.result is ReloadResult.INVALID
+    assert outcome.error == "unexpected RuntimeError while loading the policy"
+    assert store.current is before
+
+
+async def wait_for(predicate) -> None:
+    """Poll for up to 10 s; reload counters have no event to await."""
+    for _ in range(200):
+        if predicate():
+            return
+        await asyncio.sleep(0.05)
+    pytest.fail("condition not reached within 10 s")
+
+
+async def test_watcher_survives_malformed_edits_and_recovers(store, policy_path):
+    before = store.current
+    original = policy_path.read_text()
+    invalid_before = reloads(ReloadResult.INVALID)
+    watcher = asyncio.create_task(store.watch(debounce_ms=50))
+    try:
+        await asyncio.sleep(0.3)
+        for count, breakage in enumerate(BAD_EDITS.values(), start=1):
+            policy_path.write_text(original.replace(*breakage, 1))
+            await wait_for(lambda n=count: reloads(ReloadResult.INVALID) >= invalid_before + n)
+            assert store.current is before
+            assert not watcher.done()
+
+        policy_path.write_text(original.replace(*GRANT_PAYMENTS))
+        await wait_for(lambda: store.current is not before)
+    finally:
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
+
+    assert bartek_may_read_payments(store.current)

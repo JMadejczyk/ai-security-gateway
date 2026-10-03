@@ -275,3 +275,25 @@ def test_policy_without_agents_or_roles_denies_everything(evaluator, policy_doc,
     snapshot = snapshot_from(policy_doc)
     for principal in (ANNA, ROOT, ETL):
         assert not evaluator.authorize(snapshot, principal, R, "db:sales.orders").allowed
+
+
+@pytest.mark.parametrize(
+    ("agent", "principals", "principal", "allowed"),
+    [
+        ("nightly_etl", None, ETL, True),  # absent: the default rule (svc:<agent>)
+        ("nightly_etl", ["svc:nightly_etl"], ETL, True),
+        ("nightly_etl", [], ETL, False),  # empty: nobody, not "default"
+        ("databot", None, ANNA, True),
+        ("databot", [], ANNA, False),
+        ("databot", ["bartek@demo"], ANNA, False),
+    ],
+)
+def test_explicit_principals_list_applies_to_both_agent_types(
+    evaluator, policy_doc, snapshot_from, agent, principals, principal, allowed
+):
+    if principals is not None:
+        policy_doc["agents"][agent]["principals"] = principals
+    result = evaluator.authorize(snapshot_from(policy_doc), principal, R, "db:sales.orders")
+    assert result.allowed is allowed
+    if not allowed:
+        assert result.reason_code is AuthzReason.PRINCIPAL_NOT_ALLOWED

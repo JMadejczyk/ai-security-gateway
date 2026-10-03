@@ -87,7 +87,7 @@ class SessionRestriction(FrozenModel):
     denied: bool = False
     reason_code: RestrictionReason | None = None
     requires_approval: bool = False
-    throttle: Throttle | None = None
+    throttles: tuple[Throttle, ...] = ()  # every matching cap; the enforcer applies all
     alert: bool = False
     risk: float  # decayed risk the rules were evaluated against
     matched_rules: tuple[int, ...] = ()  # indexes into risk_rules[mode]
@@ -200,7 +200,7 @@ class PolicyEvaluator:
             denied=reason is not None,
             reason_code=reason,
             requires_approval=any(action in rule.then.actions for _, rule in matched),
-            throttle=_strictest_throttle(matched),
+            throttles=_throttles(matched),
             alert=any(rule.then.alert for _, rule in matched),
             risk=risk,
             matched_rules=tuple(index for index, _ in matched),
@@ -243,9 +243,11 @@ class PolicyEvaluator:
 def _principal_refused(principal: PrincipalContext, agent: Agent) -> bool:
     """Delegation check: may this principal be represented by this agent at all?"""
     if agent.type is SessionMode.AUTONOMOUS:
-        return principal.principal != service_principal(principal.agent)
-    if principal.principal.startswith(SERVICE_PRINCIPAL_PREFIX):
+        if principal.principal != service_principal(principal.agent):
+            return True
+    elif principal.principal.startswith(SERVICE_PRINCIPAL_PREFIX):
         return True
+    # An explicit list always applies, for both types; `principals: []` means nobody.
     return agent.principals is not None and principal.principal not in agent.principals
 
 
@@ -294,6 +296,14 @@ def _cooldown_to_start(
     return TimerStart(until=now + timedelta(seconds=max(durations)), key=key)
 
 
-def _strictest_throttle(matched: list[tuple[int, RiskRule]]) -> Throttle | None:
-    throttles = [rule.then.throttle for _, rule in matched if rule.then.throttle is not None]
-    return min(throttles, key=lambda t: (t.rate, t.max_actions), default=None)
+def _throttles(matched: list[tuple[int, RiskRule]]) -> tuple[Throttle, ...]:
+    """All throttle caps of the matched rules, deduplicated, in rule order.
+
+    Caps over different windows (1 per 1 s and 10 per 60 s) are not comparable, so none is
+    dropped: a call must satisfy every one of them.
+    """
+    caps: list[Throttle] = []
+    for _, rule in matched:
+        if rule.then.throttle is not None and rule.then.throttle not in caps:
+            caps.append(rule.then.throttle)
+    return tuple(caps)

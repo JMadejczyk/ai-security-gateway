@@ -15,10 +15,10 @@ never intersected symbolically.
 import re
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from typing import ClassVar, Literal, Self, cast
+from typing import ClassVar, Literal, NoReturn, Self, cast
 
 from pydantic import GetCoreSchemaHandler
-from pydantic_core import core_schema
+from pydantic_core import PydanticCustomError, core_schema
 
 from gateway.core.types import Action
 
@@ -169,9 +169,21 @@ class PermissionSet:
     """
 
     __slots__ = ("_permissions",)
+    _permissions: tuple[Permission, ...]
 
     def __init__(self, permissions: Iterable[Permission] = ()) -> None:
-        self._permissions: tuple[Permission, ...] = tuple(permissions)
+        object.__setattr__(self, "_permissions", tuple(permissions))
+
+    def __setattr__(self, name: str, value: object) -> NoReturn:
+        msg = "PermissionSet is immutable"
+        raise AttributeError(msg)
+
+    def __delattr__(self, name: str) -> NoReturn:
+        msg = "PermissionSet is immutable"
+        raise AttributeError(msg)
+
+    def __reduce__(self) -> tuple[type["PermissionSet"], tuple[tuple[Permission, ...]]]:
+        return (PermissionSet, (self._permissions,))
 
     @classmethod
     def parse(cls, values: Iterable[str]) -> Self:
@@ -213,16 +225,26 @@ class PermissionSet:
 
     @classmethod
     def coerce(cls, value: object) -> "PermissionSet":
-        """Accept a PermissionSet or a list of permission strings (the YAML shape)."""
+        """Accept a PermissionSet or a list of permission strings (the YAML shape).
+
+        Bad shapes raise `PydanticCustomError` (never a bare TypeError), so they surface as
+        ordinary validation errors instead of escaping the loader.
+        """
         if isinstance(value, PermissionSet):
             return value
         if not isinstance(value, list | tuple):
-            msg = f"expected a list of permission strings, got {type(value).__name__}"
-            raise TypeError(msg)
+            raise PydanticCustomError(
+                "permission_list",
+                "expected a list of permission strings, got {kind}",
+                {"kind": type(value).__name__},
+            )
         items = list(cast("list[object] | tuple[object, ...]", value))
         if bad := [item for item in items if not isinstance(item, str)]:
-            msg = f"permissions must be strings, got {bad[0]!r}"
-            raise ValueError(msg)
+            raise PydanticCustomError(
+                "permission_string",
+                "permissions must be strings, got {value}",
+                {"value": repr(bad[0])},
+            )
         return cls.parse(str(item) for item in items)
 
     @classmethod

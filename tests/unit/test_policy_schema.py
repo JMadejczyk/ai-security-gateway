@@ -264,6 +264,50 @@ def _delete(path: str) -> Callable[[Doc], None]:
         ),
         pytest.param(_delete("risk_rules.autonomous"), "autonomous", id="missing-rule-mode"),
         pytest.param(_set("roles.bad:name", {"allow": []}), "roles", id="role-name-with-colon"),
+        # Bad shapes for permission lists are validation errors, never a TypeError escaping.
+        pytest.param(
+            _set("blocklist.use_cases", None), "list of permission strings", id="use-cases-null"
+        ),
+        pytest.param(_set("roles.analyst.allow", 5), "list of permission strings", id="allow-int"),
+        pytest.param(
+            _set("agents.databot.deny", {"egress": "*"}),
+            "list of permission strings",
+            id="deny-mapping",
+        ),
+        pytest.param(_set("roles.analyst.allow", [1]), "must be strings", id="allow-non-string"),
+        # Numbers are finite, durations bounded.
+        pytest.param(
+            _set("risk_rules.interactive.2.then.duration_s", float("inf")),
+            "finite",
+            id="infinite-freeze",
+        ),
+        pytest.param(
+            _set("risk_rules.interactive.1.then.cooldown_s", float("nan")),
+            "finite",
+            id="nan-cooldown",
+        ),
+        pytest.param(_set("risk.half_life_s", float("inf")), "finite", id="infinite-half-life"),
+        pytest.param(
+            _set("risk_rules.interactive.1.when.risk_gt", float("nan")), "finite", id="nan-risk"
+        ),
+        pytest.param(
+            _set("budgets.per_user.daily_cost_usd", float("inf")), "finite", id="infinite-budget"
+        ),
+        pytest.param(
+            _set("risk_rules.interactive.2.then.duration_s", 10**12),
+            "less than or equal to 2592000",
+            id="huge-freeze",
+        ),
+        pytest.param(
+            _set("sessions.max_lifetime_s", 10**12),
+            "less than or equal to 2592000",
+            id="huge-lifetime",
+        ),
+        pytest.param(
+            _set("controls.sql_guard.timeout_ms", 10**15),
+            "less than or equal",
+            id="huge-timeout-ms",
+        ),
     ],
 )
 def test_schema_rule_rejects(policy_doc, snapshot_from, mutate, message):
@@ -298,6 +342,24 @@ def test_yaml_aliases_rejected(loader):
 def test_unsafe_yaml_tags_rejected(loader):
     with pytest.raises(PolicyLoadError, match="invalid YAML"):
         loader.parse(b"profile: !!python/object/apply:os.system ['true']\n")
+
+
+def nested(depth: int) -> bytes:
+    return f"profile: {'[' * depth}{']' * depth}\n".encode()
+
+
+def test_deep_nesting_rejected_without_recursion_error(loader):
+    # ~1000 nested sequences in 2 KB used to raise an uncaught RecursionError.
+    with pytest.raises(PolicyLoadError, match="nesting deeper than 32"):
+        loader.parse(nested(1000))
+    with pytest.raises(PolicyLoadError, match="nesting deeper than 32"):
+        loader.parse(nested(32))  # the root mapping is level 1
+
+
+def test_nesting_within_the_cap_reaches_schema_validation(loader):
+    with pytest.raises(PolicyLoadError, match="validation error") as caught:
+        loader.parse(nested(31))
+    assert "nesting" not in str(caught.value)
 
 
 def test_oversize_file_rejected(tmp_path: Path):

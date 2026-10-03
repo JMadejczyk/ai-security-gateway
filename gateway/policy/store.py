@@ -72,6 +72,11 @@ class PolicyStore:
             except PolicyLoadError as exc:
                 logger.error("policy reload rejected, keeping %s: %s", previous.revision, exc)  # noqa: TRY400 -- the message is the operator-facing error; a traceback adds nothing
                 return self._finish(ReloadResult.INVALID, previous, previous, error=str(exc))
+            except Exception as exc:
+                # A loader bug must never take the working policy (or the watcher) down.
+                logger.exception("policy reload failed unexpectedly, keeping %s", previous.revision)
+                error = f"unexpected {type(exc).__name__} while loading the policy"
+                return self._finish(ReloadResult.INVALID, previous, previous, error=error)
             if candidate.digest == previous.digest:
                 return self._finish(ReloadResult.UNCHANGED, previous, previous)
             self._current = candidate
@@ -101,7 +106,10 @@ class PolicyStore:
             debounce=debounce_ms,
             force_polling=force_polling,
         ):
-            self.reload()
+            try:
+                self.reload()
+            except Exception:
+                logger.exception("policy reload raised; the watcher keeps running")
 
     @staticmethod
     def _finish(

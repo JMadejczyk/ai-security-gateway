@@ -15,9 +15,9 @@ from gateway.policy.permissions import Resource
 
 
 class FrozenModel(BaseModel):
-    """Base for boundary models: unknown fields rejected, instances immutable."""
+    """Base for boundary models: unknown fields rejected, instances immutable, numbers finite."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
 
 
 def cooldown_key(action: Action, resource: str) -> str:

@@ -22,6 +22,7 @@ from pydantic import (
 
 from gateway.core.catalog import CONTROL_CATALOG, control_spec
 from gateway.core.envelope import FrozenModel
+from gateway.core.frozen import FrozenDict
 from gateway.core.interfaces import ControlConfig
 from gateway.core.types import Action, ControlMode, Profile, SessionMode
 from gateway.policy.permissions import WILDCARD, PermissionSet, Resource
@@ -31,6 +32,9 @@ SERVICE_PRINCIPAL_PREFIX = "svc:"
 # Role, agent and server names: no colon, so `svc:<agent>` and resource keys stay unambiguous.
 type Name = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")]
 type Threshold = Annotated[float, Field(ge=0.0, le=1.0)]
+# Every timer and interval is positive and bounded, so `now + duration` can never overflow.
+MAX_DURATION_S = 30 * 24 * 3600.0
+type Duration = Annotated[float, Field(gt=0.0, le=MAX_DURATION_S)]
 type EnvVarName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")]
 
 _PLACEHOLDER = re.compile(r"\{([^{}]*)\}")
@@ -93,7 +97,7 @@ class McpServer(FrozenModel):
     url: HttpUrl
     adapter: Adapter
     trust: Trust
-    tools: dict[Name, McpTool] = Field(default_factory=dict[str, McpTool])
+    tools: FrozenDict[Name, McpTool] = Field(default_factory=FrozenDict[str, McpTool])
 
     @model_validator(mode="after")
     def _resource_per_adapter(self) -> Self:
@@ -112,7 +116,7 @@ class McpServer(FrozenModel):
 
 class Upstreams(FrozenModel):
     llm: LlmUpstream
-    mcp: dict[Name, McpServer] = Field(default_factory=dict[str, McpServer])
+    mcp: FrozenDict[Name, McpServer] = Field(default_factory=FrozenDict[str, McpServer])
 
 
 # --------------------------------------------------------------------- roles and agents
@@ -162,11 +166,7 @@ class Agent(FrozenModel):
 
 class Throttle(FrozenModel):
     max_actions: PositiveInt
-    per_s: PositiveFloat
-
-    @property
-    def rate(self) -> float:
-        return self.max_actions / self.per_s
+    per_s: Duration
 
 
 class When(FrozenModel):
@@ -194,9 +194,9 @@ class Then(FrozenModel):
     deny_actions: tuple[Action, ...] = ()
     actions: tuple[Action, ...] = ()
     mode: Literal["require_approval"] | None = None
-    cooldown_s: PositiveFloat | None = None
+    cooldown_s: Duration | None = None
     freeze_tools: bool = False
-    duration_s: PositiveFloat | None = None
+    duration_s: Duration | None = None
     throttle: Throttle | None = None
     alert: bool = False
 
@@ -242,20 +242,20 @@ class RiskRules(FrozenModel):
 
 
 class Risk(FrozenModel):
-    half_life_s: PositiveFloat = 600.0
+    half_life_s: Duration = 600.0
 
 
 # ------------------------------------------------------------------ operational sections
 
 
 class Approvals(FrozenModel):
-    timeout_s: PositiveFloat = 600.0
+    timeout_s: Duration = 600.0
     on_timeout: Literal["deny"] = "deny"
 
 
 class Sessions(FrozenModel):
-    idle_ttl_s: PositiveFloat = 3600.0
-    max_lifetime_s: PositiveFloat = 86400.0
+    idle_ttl_s: Duration = 3600.0
+    max_lifetime_s: Duration = 86400.0
 
     @model_validator(mode="after")
     def _idle_within_lifetime(self) -> Self:
@@ -267,8 +267,8 @@ class Sessions(FrozenModel):
 
 class ThrottleBackoff(FrozenModel):
     backoff: Literal["exponential"] = "exponential"
-    base_s: PositiveFloat = 5.0
-    max_s: PositiveFloat = 300.0
+    base_s: Duration = 5.0
+    max_s: Duration = 300.0
 
     @model_validator(mode="after")
     def _base_within_max(self) -> Self:
@@ -287,7 +287,7 @@ class Blocklist(FrozenModel):
 class Limits(FrozenModel):
     max_request_bytes: PositiveInt = 1_048_576
     max_response_bytes: PositiveInt = 4_194_304
-    upstream_timeout_s: PositiveFloat = 120.0
+    upstream_timeout_s: Duration = 120.0
 
 
 # ------------------------------------------------------------------------------ budgets
@@ -339,17 +339,17 @@ class PromptInjectionConfig(ControlConfig):
 class SqlGuardConfig(ControlConfig):
     max_cost: PositiveFloat = 10_000.0
     force_limit: PositiveInt = 500
-    timeout_ms: PositiveInt = 3_000
+    timeout_ms: Annotated[int, Field(gt=0, le=int(MAX_DURATION_S * 1000))] = 3_000
 
 
 class SignaturesConfig(ControlConfig):
     feed: str | None = Field(default=None, min_length=1)  # URL or file path
-    refresh_s: PositiveFloat = 30.0
+    refresh_s: Duration = 30.0
 
 
 class LoopDetectConfig(ControlConfig):
     max_repeats: PositiveInt = 5
-    window_s: PositiveFloat = 60.0
+    window_s: Duration = 60.0
 
 
 class IntentJudgeConfig(ControlConfig):
@@ -408,8 +408,8 @@ class Policy(FrozenModel):
     profile: Profile
     default: Literal["deny"]
     upstreams: Upstreams
-    roles: dict[Name, Role] = Field(default_factory=dict[str, Role])
-    agents: dict[Name, Agent] = Field(default_factory=dict[str, Agent])
+    roles: FrozenDict[Name, Role] = Field(default_factory=FrozenDict[str, Role])
+    agents: FrozenDict[Name, Agent] = Field(default_factory=FrozenDict[str, Agent])
     risk: Risk = Risk()
     risk_rules: RiskRules
     approvals: Approvals = Approvals()

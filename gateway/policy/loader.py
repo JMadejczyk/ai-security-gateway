@@ -18,6 +18,7 @@ from gateway.policy.schema import Policy
 
 MAX_POLICY_BYTES = 1024 * 1024  # 1 MiB
 REVISION_LENGTH = 12
+MAX_YAML_DEPTH = 32  # the policy itself needs 6
 
 
 class PolicyLoadError(Exception):
@@ -30,15 +31,31 @@ class PolicyLoadError(Exception):
 
 
 class _StrictSafeLoader(yaml.SafeLoader):
-    """SafeLoader that rejects duplicate keys and aliases.
+    """SafeLoader that rejects duplicate keys, aliases and deep nesting.
 
     Duplicate keys would let a later line silently override an earlier grant. Aliases are
-    refused because expanding them (billion laughs) bypasses the byte-size cap.
+    refused because expanding them (billion laughs) bypasses the byte-size cap. Nesting is
+    capped because composing, constructing and validating are all recursive: a 2 KB file of
+    ``[[[[...`` would otherwise end in RecursionError.
     """
+
+    def __init__(self, stream: str) -> None:
+        super().__init__(stream)
+        self._depth = 0
 
     def compose_node(self, parent: Node | None, index: int) -> Node | None:
         is_alias = self.check_event(yaml.AliasEvent)
-        node = super().compose_node(parent, index)  # an alias resolves to its anchor, unexpanded
+        is_collection = self.check_event(yaml.SequenceStartEvent, yaml.MappingStartEvent)
+        if is_collection:
+            if self._depth >= MAX_YAML_DEPTH:
+                problem = f"YAML nesting deeper than {MAX_YAML_DEPTH} levels"
+                raise ComposerError(None, None, problem, parent.start_mark if parent else None)
+            self._depth += 1
+        try:
+            node = super().compose_node(parent, index)  # an alias resolves to its anchor
+        finally:
+            if is_collection:
+                self._depth -= 1
         if is_alias:
             problem = "YAML aliases are not allowed in the policy"
             raise ComposerError(None, None, problem, node.start_mark if node else None)
@@ -125,6 +142,9 @@ class PolicyLoader:
             document: object = yaml.load(text, Loader=_StrictSafeLoader)  # noqa: S506 -- _StrictSafeLoader subclasses SafeLoader
         except yaml.YAMLError as exc:
             msg = f"invalid YAML: {exc}"
+            raise PolicyLoadError(msg, source=source) from exc
+        except RecursionError as exc:  # backstop; the depth cap should make this unreachable
+            msg = "invalid YAML: nested too deeply"
             raise PolicyLoadError(msg, source=source) from exc
         if not isinstance(document, dict):
             msg = "policy must be a YAML mapping at the top level"

@@ -115,42 +115,116 @@ for target in json.loads(sys.argv[1]):
 """
 
 
+# Minimal streamable-HTTP MCP client (stdlib only), so it runs in any python:3.12 container.
+# argv: url, tool, JSON arguments. Prints {"is_error": bool, "text": str}.
+_MCP_CALL_SCRIPT = """
+import json, sys, urllib.request
+url, tool, arguments = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+headers = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
+def rpc(payload):
+    request = urllib.request.Request(url, json.dumps(payload).encode(), headers, method="POST")
+    with urllib.request.urlopen(request, timeout=30) as response:
+        session = response.headers.get("mcp-session-id")
+        if session:
+            headers["Mcp-Session-Id"] = session
+        body = response.read().decode()
+        kind = response.headers.get("content-type", "")
+    if "id" not in payload or not body:
+        return None
+    if kind.startswith("text/event-stream"):
+        for line in body.splitlines():
+            if line.startswith("data:") and line[5:].strip():
+                message = json.loads(line[5:])
+                if message.get("id") == payload["id"]:
+                    return message
+    return json.loads(body)
+init = rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+    "protocolVersion": "2025-06-18", "capabilities": {},
+    "clientInfo": {"name": "bypass-tests", "version": "0"}}})
+headers["MCP-Protocol-Version"] = init["result"]["protocolVersion"]
+rpc({"jsonrpc": "2.0", "method": "notifications/initialized"})
+reply = rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": tool, "arguments": arguments}})
+if "error" in reply:
+    print(json.dumps({"is_error": True, "text": json.dumps(reply["error"])}))
+else:
+    result = reply["result"]
+    text = " ".join(item.get("text", "") for item in result.get("content", []))
+    print(json.dumps({"is_error": bool(result.get("isError")), "text": text[:2000]}))
+"""
+
+
+@dataclass(frozen=True)
+class ToolCallResult:
+    is_error: bool
+    text: str
+
+
 class ProbeError(RuntimeError):
     def __init__(self, service: str, output: str) -> None:
         super().__init__(f"probe in {service} failed: {output}")
 
 
 class StackProbe:
-    """Attempts TCP connections from inside a running compose service."""
+    """Runs probes inside running compose services and inspects their network addresses."""
 
     def __init__(self, docker: str) -> None:
         self._docker = docker
 
-    def from_service(self, service: str, targets: list[str]) -> dict[str, ProbeResult]:
+    def _run(self, service: str, argv: list[str], timeout: float) -> str:
         completed = subprocess.run(  # noqa: S603 - fixed argv, docker resolved from PATH
-            [
-                self._docker,
-                "compose",
-                "exec",
-                "-T",
-                service,
-                "python",
-                "-c",
-                _PROBE_SCRIPT,
-                json.dumps(targets),
-            ],
+            [self._docker, *argv],
             capture_output=True,
             text=True,
             check=False,
             cwd=REPO_ROOT,
-            timeout=30 + 10 * len(targets),
+            timeout=timeout,
         )
         if completed.returncode != 0:
             raise ProbeError(service, completed.stderr)
+        return completed.stdout
+
+    def _exec_python(self, service: str, script: str, *args: str, timeout: float) -> str:
+        argv = ["compose", "exec", "-T", service, "python", "-c", script, *args]
+        return self._run(service, argv, timeout)
+
+    def from_service(self, service: str, targets: list[str]) -> dict[str, ProbeResult]:
+        """TCP-connect from `service` to each `host:port` target."""
+        output = self._exec_python(
+            service, _PROBE_SCRIPT, json.dumps(targets), timeout=30 + 10 * len(targets)
+        )
         results: dict[str, ProbeResult] = {}
-        for line in completed.stdout.splitlines():
+        for line in output.splitlines():
             target, outcome, detail = cast(list[str], json.loads(line))
             results[target] = ProbeResult(target=target, outcome=outcome, detail=detail)
         if set(results) != set(targets):
-            raise ProbeError(service, completed.stdout)
+            raise ProbeError(service, output)
         return results
+
+    def addresses(self, service: str) -> dict[str, str]:
+        """IPv4 address of `service`'s container on each compose network, by short network name."""
+        container = self._run(service, ["compose", "ps", "-q", service], 30).strip()
+        if not container or "\n" in container:
+            raise ProbeError(service, f"expected one running container, got {container!r}")
+        fmt = (
+            "{{json .NetworkSettings.Networks}}"
+            '|{{index .Config.Labels "com.docker.compose.project"}}'
+        )
+        raw, project = self._run(service, ["inspect", "--format", fmt, container], 30).rsplit(
+            "|", 1
+        )
+        networks = cast(dict[str, dict[str, Any]], json.loads(raw))
+        prefix = f"{project.strip()}_"
+        return {
+            name.removeprefix(prefix): str(spec["IPAddress"]) for name, spec in networks.items()
+        }
+
+    def call_tool(
+        self, service: str, url: str, tool: str, arguments: Mapping[str, object]
+    ) -> ToolCallResult:
+        """Call an MCP tool at `url` from inside `service`."""
+        output = self._exec_python(
+            service, _MCP_CALL_SCRIPT, url, tool, json.dumps(arguments), timeout=60
+        )
+        data = cast(dict[str, Any], json.loads(output))
+        return ToolCallResult(is_error=bool(data["is_error"]), text=str(data["text"]))

@@ -65,8 +65,9 @@ Two choices are worth spelling out:
   shares no network with Postgres or Ollama.
 
 `tests/bypass/` checks all of this. The static tests read `docker compose config`. The
-`docker`-marked tests run TCP probes from inside the agent and mcp-fetch containers against a
-running stack:
+`docker`-marked tests run against a running stack. They send TCP probes from inside the agent and
+mcp-fetch containers to every protected container's real IP on every network it joins, with
+positive controls from the gateway. They also call the `fetch` tool with internal URLs:
 
 ```sh
 pytest tests/bypass -m "not docker"         # static, needs only the docker CLI
@@ -117,7 +118,7 @@ called `MCPServer`. Each one serves streamable HTTP on `0.0.0.0:8000/mcp`, and t
 | --- | --- | --- |
 | `mcp-postgres` | `query(sql)` | Verifies `X-ACL-Principal`, then runs the statement in one read-only transaction that starts with `set_config('app.user_id', principal, true)`. Exactly one statement runs (extended protocol). Without a valid principal, nothing runs. |
 | `mcp-files` | `write_report(name, content)` | Plain file names only. Creates files only (O_EXCL, so it never overwrites or follows a symlink). Writes under the `reports` volume at `/data/reports`. |
-| `mcp-fetch` | `fetch(url)` | http(s) GET with a 10 s timeout and a 256 KiB cap. It does not follow redirects: the agent has to fetch the new URL through the gateway, so egress checks run again. |
+| `mcp-fetch` | `fetch(url)` | http(s) GET on port 80/443 only, with a 10 s timeout and a 256 KiB cap. It resolves the host itself and refuses the call if any answer is not a public address (loopback, private, CGNAT, link-local/metadata, ULA, multicast, and IPv4-mapped/6to4 forms of those). It then connects to the validated IP, keeping the original Host header and TLS SNI, so DNS rebinding can't redirect the connection. It does not follow redirects: the agent has to fetch the new URL through the gateway. |
 
 Tool annotations (`readOnlyHint`, `destructiveHint`, ...) are only hints. The gateway's operator
 mapping in `policy.yaml` decides what each tool means.
@@ -142,6 +143,6 @@ without the key it cannot make the database act as another user.
 
 ```sh
 cd demo/mcp_servers
-uv run pytest                      # unit tests: report path enforcement, principal verification
+uv run pytest                      # unit tests: report paths, principal verification, fetch SSRF
 uv run --with pyright pyright      # strict
 ```

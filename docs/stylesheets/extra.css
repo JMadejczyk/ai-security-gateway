@@ -1,0 +1,32 @@
+:root, [data-md-color-scheme="default"] {
+  --md-primary-fg-color: #1D3FB8;
+  --md-primary-fg-color--light: #2563EB;
+  --md-primary-fg-color--dark: #142C82;
+  --md-accent-fg-color: #0EB5D6;
+}
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: #1D3FB8;
+  --md-accent-fg-color: #22D3EE;
+  --md-default-bg-color: #0B1220;
+}
+.md-header__button.md-logo img { height: 1.6rem; }
+.hero { text-align: center; padding: 1.5rem 0 0.5rem; }
+.hero img.logo { max-width: 560px; width: 90%; }
+[data-md-color-scheme="slate"] .hero img.logo { background: #fff; border-radius: 16px; padding: 12px 20px; }
+.hero .tagline { font-size: 1.35rem; font-weight: 600; margin: 0.6rem 0 1.2rem; }
+.hero .md-button { margin: 0.25rem; }
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: .8rem; margin: 1.5rem 0; }
+.stats div { border: 1px solid var(--md-default-fg-color--lightest); border-radius: 12px; padding: .9rem 1rem; text-align: center; }
+.stats b { display: block; font-size: 1.8rem; color: var(--md-primary-fg-color--light); line-height: 1.1; }
+[data-md-color-scheme="slate"] .stats b { color: #60A5FA; }
+.stats span { font-size: .75rem; opacity: .8; }
+img.showcase { width: 100%; border-radius: 14px; box-shadow: 0 18px 50px rgba(16,40,100,.18); }
+@media (max-width: 760px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+.md-typeset .grid.cards > ul > li { border-radius: 12px; }
+.md-typeset h1.sr-title { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); }
+.md-header__button.md-logo { background:#fff; border-radius:8px; padding:.25rem; margin:.3rem .4rem; }
+.md-typeset table:not([class]) td:first-child code { white-space: nowrap; }
+.showcase-link { position: relative; display: block; }
+.showcase-link .play { position: absolute; left: 50%; bottom: 8%; transform: translateX(-50%); background: #1D3FB8; color: #fff;
+  font-weight: 700; padding: .6rem 1.2rem; border-radius: 999px; box-shadow: 0 10px 30px rgba(16,40,100,.3); }
+.showcase-link:hover .play { background: #2563EB; }

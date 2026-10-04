@@ -33,3 +33,4 @@ models/cache/
 # opencode's isolated per-identity homes, npm cache and capture dumps (make opencode)
 demo/opencode/.home/
 video-out/
+site/

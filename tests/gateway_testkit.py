@@ -8,7 +8,7 @@ import base64
 import io
 import json
 import shutil
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -181,13 +181,15 @@ async def running_gateway(
     classifier: InjectionClassifier | None = None,
     judge_factory: JudgeFactory = FakeJudgeClient,
     resolver: FakeResolver | None = None,
+    env: Mapping[str, str] | None = None,
     **settings: Any,
 ) -> AsyncIterator[Harness]:
     """``transport`` carries every upstream call (LLM and MCP) when given. ``classifier`` is
     the prompt-injection classifier (default: `MarkerClassifier`, never the real model).
     ``judge_factory`` builds the LLM judge (default: the deterministic `FakeJudgeClient`;
     ``JudgeClient`` for the real one over ``transport``). ``resolver`` answers ``egress``
-    DNS lookups (default: a `FakeResolver`; tests never query real DNS)."""
+    DNS lookups (default: a `FakeResolver`; tests never query real DNS). ``env`` is the
+    gateway's process environment (default: empty), e.g. a remote upstream's key."""
     policy_path = tmp_path / "policy.yaml"
     shutil.copy(ROOT_POLICY, policy_path)
     shutil.copytree(FEEDS, tmp_path / FEEDS.name, dirs_exist_ok=True)
@@ -199,7 +201,7 @@ async def running_gateway(
         make_settings(policy_path, **settings),
         clock=clock,
         audit_stream=audit,
-        env={},
+        env=dict(env or {}),
         transport=transport,
         classifier=classifier if classifier is not None else MarkerClassifier(),
         judge_factory=judge_factory,

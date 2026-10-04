@@ -1,0 +1,22 @@
+# Remote LLM overlay (engineering only): the gateway sends `generate` and judge calls to
+# upstreams.llm_remote in config/policy.yaml (OpenRouter, zero-data-retention endpoints only)
+# instead of the local Ollama, which runs qwen3:8b at ~2.4 tok/s on a CPU-only laptop.
+#
+#   docker compose -f docker-compose.yml -f compose.remote.yml up -d --build --wait   (make remote-up)
+#   docker compose up -d --wait --remove-orphans                                       (make remote-off)
+#
+# Prompts and judge content then leave this machine, after the pre controls (pii redaction,
+# secrets and prompt-injection blocks); grants, budgets and audit keep the logical model ids,
+# and every audit entry says `"upstream": "remote"`. Nothing else changes:
+#
+#   - The key comes from .env and reaches the gateway only. The gateway refuses to start when
+#     it is missing (never a silent fall back to Ollama); the agent never sees it.
+#   - No network is opened: the gateway already reaches the internet through `ops`, the one
+#     non-internal network it is on. The agent stays on `edge` alone (tests/bypass/).
+#   - Ollama keeps running and serving nothing; `make remote-off` returns to the default.
+
+services:
+  gateway:
+    environment:
+      ACL_LLM_UPSTREAM: remote
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?set OPENROUTER_API_KEY in .env for make remote-up}

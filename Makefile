@@ -2,7 +2,7 @@
 REPORTS := reports
 
 .PHONY: help install models lint fmt test report test-docker test-all perf up down grafana smoke dashboards \
-	demo demo-up demo-off diagrams
+	demo demo-up demo-off remote-up remote-off diagrams
 
 help: ## List targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -93,4 +93,13 @@ demo: ## Run the 7-scene demo against the running stack (DEMO_ARGS="--pause" or 
 		uv run python -m demo.run_demo $(DEMO_ARGS)
 
 demo-off: ## Back to the default stack: gateway and mcp-fetch without the demo allowances, demo-web removed
+	docker compose up -d --wait --remove-orphans
+
+REMOTE_COMPOSE := docker compose -f docker-compose.yml -f compose.remote.yml
+
+remote-up: ## Engineering: LLM calls go to OpenRouter (ZDR only) instead of Ollama; needs OPENROUTER_API_KEY in .env
+	$(REMOTE_COMPOSE) up -d --build --wait
+	@curl -fsS http://127.0.0.1:$(OPERATOR_PORT)/healthz; echo
+
+remote-off: ## Back to the default stack: the local Ollama upstream
 	docker compose up -d --wait --remove-orphans

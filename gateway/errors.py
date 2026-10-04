@@ -16,6 +16,10 @@ class RejectionError(Exception):
         super().__init__(f"{reason_code}: {self.message}")
 
 
+class StartupError(Exception):
+    """The process configuration is unusable: the gateway refuses to start (never degrades)."""
+
+
 class InvalidRequestError(RejectionError):
     """The request body is not something the entry point accepts."""
 

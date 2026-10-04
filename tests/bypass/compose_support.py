@@ -53,11 +53,25 @@ class ComposeConfig:
         return cast(dict[str, str | None], self.service(service).get("environment") or {})
 
     @classmethod
-    def render(cls, docker: str) -> ComposeConfig:
-        """Render the committed compose file with every profile enabled."""
-        env = {**os.environ, **_PLACEHOLDER_SECRETS}
+    def render(
+        cls,
+        docker: str,
+        overlays: tuple[Path, ...] = (),
+        extra_env: Mapping[str, str] | None = None,
+        drop_env: tuple[str, ...] = (),
+    ) -> ComposeConfig:
+        """Render the committed compose file (plus ``overlays``) with every profile enabled.
+
+        ``drop_env`` removes variables from the environment the render sees (e.g. to prove an
+        overlay refuses to render without its secret)."""
+        env = {**os.environ, **_PLACEHOLDER_SECRETS, **(extra_env or {})}
         env.pop("COMPOSE_FILE", None)  # the committed file only, never a local override
-        argv = [docker, "compose", "-f", str(COMPOSE_FILE), "--profile", "*"]
+        for name in drop_env:
+            env.pop(name, None)
+        files = [arg for path in (COMPOSE_FILE, *overlays) for arg in ("-f", str(path))]
+        # Never the developer's .env: the committed files and placeholders only, so a real
+        # secret there (OPENROUTER_API_KEY) never lands in a rendered config or a test failure.
+        argv = [docker, "compose", "--env-file", os.devnull, *files, "--profile", "*"]
         completed = subprocess.run(  # noqa: S603 - fixed argv, docker resolved from PATH
             [*argv, "config", "--format", "json"],
             capture_output=True,

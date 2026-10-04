@@ -27,7 +27,7 @@ from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 from pydantic import AwareDatetime, Field, field_serializer
 
 from gateway.core.envelope import FrozenModel, Verdict
-from gateway.core.types import Action, Channel, Decision, SessionMode, Stage
+from gateway.core.types import Action, Channel, Decision, LlmUpstreamKind, SessionMode, Stage
 
 REGISTRY = CollectorRegistry(auto_describe=True)
 OTHER_LABEL: Final = "other"
@@ -179,6 +179,19 @@ def initialize_signature_series(signature_ids: Iterable[str]) -> None:
     """`acl_signature_hits_total` at 0 for every signature of a loaded feed (see above)."""
     for signature_id in signature_ids:
         SIGNATURE_HITS.labels(signature=signature_id)
+
+
+LLM_UPSTREAM_INFO = Gauge(
+    "acl_llm_upstream_info",
+    "1 for the LLM upstream this gateway sends generate and judge calls to (local or remote).",
+    ["upstream"],
+    registry=REGISTRY,
+)
+
+
+def set_llm_upstream(kind: LlmUpstreamKind) -> None:
+    for each in LlmUpstreamKind:
+        LLM_UPSTREAM_INFO.labels(upstream=each.value).set(1 if each is kind else 0)
 
 
 def record_policy_reload(result: ReloadResult) -> None:
@@ -352,6 +365,7 @@ class AuditEntry(FrozenModel):
     latency_ms: AuditLatency
     payload_hmac: str | None = None
     approval_id: str | None = None  # the approval the call was held under or presented
+    upstream: LlmUpstreamKind | None = None  # LLM calls: which upstream would serve them
 
     @field_serializer("ts")
     def _utc_z(self, ts: datetime) -> str:

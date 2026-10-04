@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from pydantic import ValidationError
 
 from gateway.container import GatewayContainer
+from gateway.errors import StartupError
 from gateway.feed.schema import FeedError
 from gateway.injection.manifest import ModelVerificationError
 from gateway.main import create_agent_app, create_operator_app
@@ -98,7 +99,14 @@ def main() -> int:
     )
     try:
         container = GatewayContainer.from_settings(settings)
-    except (PolicyLoadError, FeedError, ModelVerificationError, OSError, ValidationError) as exc:
+    except (
+        PolicyLoadError,
+        FeedError,
+        ModelVerificationError,
+        StartupError,
+        OSError,
+        ValidationError,
+    ) as exc:
         logger.critical("refusing to start: %s", exc)
         return 2
     return asyncio.run(serve(settings, container))

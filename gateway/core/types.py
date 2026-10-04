@@ -78,3 +78,13 @@ class Profile(StrEnum):
     STRICT = "strict"
     BALANCED = "balanced"
     PERMISSIVE = "permissive"
+
+
+class LlmUpstreamKind(StrEnum):
+    """Which declared LLM upstream serves ``generate`` and the judges (``ACL_LLM_UPSTREAM``).
+
+    ``local`` (``upstreams.llm``, the product default) or ``remote`` (``upstreams.llm_remote``,
+    an opt-in engineering upstream outside the machine)."""
+
+    LOCAL = "local"
+    REMOTE = "remote"

@@ -6,6 +6,33 @@ upstreams:                 # internal networks, reachable only from the gateway
   llm:
     base_url: http://ollama:11434/v1        # or LiteLLM
     api_key_env: null                       # env var holding the router key, if any
+  # Opt-in remote upstream for engineering (CPU-only Ollama runs qwen3:8b at ~2.4 tok/s). Used
+  # only when the gateway runs with ACL_LLM_UPSTREAM=remote (compose.remote.yml, `make
+  # remote-up`); the default above is unchanged. Prompts then leave the machine after the pre
+  # controls (pii redaction, secrets and prompt-injection blocks). Grants, pricing keys,
+  # model_allowlist and audit keep the logical ids on the left; a model missing here is refused.
+  llm_remote:
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY         # gateway environment only, from .env
+    reasoning: openrouter                   # reasoning_effort -> reasoning {enabled|effort}
+    model_map:
+      # qwen/qwen3-8b has no zero-data-retention endpoint on OpenRouter (2026-10-04: one
+      # provider, not ZDR), so ZDR routing could never serve it. The hybrid Qwen3 models with
+      # ZDR endpoints (qwen3-14b, -32b) keep thinking whatever `reasoning` says (measured: only
+      # a "/no_think" prompt suffix stops them), which the judges cannot afford. The 2507
+      # instruct model never thinks, has ZDR endpoints (DekaLLM, Nebius, SiliconFlow), JSON mode,
+      # and answered a one-sentence prompt in ~1.4 s.
+      "qwen3:8b": qwen/qwen3-30b-a3b-instruct-2507
+    extra_body:                             # merged into every request; the agent cannot override
+      provider:
+        zdr: true                           # zero-data-retention endpoints only, or an error
+        data_collection: deny               # no provider that may train on or store prompts
+        # Fallbacks stay on: zdr filters every candidate, so a fallback is another ZDR endpoint.
+    pricing:                                # replaces the top-level price while remote is selected
+      # OpenRouter, qwen/qwen3-30b-a3b-instruct-2507 ZDR endpoints 2026-10-04, USD per 1k tokens:
+      # the dearest of DekaLLM/SiliconFlow $0.09 and Nebius $0.10 in, $0.30 out per million.
+      # No GPU time is ours to charge.
+      "qwen3:8b": { prompt_per_1k: 0.0001, completion_per_1k: 0.0003, gpu_second: 0.0 }
   mcp:
     sales_db:
       url: http://mcp-postgres:8000/mcp

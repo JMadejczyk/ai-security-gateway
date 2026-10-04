@@ -408,4 +408,6 @@ async def test_healthz(gateway):
         "status": "ok",
         "policy_revision": gateway.container.policy_store.current.revision,
         "budget_store": "memory",  # the test kit's store; Redis reports up/down
+        "llm_upstream": "local",  # the product default
+        "llm_upstream_host": "ollama",
     }

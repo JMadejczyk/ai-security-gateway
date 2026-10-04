@@ -65,9 +65,10 @@ from gateway.budget.model import (
     SpendLimits,
     daily_window,
 )
-from gateway.budget.pricing import CostModel
+from gateway.budget.pricing import CostModel, upstream_pricing
 from gateway.budget.store import BudgetStore
 from gateway.clock import Clock, utc_now
+from gateway.core.types import Channel, LlmUpstreamKind
 from gateway.policy.loader import PolicySnapshot
 from gateway.policy.schema import Policy
 from gateway.telemetry import (
@@ -141,8 +142,11 @@ class BudgetLedger:
         *,
         clock: Clock = utc_now,
         monotonic: Callable[[], float] = time.monotonic,
+        llm_upstream: LlmUpstreamKind = LlmUpstreamKind.LOCAL,
     ) -> None:
         self._store = store
+        self._llm_upstream = llm_upstream
+        self._gpu_metered = llm_upstream is LlmUpstreamKind.LOCAL
         self._clock = clock
         self._monotonic = monotonic
         self._tasks: set[asyncio.Task[object]] = set()
@@ -164,13 +168,16 @@ class BudgetLedger:
         and `InvalidRequestError` (400) for a request whose completions cannot be bounded.
         """
         policy = snapshot.policy
-        costs = CostModel(policy.pricing)
+        pricing = upstream_pricing(policy, self._llm_upstream)
+        costs = CostModel(pricing)
         plan = metering.plan(
             call,
             costs,
             default_max_tokens=policy.limits.default_max_tokens,
             max_completion_tokens=policy.limits.max_completion_tokens,
         )
+        if not self._gpu_metered:
+            plan = metering.without_gpu(plan)
         scopes = scopes_for(call, policy, plan.meters, daily_window(self._clock()))
         reservation = Reservation(
             op_id=uuid.uuid4().hex,
@@ -179,11 +186,12 @@ class BudgetLedger:
             scopes=(),
             held=Spend(),
             started_s=self._monotonic(),
-            pricing=policy.pricing,
+            pricing=pricing,
+            gpu_metered=self._gpu_metered,
             policy_revision=snapshot.revision,
             soft_limit_pct=policy.budgets.soft_limit_pct,
             # No budget limits the call: its deadline is still the upstream timeout, in total.
-            gpu_allowance_s=policy.limits.upstream_timeout_s if Meter.GPU in plan.meters else None,
+            gpu_allowance_s=_deadline_s(call, policy),
         )
         if not scopes:
             return reservation
@@ -268,8 +276,8 @@ class BudgetLedger:
         policy: Policy,
     ) -> tuple[Spend, float | None]:
         """What to hold, GPU allowance included, and the allowance (LLM calls only)."""
-        if Meter.GPU not in plan.meters:
-            return plan.estimate, None
+        if Meter.GPU not in plan.meters:  # MCP, or a remote LLM: the plain upstream deadline
+            return plan.estimate, _deadline_s(call, policy)
         allowance_ms = math.ceil(policy.limits.upstream_timeout_s * MS_PER_SECOND)
         binding: str | None = None
         gpu_priced = costs.price(call.model).gpu_second > 0
@@ -331,6 +339,7 @@ class BudgetLedger:
             answered=upstream is not None,
             usage=upstream.usage if upstream is not None else None,
             wall_s=wall_s,
+            gpu_metered=reservation.gpu_metered,
         )
         if spent.cost_nano_usd:
             # Models outside the pricing table share `other` (bounded label set).
@@ -431,6 +440,11 @@ class BudgetLedger:
                 sort_keys=True,
             )
         )
+
+
+def _deadline_s(call: BudgetedCall, policy: Policy) -> float | None:
+    """Every LLM call is held to ``limits.upstream_timeout_s`` in total, metered GPU or not."""
+    return policy.limits.upstream_timeout_s if call.channel is Channel.LLM else None
 
 
 def _gpu_room(

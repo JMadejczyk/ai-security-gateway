@@ -7,10 +7,13 @@ store, session state and upstream connection pool.
 import asyncio
 import contextlib
 import functools
+import json
 import logging
+import os
 from collections.abc import AsyncGenerator, Mapping
 from dataclasses import dataclass, field
 from typing import Self, TextIO
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -37,7 +40,8 @@ from gateway.controls.signatures import SignaturesControl
 from gateway.controls.sql_guard import SqlGuardControl
 from gateway.controls.tool_pinning import ToolPinningControl
 from gateway.controls.tool_poisoning import ToolPoisoningControl
-from gateway.core.types import Channel
+from gateway.core.types import Channel, LlmUpstreamKind
+from gateway.errors import StartupError
 from gateway.feed.store import FeedStore
 from gateway.identity import DemoIdentities, DemoTokenIssuer, TokenVerifier
 from gateway.injection.classifier import ClassifierRunner, InjectionClassifier, load_classifier
@@ -46,8 +50,9 @@ from gateway.judges.client import JudgeFactory
 from gateway.metric_series import initialize_metric_series
 from gateway.pipeline import ChannelRoute, DecisionRecorder, Pipeline, SessionGate
 from gateway.policy.evaluator import PolicyEvaluator
+from gateway.policy.loader import PolicyLoader, PolicySnapshot
 from gateway.policy.store import PolicyStore
-from gateway.proxies.llm import LLMProxy
+from gateway.proxies.llm import LLMProxy, require_upstream
 from gateway.proxies.mcp.downstream import MCPProxy
 from gateway.proxies.mcp.explain import explain_cost
 from gateway.proxies.mcp.pins import PinStore
@@ -57,9 +62,35 @@ from gateway.proxies.mcp.upstream import MCPConnector
 from gateway.sessions import SessionStore
 from gateway.settings import Settings
 from gateway.state_stores import StateStores
-from gateway.telemetry import AuditLogger, PolicyReloadEvent
+from gateway.telemetry import AuditLogger, PolicyReloadEvent, set_llm_upstream
 
 logger = logging.getLogger(__name__)
+
+
+def check_llm_upstream(
+    settings: Settings, snapshot: PolicySnapshot, env: Mapping[str, str]
+) -> None:
+    """Refuse to start with a remote upstream that cannot work; warn that prompts leave.
+
+    Never falls back to the local upstream: a remote run that silently went local (or the
+    reverse) would make every latency and data-handling observation wrong."""
+    set_llm_upstream(settings.llm_upstream)
+    if settings.llm_upstream is not LlmUpstreamKind.REMOTE:
+        return
+    remote = snapshot.policy.upstreams.llm_remote
+    if remote is None:  # require_upstream already refused this policy; kept for clarity
+        msg = "ACL_LLM_UPSTREAM=remote, but the policy declares no upstreams.llm_remote"
+        raise StartupError(msg)
+    if not env.get(remote.api_key_env, "").strip():
+        msg = f"ACL_LLM_UPSTREAM=remote, but {remote.api_key_env} is not set"
+        raise StartupError(msg)
+    logger.warning(
+        "LLM upstream is REMOTE (%s): agent prompts and judge content leave this machine, after "
+        "pre controls (pii redaction, secrets and prompt-injection blocks); routing terms sent "
+        "with every request: %s",
+        urlsplit(remote.base_url).hostname,
+        json.dumps(dict(remote.extra_body), sort_keys=True),
+    )
 
 
 @dataclass(kw_only=True, eq=False)
@@ -105,7 +136,12 @@ class GatewayContainer:
         classifier is missing or altered; ``classifier`` injects one instead, for tests) or an
         identities file error. ``resolver`` resolves ``egress`` destinations (tests inject a
         fake, so they make no DNS queries)."""
-        policy_store = PolicyStore.from_path(settings.policy_path)
+        # The selected LLM upstream must be declared at startup and in every reloaded policy.
+        policy_store = PolicyStore.from_path(
+            settings.policy_path,
+            PolicyLoader(requirement=require_upstream(settings.llm_upstream)),
+        )
+        check_llm_upstream(settings, policy_store.current, env if env is not None else os.environ)
         feed_store = FeedStore.boot(lambda: policy_store.current)
         # prompt_injection is always active (omitted = profile default), so no verified model
         # means no gateway; tool_poisoning shares the model, its cache and its worker bound.
@@ -134,7 +170,7 @@ class GatewayContainer:
             else None
         )
         gate = SessionGate(verifier, sessions)
-        llm = LLMProxy(env=env, transport=transport)
+        llm = LLMProxy(kind=settings.llm_upstream, env=env, transport=transport)
         # Judges call the LLM upstream directly (router key, response cap), never through the
         # pipeline: not audited as agent requests, not charged to budgets.
         # ``judge_factory`` builds the client: tests hand in a deterministic stand-in.
@@ -162,6 +198,7 @@ class GatewayContainer:
             settings.internal_key_bytes,
             identities.subjects() if identities is not None else frozenset(),
             feed=lambda: feed_store.current,
+            llm_upstream=settings.llm_upstream,
         )
         mcp_connector = MCPConnector(settings.internal_key_bytes, clock=clock, transport=transport)
         # sql_guard prices statements through the SQL server's gateway-only `explain` tool.
@@ -169,7 +206,11 @@ class GatewayContainer:
         pinning = ToolPinningControl(
             PinStore(settings.pins_dir), state.tool_quarantine, clock=clock
         )
-        budgets = BudgetLedger(budget_store_from_settings(settings, clock=clock), clock=clock)
+        budgets = BudgetLedger(
+            budget_store_from_settings(settings, clock=clock),
+            clock=clock,
+            llm_upstream=settings.llm_upstream,
+        )
         operator_stores = operator_stores_from_settings(settings)
         oversight = Oversight(
             ApprovalService(

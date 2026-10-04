@@ -56,7 +56,7 @@ from gateway.core.envelope import (
     Verdict,
 )
 from gateway.core.interfaces import Adapter
-from gateway.core.types import Channel, ControlMode, Decision, Stage
+from gateway.core.types import Channel, ControlMode, Decision, LlmUpstreamKind, Stage
 from gateway.core.verdicts import MergedVerdict, merge_verdicts
 from gateway.errors import InvalidRequestError, RejectionError, RequestTooLargeError
 from gateway.feed.schema import EMPTY_FEED, SignatureFeed
@@ -179,11 +179,13 @@ class DecisionRecorder:
         hmac_key: bytes,
         known_users: frozenset[str],
         feed: Callable[[], SignatureFeed] = lambda: EMPTY_FEED,
+        llm_upstream: LlmUpstreamKind = LlmUpstreamKind.LOCAL,
     ) -> None:
         self._audit = audit
         self._key = hmac_key
         self._known_users = known_users
         self._feed = feed
+        self.llm_upstream = llm_upstream  # stamped on every LLM audit entry
 
     def current_feed(self) -> SignatureFeed:
         """The signature feed in effect now: pinned per call, its version in every audit entry."""
@@ -1143,6 +1145,7 @@ class Pipeline:
             "latency_ms": latency,
             "approval_id": outcome.approval_id
             or (trace.approval.id if trace.approval is not None else None),
+            "upstream": self._recorder.llm_upstream if channel is Channel.LLM else None,
             **identity,
         }
         if not trace.steps:

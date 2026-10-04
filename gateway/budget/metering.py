@@ -20,7 +20,9 @@ LLM calls (``generate``):
 - GPU time (upstream wall time, an estimate of GPU seconds for a local model) is reserved as
   an allowance the ledger sizes and the pipeline enforces as the call's deadline
   (`gateway.budget.ledger`); the settlement charges the measured wall time, never more than
-  the allowance, and refunds the rest.
+  the allowance, and refunds the rest. A remote upstream (``ACL_LLM_UPSTREAM=remote``) spends
+  no GPU time of ours: its calls draw on tokens and cost only (`without_gpu`), and the
+  deadline stays ``limits.upstream_timeout_s``.
 
 MCP calls reserve one tool call, which a dispatched call keeps even if the upstream fails:
 the attempt reached the server.
@@ -29,7 +31,7 @@ the attempt reached the server.
 import json
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Final, cast
 
 from gateway.budget.model import MS_PER_SECOND, BudgetedCall, Meter, Spend
@@ -72,6 +74,11 @@ def plan(
             return Plan(payload=call.payload, estimate=Spend(), meters=frozenset())
 
 
+def without_gpu(plan: Plan) -> Plan:
+    """``plan`` for an upstream whose time is not our GPU's (a remote LLM)."""
+    return replace(plan, meters=plan.meters - {Meter.GPU})
+
+
 def actual(  # noqa: PLR0913 -- what was held, what came back, and how long it took
     call: BudgetedCall,
     held: Spend,
@@ -81,6 +88,7 @@ def actual(  # noqa: PLR0913 -- what was held, what came back, and how long it t
     answered: bool,
     usage: TokenUsage | None,
     wall_s: float,
+    gpu_metered: bool = True,
 ) -> Spend:
     """What the call spent.
 
@@ -92,7 +100,7 @@ def actual(  # noqa: PLR0913 -- what was held, what came back, and how long it t
     """
     if call.channel is not Channel.LLM:
         return held
-    gpu_ms = max(round(wall_s * MS_PER_SECOND), 0)
+    gpu_ms = max(round(wall_s * MS_PER_SECOND), 0) if gpu_metered else 0
     if held.gpu_ms:
         gpu_ms = min(gpu_ms, held.gpu_ms)
     gpu_cost = costs.gpu_cost(call.model, gpu_ms=gpu_ms)

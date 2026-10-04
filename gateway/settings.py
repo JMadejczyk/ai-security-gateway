@@ -11,6 +11,8 @@ from typing import Annotated, Literal
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from gateway.core.types import LlmUpstreamKind
+
 MIN_SECRET_BYTES = 32
 
 
@@ -108,6 +110,11 @@ class Settings(BaseSettings):
     # only the demo overlay (demo/compose.demo.yml) sets it, as a JSON list of name=address:
     # ACL_EGRESS_DEMO_HOSTS='["demo-web=10.218.97.10"]'.
     egress_demo_hosts: Annotated[tuple[DemoHost, ...], AfterValidator(_unique_hosts)] = ()
+    # Which declared LLM upstream serves `generate` and the judges. `local` (upstreams.llm,
+    # Ollama) is the product default; `remote` (upstreams.llm_remote, OpenRouter with zero data
+    # retention) is opt-in for engineering, set only by compose.remote.yml (`make remote-up`).
+    # Remote without its section in the policy or its key in the environment refuses to start.
+    llm_upstream: LlmUpstreamKind = LlmUpstreamKind.LOCAL
     log_level: str = "info"
 
     def demo_host_bindings(self) -> dict[str, IPv4Address | IPv6Address]:

@@ -199,6 +199,7 @@ class Reservation(FrozenModel):
     usage: tuple[Spend, ...] = ()  # per scope, right after the reservation
     started_s: float  # monotonic time of the reservation, for wall time on failure
     pricing: FrozenDict[str, ModelPrice]  # the snapshot's prices: settled at reservation terms
+    gpu_metered: bool = True  # False for a remote LLM upstream: no GPU time is ours to charge
     policy_revision: str
     soft_limit_pct: float
 

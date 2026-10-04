@@ -54,6 +54,8 @@ make smoke     # demo traffic through the running stack, so the dashboards have 
 make demo-up   # the stack plus the demo overlay (demo-web), then prints the Grafana URL
 make demo      # the 7-scene demo against it; exit 1 if any scene deviates (see "Demo")
 make grafana   # the Grafana URL
+make remote-up # engineering: LLM calls to OpenRouter (ZDR only) instead of Ollama (see below)
+make remote-off  # back to the local Ollama upstream
 ```
 
 Run the gateway outside compose (two listeners: agent API on 127.0.0.1:8080, operator API on
@@ -71,6 +73,32 @@ curl -s -X POST localhost:9090/auth/demo-token -H 'content-type: application/jso
 The gateway refuses to start without a valid policy or strong secrets. A policy edit that
 fails validation is logged and counted (`acl_policy_reloads_total{result="invalid"}`), and the last valid
 version stays in force.
+
+### Remote LLM upstream (engineering only)
+
+CPU-only Ollama runs qwen3:8b at a few tokens a second. For engineering, `make remote-up`
+starts the stack with `compose.remote.yml`: the gateway sends `generate` and judge calls to
+`upstreams.llm_remote` in `config/policy.yaml` (OpenRouter) instead of `upstreams.llm`. Put
+`OPENROUTER_API_KEY=...` in `.env` first; it reaches the gateway container only, and the
+gateway refuses to start without it (never a silent fall back to Ollama). `make remote-off`
+returns to the local default, which is what the product ships.
+
+- **Data.** Prompts and judge content leave the machine, after the pre controls: `pii` masks,
+  `secrets` and `prompt_injection` block, before the upstream call. Every request carries the
+  policy's `extra_body` (`provider: {zdr: true, data_collection: deny}`), which the agent
+  cannot override; OpenRouter answers an error rather than route to an endpoint that retains
+  data, and the gateway turns that into a generic 502 `upstream_error`. Router extensions in
+  the agent's request (`models`, `provider`, `plugins`, ...) are dropped.
+- **Models.** Grants, pricing, `model_allowlist` and audit keep the logical id (`qwen3:8b`);
+  `model_map` names the provider model it is sent as, and an unmapped model is refused
+  (`model_not_mapped`). qwen3:8b maps to `qwen/qwen3-30b-a3b-instruct-2507`: OpenRouter has no
+  zero-data-retention endpoint for qwen3-8b, and the hybrid Qwen3 models that have one keep
+  thinking whatever `reasoning` says.
+- **Visibility.** `/healthz` reports `llm_upstream` and its host, every LLM audit entry carries
+  `"upstream": "remote"`, `acl_llm_upstream_info{upstream}` is 1 for the active one, and the
+  gateway logs a warning at startup.
+- **Budgets.** Remote calls are charged tokens at `llm_remote.pricing` and no GPU time; their
+  deadline stays `limits.upstream_timeout_s`.
 
 ## Demo
 

@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 from pydantic import (
     AfterValidator,
     Field,
+    JsonValue,
     PositiveFloat,
     PositiveInt,
     StringConstraints,
@@ -78,7 +79,26 @@ type ResourceTemplate = Annotated[str, AfterValidator(_resource_template)]
 # --------------------------------------------------------------------------- upstreams
 
 
-class LlmUpstream(FrozenModel):
+def _https_url(value: str) -> str:
+    if urlsplit(value).scheme != "https":
+        msg = f"{value!r} must be an https URL: prompts to a remote upstream cross the internet"
+        raise ValueError(msg)
+    return value
+
+
+type HttpsUrl = Annotated[str, AfterValidator(_http_url), AfterValidator(_https_url)]
+# How an upstream takes the OpenAI ``reasoning_effort`` field: as is (``openai``: OpenAI,
+# Ollama, LiteLLM), or translated to OpenRouter's ``reasoning`` object (``openrouter``).
+type ReasoningStyle = Literal["openai", "openrouter"]
+
+
+class _LlmUpstreamBase(FrozenModel):
+    reasoning: ReasoningStyle = "openai"
+
+
+class LlmUpstream(_LlmUpstreamBase):
+    """The local LLM upstream (``upstreams.llm``): the product default."""
+
     base_url: HttpUrl
     api_key_env: EnvVarName | None = None
 
@@ -116,11 +136,6 @@ class McpServer(FrozenModel):
                 msg = f"tool {name!r}: the {self.adapter} adapter needs a resource template"
                 raise ValueError(msg)
         return self
-
-
-class Upstreams(FrozenModel):
-    llm: LlmUpstream
-    mcp: FrozenDict[Name, McpServer] = Field(default_factory=FrozenDict[str, McpServer])
 
 
 # --------------------------------------------------------------------- roles and agents
@@ -350,6 +365,82 @@ def _model_identifier(value: str) -> str:
 # Keyed by the model identifier the call is authorized for (``generate:model:<id>``). A model
 # without an entry costs nothing, but its tokens and GPU time still count against budgets.
 type PricedModel = Annotated[str, AfterValidator(_model_identifier)]
+
+
+# --------------------------------------------------------------------------- upstreams (2)
+
+# A provider's model id as the remote upstream names it, e.g. ``qwen/qwen3-14b``.
+type ProviderModelId = Annotated[
+    str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._/:@-]*$", max_length=200)
+]
+# Request fields the gateway owns: ``extra_body`` may not set them (the model is mapped, the
+# token cap is the budget's, streaming is always off upstream, reasoning is translated).
+EXTRA_BODY_RESERVED: frozenset[str] = frozenset(
+    {
+        "model",
+        "models",
+        "messages",
+        "stream",
+        "stream_options",
+        "max_tokens",
+        "max_completion_tokens",
+        "n",
+        "tools",
+        "tool_choice",
+        "reasoning",
+        "reasoning_effort",
+    }
+)
+
+
+class RemoteLlmUpstream(_LlmUpstreamBase):
+    """An opt-in LLM upstream outside the machine (``upstreams.llm_remote``), selected only by
+    ``ACL_LLM_UPSTREAM=remote``. Engineering use: the product default stays ``upstreams.llm``.
+
+    Inside the gateway every model keeps its logical id (grants, pricing keys,
+    ``model_allowlist``, audit); ``model_map`` names the provider model each logical id is sent
+    as, and an unmapped model is refused, never passed through. ``extra_body`` is merged into
+    every request and wins over the agent's fields (e.g. OpenRouter's
+    ``provider: {zdr: true, data_collection: deny}``). ``pricing`` replaces the top-level price
+    of a logical id while this upstream is selected (remote calls have no GPU time).
+    """
+
+    base_url: HttpsUrl
+    api_key_env: EnvVarName  # required: the key lives only in the gateway's environment
+    model_map: FrozenDict[PricedModel, ProviderModelId] = Field(min_length=1)
+    extra_body: FrozenDict[str, JsonValue] = Field(default_factory=FrozenDict[str, JsonValue])
+    pricing: FrozenDict[PricedModel, ModelPrice] = Field(
+        default_factory=FrozenDict[str, ModelPrice]
+    )
+
+    @model_validator(mode="after")
+    def _coherent(self) -> Self:
+        providers = list(self.model_map.values())
+        if len(set(providers)) != len(providers):
+            msg = "model_map must map each provider model from one logical id (answers map back)"
+            raise ValueError(msg)
+        if reserved := sorted(EXTRA_BODY_RESERVED.intersection(self.extra_body)):
+            msg = f"extra_body may not set gateway-owned request fields {reserved}"
+            raise ValueError(msg)
+        if unmapped := sorted(set(self.pricing) - set(self.model_map)):
+            msg = f"pricing names models without a model_map entry: {unmapped}"
+            raise ValueError(msg)
+        return self
+
+    def provider_model(self, logical: str) -> str | None:
+        return self.model_map.get(logical)
+
+    def logical_model(self, provider: str) -> str | None:
+        return next((k for k, v in self.model_map.items() if v == provider), None)
+
+
+type AnyLlmUpstream = LlmUpstream | RemoteLlmUpstream
+
+
+class Upstreams(FrozenModel):
+    llm: LlmUpstream
+    llm_remote: RemoteLlmUpstream | None = None
+    mcp: FrozenDict[Name, McpServer] = Field(default_factory=FrozenDict[str, McpServer])
 
 
 # ----------------------------------------------------------------------------- controls

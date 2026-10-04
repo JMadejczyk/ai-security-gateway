@@ -1,7 +1,18 @@
 """LLM upstream: any OpenAI-compatible base URL (Ollama, LiteLLM, ...) from the policy snapshot.
 
-- The agent's headers are never forwarded: requests carry only the router key named by
-  ``upstreams.llm.api_key_env``, if any.
+- Two upstreams may be declared: ``upstreams.llm`` (local, the default) and
+  ``upstreams.llm_remote`` (an opt-in remote router such as OpenRouter). The process selects
+  one with ``ACL_LLM_UPSTREAM``; there is no fallback from one to the other.
+- Inside the gateway models keep their logical ids. For the remote upstream the request's
+  model is mapped to the provider id on the way out (an unmapped model is refused,
+  ``model_not_mapped``) and the answer's model back to the logical id on the way in, so
+  ``model_allowlist`` compares logical ids. Only OpenAI chat-completion fields are forwarded
+  to it (router extensions such as ``models``, ``provider`` or ``plugins`` from the agent are
+  dropped), then the policy's ``extra_body`` is merged in and wins.
+- ``reasoning_effort`` is translated per upstream (``reasoning: openrouter``): ``none`` becomes
+  ``reasoning: {"enabled": false}``, any other effort ``reasoning: {"effort": ...}``.
+- The agent's headers are never forwarded: requests carry only the router key named by the
+  selected upstream's ``api_key_env``, if any.
 - The upstream is always called with ``stream: false``. Post controls need the complete
   answer, and an SSE chunk that reached the agent cannot be retracted, so a streaming agent
   gets the approved answer re-emitted as ``chat.completion.chunk`` events (SPEC "Streaming").
@@ -9,17 +20,21 @@
   generic `UpstreamError`, never with upstream text.
 """
 
+import copy
 import json
 import logging
 import os
 import time
-from collections.abc import Iterator, Mapping
-from typing import Any, Final
+from collections.abc import Callable, Iterator, Mapping
+from typing import Any, Final, cast
+from urllib.parse import urlsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from gateway.core.types import LlmUpstreamKind
 from gateway.policy.loader import PolicySnapshot
+from gateway.policy.schema import AnyLlmUpstream, Policy, RemoteLlmUpstream
 from gateway.upstream import (
     TokenUsage,
     Upstream,
@@ -33,6 +48,92 @@ logger = logging.getLogger(__name__)
 
 SSE_CONTENT_CHARS: Final = 64  # content characters per re-emitted chunk
 _MESSAGE_CORE_FIELDS: Final = frozenset({"role", "content", "tool_calls"})
+# OpenAI chat-completion request fields a remote upstream receives from the agent's payload.
+# Everything else is dropped: a router's own extensions (OpenRouter's `models` fallbacks,
+# `provider` routing, `plugins` such as web search, `transforms`, `route`) would let the agent
+# pick another model, relax data-retention routing or open egress the policy never granted.
+REMOTE_FORWARDED_FIELDS: Final = frozenset(
+    {
+        "model",
+        "messages",
+        "temperature",
+        "top_p",
+        "max_tokens",
+        "max_completion_tokens",
+        "stop",
+        "seed",
+        "presence_penalty",
+        "frequency_penalty",
+        "logit_bias",
+        "logprobs",
+        "top_logprobs",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "response_format",
+        "reasoning_effort",
+    }
+)
+
+
+class ModelNotMappedError(UpstreamError):
+    """The remote upstream has no provider model for this logical id: refused before egress."""
+
+    status_code = 400
+
+    def __init__(self) -> None:
+        super().__init__("model_not_mapped")
+        self.message = "the model is not available on the selected upstream"
+
+
+def selected_upstream(policy: Policy, kind: LlmUpstreamKind) -> AnyLlmUpstream:
+    """The declared upstream ``kind`` selects. Raises `ValueError` when it is not declared."""
+    if kind is LlmUpstreamKind.LOCAL:
+        return policy.upstreams.llm
+    if policy.upstreams.llm_remote is None:
+        msg = "ACL_LLM_UPSTREAM=remote, but the policy declares no upstreams.llm_remote"
+        raise ValueError(msg)
+    return policy.upstreams.llm_remote
+
+
+def require_upstream(kind: LlmUpstreamKind) -> Callable[[Policy], None]:
+    """A `PolicyLoader` requirement: the selected upstream is declared (startup and reloads)."""
+
+    def check(policy: Policy) -> None:
+        selected_upstream(policy, kind)
+
+    return check
+
+
+def outgoing_request(payload: Mapping[str, Any], upstream: AnyLlmUpstream) -> dict[str, Any]:
+    """The body sent to ``upstream`` for an approved request (always ``stream: false``)."""
+    body = {key: value for key, value in payload.items() if key != "stream_options"}
+    if isinstance(upstream, RemoteLlmUpstream):
+        body = {key: value for key, value in body.items() if key in REMOTE_FORWARDED_FIELDS}
+        logical = body.get("model")
+        provider = upstream.provider_model(logical) if isinstance(logical, str) else None
+        if provider is None:
+            raise ModelNotMappedError
+        body["model"] = provider
+        body.update(cast("dict[str, Any]", copy.deepcopy(dict(upstream.extra_body))))
+    if upstream.reasoning == "openrouter" and "reasoning_effort" in body:
+        effort = body.pop("reasoning_effort")
+        body["reasoning"] = {"enabled": False} if effort == "none" else {"effort": effort}
+    body["stream"] = False
+    return body
+
+
+def incoming_completion(data: dict[str, Any], upstream: AnyLlmUpstream) -> dict[str, Any]:
+    """The upstream's answer with its model named by logical id where the map says so.
+
+    A provider id outside the map stays as reported, so ``model_allowlist`` sees a mismatch
+    (fail closed) unless the operator lists it as an alias."""
+    model = data.get("model")
+    if isinstance(upstream, RemoteLlmUpstream) and isinstance(model, str):
+        logical = upstream.logical_model(model)
+        if logical is not None:
+            return {**data, "model": logical}
+    return data
 
 
 class _Lenient(BaseModel):
@@ -92,12 +193,29 @@ class LLMProxy(Upstream):
     def __init__(
         self,
         *,
+        kind: LlmUpstreamKind = LlmUpstreamKind.LOCAL,
         env: Mapping[str, str] | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
+        self._kind = kind
         self._env = env if env is not None else os.environ
         self._transport = transport
         self._client: httpx.AsyncClient | None = None
+
+    @property
+    def kind(self) -> LlmUpstreamKind:
+        return self._kind
+
+    def upstream(self, snapshot: PolicySnapshot) -> AnyLlmUpstream:
+        """The selected upstream under ``snapshot`` (reloads cannot drop it: `require_upstream`)."""
+        try:
+            return selected_upstream(snapshot.policy, self._kind)
+        except ValueError:
+            logger.error("the selected LLM upstream (%s) is not declared", self._kind.value)  # noqa: TRY400 -- configuration message, no traceback needed
+            raise UpstreamError("upstream_misconfigured") from None
+
+    def host(self, snapshot: PolicySnapshot) -> str:
+        return urlsplit(self.upstream(snapshot).base_url).hostname or ""
 
     async def start(self) -> None:
         if self._client is None:
@@ -114,22 +232,23 @@ class LLMProxy(Upstream):
     async def execute(self, payload: object, snapshot: PolicySnapshot) -> UpstreamResult:
         if not isinstance(payload, dict):
             raise UpstreamError("upstream_invalid_request")
-        body: dict[str, Any] = {
-            key: value
-            for key, value in payload.items()  # pyright: ignore[reportUnknownVariableType] -- JSON object
-            if key != "stream_options"  # only valid with stream: true
-        }
-        body["stream"] = False
+        upstream = self.upstream(snapshot)
+        logical = cast("dict[str, Any]", payload).get("model")
+        body = outgoing_request(cast("dict[str, Any]", payload), upstream)
         started = time.perf_counter()
-        data = await self._send("POST", "/chat/completions", snapshot, body=body)
+        sent = await self._send("POST", "/chat/completions", snapshot, body=body)
         elapsed = time.perf_counter() - started
+        if isinstance(sent, dict) and "error" in sent:  # an error object with a 200 status
+            logger.warning("upstream answered an error object with status 200")
+            raise UpstreamError("upstream_error")
         try:
-            completion = ChatCompletion.model_validate(data)
+            completion = ChatCompletion.model_validate(sent)
         except ValidationError:
             raise UpstreamError("upstream_invalid_response") from None
+        data = incoming_completion(cast("dict[str, Any]", sent), upstream)
         usage = (
             TokenUsage(
-                model=completion.model or str(body.get("model", "")),
+                model=str(logical) if isinstance(logical, str) else "",
                 prompt_tokens=completion.usage.prompt_tokens,
                 completion_tokens=completion.usage.completion_tokens,
                 total_tokens=completion.usage.total_tokens,
@@ -140,7 +259,15 @@ class LLMProxy(Upstream):
         return UpstreamResult(body=data, elapsed_s=elapsed, usage=usage)
 
     async def list_models(self, snapshot: PolicySnapshot) -> list[dict[str, Any]]:
-        """The upstream's ``/models`` entries, as returned."""
+        """The upstream's ``/models`` entries, as returned; for the remote upstream, its mapped
+        logical ids only (a router lists hundreds of models the policy never named)."""
+        upstream = self.upstream(snapshot)
+        if isinstance(upstream, RemoteLlmUpstream):
+            owner = urlsplit(upstream.base_url).hostname or "remote"
+            return [
+                {"id": logical, "object": "model", "owned_by": owner}
+                for logical in upstream.model_map
+            ]
         data = await self._send("GET", "/models", snapshot)
         try:
             models = ModelList.model_validate(data)
@@ -148,10 +275,10 @@ class LLMProxy(Upstream):
             raise UpstreamError("upstream_invalid_response") from None
         return [card.model_dump(mode="json") for card in models.data]
 
-    def _headers(self, snapshot: PolicySnapshot) -> dict[str, str]:
+    def _headers(self, upstream: AnyLlmUpstream) -> dict[str, str]:
         # identity only: a compressed body would be inflated before the size cap could see it.
         headers = {"accept": "application/json", "accept-encoding": "identity"}
-        key_env = snapshot.policy.upstreams.llm.api_key_env
+        key_env = upstream.api_key_env
         if key_env is not None:
             key = self._env.get(key_env)
             if not key:
@@ -167,14 +294,15 @@ class LLMProxy(Upstream):
             msg = "LLMProxy.start() was not awaited"
             raise RuntimeError(msg)
         limits = snapshot.policy.limits
-        url = snapshot.policy.upstreams.llm.base_url.rstrip("/") + path
+        upstream = self.upstream(snapshot)
+        url = upstream.base_url.rstrip("/") + path
         raw = bytearray()
         try:
             async with self._client.stream(
                 method,
                 url,
                 json=body,
-                headers=self._headers(snapshot),
+                headers=self._headers(upstream),
                 timeout=limits.upstream_timeout_s,
             ) as response:
                 if not response.is_success:

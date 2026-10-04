@@ -11,7 +11,9 @@ from decimal import ROUND_CEILING, Decimal
 from typing import Final
 
 from gateway.budget.model import MS_PER_SECOND, NANO_USD_PER_USD
-from gateway.policy.schema import ModelPrice
+from gateway.core.frozen import FrozenDict
+from gateway.core.types import LlmUpstreamKind
+from gateway.policy.schema import ModelPrice, Policy
 
 _FREE: Final = ModelPrice()
 _TOKENS_PER_PRICE_UNIT: Final = 1_000
@@ -48,6 +50,15 @@ class CostModel:
         per_ms = _exact(price) * NANO_USD_PER_USD / MS_PER_SECOND
         gpu_ms = int(Decimal(budget_nano_usd) / per_ms)  # floor: rounding up could overspend
         return gpu_ms if self.gpu_cost(model, gpu_ms=gpu_ms) <= budget_nano_usd else gpu_ms - 1
+
+
+def upstream_pricing(policy: Policy, kind: LlmUpstreamKind) -> FrozenDict[str, ModelPrice]:
+    """Prices in effect for the selected LLM upstream: the top-level table, with
+    ``upstreams.llm_remote.pricing`` replacing a logical id's entry while remote is selected."""
+    remote = policy.upstreams.llm_remote
+    if kind is LlmUpstreamKind.LOCAL or remote is None or not remote.pricing:
+        return policy.pricing
+    return FrozenDict({**policy.pricing, **remote.pricing})
 
 
 def _exact(price: float) -> Decimal:

@@ -261,10 +261,13 @@ def create_operator_app(container: GatewayContainer) -> FastAPI:
         # Always 200: with Redis down the gateway is still the one serving (fail-closed)
         # refusals, so it must keep running; `degraded` and acl_budget_store_up say why.
         budget_store = await container.budgets.status()
+        snapshot = container.policy_store.current
         return {
             "status": "degraded" if budget_store == "down" else "ok",
-            "policy_revision": container.policy_store.current.revision,
+            "policy_revision": snapshot.revision,
             "budget_store": budget_store,
+            "llm_upstream": container.llm.kind.value,
+            "llm_upstream_host": container.llm.host(snapshot),
         }
 
     @app.get("/metrics")

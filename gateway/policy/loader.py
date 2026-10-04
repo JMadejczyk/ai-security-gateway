@@ -2,7 +2,7 @@
 
 import hashlib
 import json
-from collections.abc import Hashable
+from collections.abc import Callable, Hashable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -115,8 +115,17 @@ def _format_validation_error(error: ValidationError) -> str:
 class PolicyLoader:
     """Safe YAML loading, size cap and schema validation."""
 
-    def __init__(self, *, max_bytes: int = MAX_POLICY_BYTES) -> None:
+    def __init__(
+        self,
+        *,
+        max_bytes: int = MAX_POLICY_BYTES,
+        requirement: Callable[[Policy], None] | None = None,
+    ) -> None:
+        """``requirement`` is a deployment check beyond the schema (it raises `ValueError`), e.g.
+        that the LLM upstream the process selected is declared. It applies at startup and to
+        every reload: a policy failing it never replaces a working one."""
         self._max_bytes = max_bytes
+        self._requirement = requirement
 
     def load(self, path: Path) -> PolicySnapshot:
         """Read and validate the policy file at ``path``."""
@@ -153,6 +162,11 @@ class PolicyLoader:
             policy = Policy.model_validate(document)
         except ValidationError as exc:
             raise PolicyLoadError(_format_validation_error(exc), source=source) from exc
+        if self._requirement is not None:
+            try:
+                self._requirement(policy)
+            except ValueError as exc:
+                raise PolicyLoadError(str(exc), source=source) from exc
         return PolicySnapshot(
             policy=policy,
             digest=canonical_digest(policy),

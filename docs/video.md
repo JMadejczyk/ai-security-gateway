@@ -198,14 +198,19 @@ Voiceover lengths are counted at about 150 words a minute. Captions are lower-th
   leaves the machine. The request stops at the gateway, before any model sees it. And personal
   data, like this Polish national ID number, is masked before the model reads it. The model
   works with a placeholder, so it can't leak what it never saw."
-- **Type in opencode** (anna):
+- **Type in opencode** (anna), each prompt **in its own launch**:
   1. `My AWS access key is AKIAQ3EGRVW6XKZT4M7N. Which region is it for?`
-  2. `Convert this ticket line to upper case: caller PESEL 44051401359, invoice resend.`
+  2. Quit, relaunch `make opencode AS=anna`, then
+     `Convert this ticket line to upper case: caller PESEL 44051401359, invoice resend.`
+
+  opencode resends the whole chat history on every turn. In the same launch the second turn
+  still carries the key, so it is blocked as `secret_detected` as well.
 - **On screen**:
   - opencode: the first prompt fails in about 3 s (opencode startup; the gateway itself
     answers in milliseconds) with the red banner `Error: blocked by policy: secret_detected`.
-    No model is called. The second is answered `CALLER PESEL [REDACTED:PL_PESEL], INVOICE RESEND.` Zoom
-    into `[REDACTED:PL_PESEL]`. The model can only upper-case what it received.
+    No model is called. The second is answered `CALLER PESEL [REDACTED:PL_PESEL], INVOICE RESEND.`
+    opencode renders the mask as a link, so the brackets disappear on screen. Zoom into
+    `REDACTED:PL_PESEL`. The model can only upper-case what it received.
   - Grafana Recording: Last decisions shows the `secret_detected` block and the redact row.
     The bottom row counts the redaction under Redacted.
 - **Caption**: `Secrets blocked. PESEL masked.`
@@ -248,10 +253,9 @@ Voiceover lengths are counted at about 150 words a minute. Captions are lower-th
 
 ### 2:35–3:00 The totals, then the end card (`make record SCENE=6`)
 
-- **Voiceover** (55 words): "One gateway in front of any model and any tool. Who is
+- **Voiceover** (41 words): "One gateway in front of any model and any tool. Who is
   asking, what they may touch, how risky the session is, and when a human must decide, all in
-  one place, on your own machine. Fifteen controls and over three thousand tests. The rule
-  checks take milliseconds; the AI checks, up to a second."
+  one place, on your own machine. Fifteen controls, over three thousand tests."
 - **On screen**: the Recording dashboard's bottom row as the closing shot: Requests, Redacted,
   **Rule checks p95 (live)** and **AI checks p95 (live)**. Then the end card,
   which the coordinator owns in the deck. For a wider shot, `make record SCENE=6` also
@@ -266,9 +270,9 @@ Voiceover lengths are counted at about 150 words a minute. Captions are lower-th
     exactly those words.
   - The live **Rule checks p95** on screen is tens of milliseconds, about 48 ms after
     `make smoke`. Most of it is sql_guard asking Postgres for a query plan (about 25 ms) and
-    egress's DNS lookup (about 9 ms); without those two it's about 4 ms. **AI checks p95** is
-    0.1–2 s, depending on whether the remote judge ran. So the voiceover says "milliseconds"
-    and "up to a second", which is true of what the viewer sees.
+    egress's DNS lookup (about 9 ms); without those two it's about 4 ms. **AI checks p95** was
+    0.2–4.7 s in the 2026-10-04 takes, depending on whether the remote judge ran. "Up to a
+    second" was not true of the screen, so the voiceover makes no latency claim.
   - The 1.6 ms figure (p95 1.63 ms, `docs/reports/perf.md`) is the benchmark: rule checks on
     a typical prompt, with mocked upstreams and no database or DNS. If it goes on a card,
     label it "rule checks 1.6 ms p95 (benchmark)". Never write a bare "1.6 ms overhead".
@@ -298,7 +302,7 @@ Voiceover lengths are counted at about 150 words a minute. Captions are lower-th
 
 ## Voiceover script (one take)
 
-390 words, about 2:36 at 150 words a minute. That leaves roughly 25 s for the title and
+376 words, about 2:30 at 150 words a minute. That leaves roughly 25 s for the title and
 end cards and for the pauses while results land on screen.
 
 AI assistants now act as us. They read our databases, browse the web and use our tools, with
@@ -332,5 +336,4 @@ marker on the dashboard.
 
 One gateway in front of any model and any tool. Who is asking, what they may touch, how risky
 the session is, and when a human must decide, all in one place, on your own machine. Fifteen
-controls and over three thousand tests. The rule checks take milliseconds; the AI checks, up
-to a second.
+controls, over three thousand tests.

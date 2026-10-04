@@ -70,7 +70,7 @@ page must not turn it against you. Firewalls and API keys see none of this.
 -   :material-test-tube: **Proven both ways**
 
     Each control has passing *allowed* and *blocked* tests; a 73-case attack corpus;
-    `make test` in about 90 seconds.
+    `make test` in about 75 seconds.
 
 </div>
 

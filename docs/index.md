@@ -28,10 +28,11 @@ Rules and AI checks decide each call. One attack changes what the agent may do f
   <div><b>100%</b><span>local by default</span></div>
 </div>
 
-<a class="showcase-link" href="https://github.com/JMadejczyk/ai-security-gateway/releases/download/v1.0.0/ai-security-gateway-showcase.mp4" title="Watch the 2:42 showcase (MP4)">
-  <img class="showcase" src="assets/showcase-poster.jpg" alt="AI Security Gateway showcase video">
-  <span class="play">▶ Watch the 2:42 showcase</span>
-</a>
+<div class="video">
+  <iframe src="https://www.youtube-nocookie.com/embed/vws1KhS0DEI?rel=0" title="AI Security Gateway showcase"
+    allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; fullscreen"
+    referrerpolicy="strict-origin-when-cross-origin" allowfullscreen loading="lazy"></iframe>
+</div>
 
 ## Why
 

@@ -73,7 +73,7 @@ venvPath = "."
 venv = ".venv"
 include = ["gateway", "tests", "grafana", "observability", "demo/agent", "demo/orchestrator", "demo/run_demo.py"]
 typeCheckingMode = "basic"
-strict = ["gateway", "grafana", "observability", "demo/agent", "demo/orchestrator", "demo/run_demo.py"]
+strict = ["gateway", "grafana", "observability", "demo/agent", "demo/orchestrator", "demo/run_demo.py", "demo/opencode"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

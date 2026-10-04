@@ -484,3 +484,11 @@ async def test_a_reported_cost_above_the_ceiling_is_capped_and_logged(remote, op
 async def test_a_malformed_reported_cost_settles_at_the_ceiling(remote, openrouter, cost):
     billed(openrouter, cost)
     assert await settled_cost(remote) == pytest.approx(CEILING_USD, abs=1e-12)
+
+
+async def test_token_metric_names_the_remote_model(remote, answers):
+    labels = {"user": "anna@demo", "agent": "databot", "model": LOGICAL}
+    before = REGISTRY.get_sample_value("acl_tokens_total", labels) or 0.0
+    assert (await ask(remote)).status_code == 200
+    # Priced in llm_remote.pricing (not the top-level table): its own bounded label, not `other`.
+    assert REGISTRY.get_sample_value("acl_tokens_total", labels) == before + 19

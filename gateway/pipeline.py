@@ -42,6 +42,7 @@ from gateway.approvals.oversight import (
 from gateway.budget.ledger import BudgetLedger
 from gateway.budget.metering import charged_tokens
 from gateway.budget.model import BudgetedCall, BudgetRefusalError
+from gateway.budget.pricing import upstream_pricing
 from gateway.canonical import canonical_bytes as _canonical_bytes
 from gateway.clock import Clock, utc_now
 from gateway.controls.registry import ControlRegistry
@@ -738,7 +739,9 @@ class Pipeline:
         if call.ctx.flags_overflowed:  # evicted flags could be this call's: hold every call
             reason = INTENT_FLAGS_OVERFLOW
         elif call.ctx.flagged_tool_calls and not mcp_flag_candidates(
-            _parse_json_object(trace.call.body), *(step.original_payload for step in trace.steps)
+            _parse_json_object(trace.call.body),
+            *(step.original_payload for step in trace.steps),
+            server=trace.call.server,
         ).isdisjoint(call.ctx.flagged_tool_calls):
             reason = INTENT_FLAGGED
         else:
@@ -1118,7 +1121,8 @@ class Pipeline:
         if trace.upstream is not None and trace.upstream.usage is not None:
             usage = trace.upstream.usage
             # Models without a pricing entry share `other`: a wildcard grant must not mint labels.
-            model = bounded(_model_label(trace.executed), snapshot.policy.pricing)
+            priced = upstream_pricing(snapshot.policy, self._recorder.llm_upstream)
+            model = bounded(_model_label(trace.executed), priced)
             record_tokens(user, agent, model, charged_tokens(usage))
 
         latency = AuditLatency(

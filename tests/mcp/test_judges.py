@@ -190,6 +190,27 @@ async def test_misaligned_tool_call_is_released_and_its_mcp_call_needs_approval(
     assert len(stack.log.of("query")) == 1
 
 
+@INTENT_HOLD
+@pytest.mark.parametrize("exposed", ["sales_db_query", "mcp__sales_db__query"])
+async def test_a_flag_matches_the_mcp_tool_under_a_clients_prefixed_name(
+    stack: MCPStack, llm: ScriptedLLM, exposed: str
+):
+    """MCP clients show a server's tools to their model under prefixed names (opencode
+    `<server>_<tool>`, Claude Code `mcp__<server>__<tool>`). A flag raised on that name must
+    still hold the matching ``tools/call`` on the server (live finding with opencode)."""
+    llm.aligned = lambda call: False
+    llm.agent_answer = completion(None, tool_calls=[tool_call(exposed, {"sql": DUMP_PAYMENTS})])
+    (db,) = await connect_all(stack, ANNA, "sales_db")
+    assert (await ask(stack.gateway, db.token)).status_code == 200
+
+    held = await db.call("query", sql=DUMP_PAYMENTS)
+    assert error_text(held).startswith("approval_required")
+    assert stack.log.of("query") == []
+    assert any(
+        v["reason_code"] == "intent_flagged" for v in stack.gateway.audit_entries()[-1]["verdicts"]
+    )
+
+
 @INTENT_ALLOW
 async def test_aligned_tool_call_flags_nothing(stack: MCPStack, llm: ScriptedLLM):
     llm.agent_answer = completion(None, tool_calls=[tool_call("query", {"sql": COUNT_CUSTOMERS})])

@@ -24,6 +24,9 @@ from typing import Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
+from gateway.core.catalog import CONTROL_CATALOG
+from gateway.core.types import ControlKind
+
 DASHBOARDS_DIR: Final = Path(__file__).resolve().parent / "dashboards"
 # `acl_approvals_total` counts every state an approval reaches; the panel shows the request
 # ("pending", the first state) and the outcomes, not the intermediate approved/executing steps.
@@ -40,7 +43,7 @@ GRID_COLUMNS: Final = 24
 TAG: Final = "acl"
 
 type DatasourceType = Literal["prometheus", "loki"]
-type PanelType = Literal["stat", "timeseries", "bargauge", "table", "logs"]
+type PanelType = Literal["stat", "gauge", "timeseries", "bargauge", "table", "logs"]
 type Json = dict[str, JsonValue]
 
 
@@ -49,12 +52,13 @@ class _Model(BaseModel):
 
 
 class DatasourceRef(_Model):
-    type: DatasourceType
+    type: DatasourceType | Literal["datasource"]  # "datasource": Grafana's built-in Mixed
     uid: str
 
 
 PROMETHEUS: Final = DatasourceRef(type="prometheus", uid="${datasource}")
 LOKI: Final = DatasourceRef(type="loki", uid="${loki}")
+MIXED: Final = DatasourceRef(type="datasource", uid="-- Mixed --")  # each target names its own
 _SESSION_FILTER: Final = '|= "$session_id"'  # cheap line filter before the json parser
 
 
@@ -66,6 +70,7 @@ class Query(_Model):
     legend: str | None = None
     instant: bool = False
     table: bool = False  # Prometheus ``format: table``
+    max_lines: int | None = None  # Loki log queries: newest N lines only
 
     def target(self, ref_id: str) -> Json:
         body: Json = {
@@ -78,6 +83,8 @@ class Query(_Model):
             body["legendFormat"] = self.legend
         if self.datasource.type == "loki":
             body["queryType"] = "instant" if self.instant else "range"
+            if self.max_lines is not None:
+                body["maxLines"] = self.max_lines
         else:
             body["instant"] = self.instant
             body["range"] = not self.instant
@@ -89,8 +96,14 @@ def prom(expr: str, legend: str | None = None, *, instant: bool = False) -> Quer
     return Query(datasource=PROMETHEUS, expr=expr, legend=legend, instant=instant)
 
 
-def loki(expr: str, legend: str | None = None, *, instant: bool = False) -> Query:
-    return Query(datasource=LOKI, expr=expr, legend=legend, instant=instant)
+def loki(
+    expr: str,
+    legend: str | None = None,
+    *,
+    instant: bool = False,
+    max_lines: int | None = None,
+) -> Query:
+    return Query(datasource=LOKI, expr=expr, legend=legend, instant=instant, max_lines=max_lines)
 
 
 class Threshold(_Model):
@@ -139,9 +152,11 @@ class Panel(_Model):
 
     @property
     def datasource(self) -> DatasourceRef:
-        if len({query.datasource.uid for query in self.queries}) != 1:
-            msg = f"panel {self.title!r} needs exactly one data source"
+        if not self.queries:
+            msg = f"panel {self.title!r} has no query"
             raise ValueError(msg)
+        if len({query.datasource.uid for query in self.queries}) > 1:
+            return MIXED
         return self.queries[0].datasource
 
     def render(self, panel_id: int, x: int, y: int) -> Json:
@@ -217,6 +232,14 @@ def _default_options(kind: PanelType) -> Json:
             return {
                 "legend": {"displayMode": "list", "placement": "bottom", "showLegend": True},
                 "tooltip": {"mode": "multi", "sort": "desc"},
+            }
+        case "gauge":
+            return {
+                "reduceOptions": reduce,
+                "orientation": "auto",
+                "showThresholdLabels": False,
+                "showThresholdMarkers": True,
+                "sizing": "auto",
             }
         case "table":
             return {"showHeader": True, "cellHeight": "sm", "footer": {"show": False}}
@@ -345,6 +368,8 @@ class Dashboard(_Model):
     description: str
     panels: tuple[Panel, ...]
     session_variable: bool = False
+    time_from: str = "now-15m"
+    dashboard_links: bool = True  # the row of links to the other dashboards
 
     def render(self) -> Json:
         variables: list[JsonValue] = [
@@ -361,7 +386,7 @@ class Dashboard(_Model):
             "editable": False,
             "graphTooltip": 1,
             "timezone": "browser",
-            "time": {"from": "now-15m", "to": "now"},
+            "time": {"from": self.time_from, "to": "now"},
             "refresh": "5s",
             "timepicker": {"refresh_intervals": ["5s", "10s", "30s", "1m", "5m"]},
             "schemaVersion": 41,
@@ -382,7 +407,9 @@ class Dashboard(_Model):
                     "tooltip": "",
                     "url": "",
                 }
-            ],
+            ]
+            if self.dashboard_links
+            else [],
             "templating": {"list": variables},
             "annotations": {"list": _annotations()},
             "panels": list[JsonValue](Layout().add(*self.panels).panels),
@@ -1280,7 +1307,289 @@ def performance() -> Dashboard:
     )
 
 
-DASHBOARDS: Final = (posture, threats, session_trace, performance)
+# ----------------------------------------------------------------------------- Recording
+
+
+def _value_box(ref_id: str, name: str, steps: tuple[Threshold, ...], **extra: JsonValue) -> Json:
+    """Per-query display name and colours inside a multi-value stat panel."""
+    properties: list[JsonValue] = [
+        {"id": "displayName", "value": name},
+        {"id": "color", "value": {"mode": "thresholds"}},
+        {
+            "id": "thresholds",
+            "value": {"mode": "absolute", "steps": [t.model_dump() for t in steps]},
+        },
+        *({"id": key, "value": value} for key, value in extra.items()),
+    ]
+    return {"matcher": {"id": "byFrameRefID", "options": ref_id}, "properties": properties}
+
+
+def _big_stat(*, value_size: int, title_size: int = 16) -> Json:
+    return {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": False},
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "value_and_name",
+        "orientation": "vertical",
+        "wideLayout": True,
+        "text": {"valueSize": value_size, "titleSize": title_size},
+    }
+
+
+RULE_CONTROLS: Final = tuple(
+    spec.id for spec in CONTROL_CATALOG.values() if spec.kind is ControlKind.DETERMINISTIC
+)
+AI_CONTROLS: Final = tuple(
+    spec.id for spec in CONTROL_CATALOG.values() if spec.kind is ControlKind.SEMANTIC
+)
+
+
+def per_call_check_ms(kind: Literal["rule", "ai"], window: str) -> str:
+    """p95 over calls of the time one call spent in its rule (deterministic) or AI (semantic)
+    checks: each audit entry's ``latency_ms.controls`` summed per call, then the quantile.
+
+    Per-control metric quantiles cannot be added up into a per-call number; the audit line has
+    every control's time for that one call. AI checks count only calls where one ran.
+    """
+    controls = RULE_CONTROLS if kind == "rule" else AI_CONTROLS
+    fields = {f"c{i}": control for i, control in enumerate(controls)}
+    extract = ", ".join(f'{key}="latency_ms.controls.{name}"' for key, name in fields.items())
+    total = "addf " + " ".join(f".{key}" for key in fields)
+    only_ran = ' | ms != "0"' if kind == "ai" else ""
+    return (
+        f'quantile_over_time(0.95, {{job="acl", decision=~".+"}} | json {extract} '
+        f"| label_format ms=`{{{{ {total} }}}}`{only_ran} "
+        f'| unwrap ms | __error__="" {window}) by ()'
+    )
+
+
+def recording() -> Dashboard:
+    """For the pitch video: a ~760x1000 browser slot, read in ten seconds.
+
+    Grafana switches to its single-column (mobile) layout below 769 px (the video's 40 % of
+    1920 is 768), so every panel is full width and the stack is planned to fit 1000 px: risk,
+    compromised, risk over time (with the policy-change annotations), the last six decisions,
+    then blocked/approvals and the closing totals. ``$session_id`` focuses the session panels;
+    empty, they follow every session (the gauge shows the riskiest session's current risk).
+    """
+    focus = '|= "$session_id" | json session_id="session_id"'
+    in_focus = '| session_id=~"$session_id.*" | session_id != ""'
+    risk = f'{{job="acl", decision=~".+"}} {focus}, risk="risk" {in_focus} | risk != ""'
+    unwrapped = f'{risk} | unwrap risk | __error__=""'
+    decisions = (
+        f'{{job="acl", decision=~".+"}} {focus}, principal="principal", action="action", '
+        f'resource="resource", reason="reason_code" {in_focus} '
+        '| label_format who=`{{ .principal | trimSuffix "@demo" | trimPrefix "svc:" }}`, '
+        "call=`{{ .action }} {{ .resource }}`"
+    )
+    tainted = f'{{job="acl", decision=~".+"}} {focus}, taint="taint" {in_focus} | taint="true"'
+    five_min = "[5m]"
+    grey, red, orange, green = (
+        Threshold(color="#2a2d35"),
+        Threshold(color="red", value=1),
+        Threshold(color="orange", value=1),
+        Threshold(color="green"),
+    )
+    return Dashboard(
+        uid="acl-recording",
+        title="Recording",
+        description="Big-number view for the demo video (open with ?kiosk&theme=dark; "
+        "var-session_id=<id> focuses one session).",
+        session_variable=True,
+        time_from="now-5m",
+        dashboard_links=False,
+        panels=(
+            Panel(
+                type="gauge",
+                title="Session risk",
+                description="The session's current risk (latest audit entry); with no "
+                "session_id, the riskiest session in the time range. 0.5: write needs "
+                "approval or the agent is throttled; 0.8: tools frozen.",
+                queries=(
+                    loki(
+                        f"topk(1, last_over_time({unwrapped} [$__range]) by (session_id))",
+                        instant=True,
+                    ),
+                ),
+                width=24,
+                height=5,
+                decimals=2,
+                minimum=0,
+                maximum=1,
+                thresholds=GREEN_AMBER_RED,
+                color_mode="thresholds",
+                no_value="0",
+            ),
+            Panel(
+                type="stat",
+                title="Session marked compromised",
+                description="Untrusted content reached the session (taint). It lasts until "
+                "the session ends; write, delete and egress are removed or held.",
+                queries=(loki(f"sum(count_over_time({tainted} [$__range]))", instant=True),),
+                width=24,
+                height=3,
+                no_value="NO",
+                mappings=(
+                    {
+                        "type": "range",
+                        "options": {
+                            "from": 1,
+                            "to": None,
+                            "result": {"text": "YES: COMPROMISED", "color": "red"},
+                        },
+                    },
+                ),
+                thresholds=(green, red),
+                color_mode="thresholds",
+                options=_big_stat(value_size=44) | {"textMode": "value"},
+            ),
+            Panel(
+                type="timeseries",
+                title="Risk over time",
+                description="Session risk after each call; blue markers are policy reloads.",
+                queries=(loki(f"max(max_over_time({unwrapped} [$__auto]))", "risk"),),
+                width=24,
+                height=3,
+                minimum=0,
+                maximum=1,
+                decimals=1,
+                thresholds=GREEN_AMBER_RED,
+                options={
+                    "legend": {"showLegend": False, "displayMode": "hidden", "placement": "bottom"},
+                    "tooltip": {"mode": "single", "sort": "none"},
+                },
+                overrides=(
+                    {
+                        "matcher": {"id": "byName", "options": "risk"},
+                        "properties": [
+                            {"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}},
+                            {"id": "custom.lineWidth", "value": 3},
+                            {"id": "custom.showPoints", "value": "always"},
+                            {"id": "custom.spanNulls", "value": True},
+                            {"id": "custom.thresholdsStyle", "value": {"mode": "dashed"}},
+                        ],
+                    },
+                ),
+            ),
+            Panel(
+                type="table",
+                title="Last decisions",
+                description="The six newest decisions: time, who, action and resource, the "
+                "verdict and its reason code.",
+                queries=(loki(decisions, max_lines=6),),
+                width=24,
+                height=8,
+                transformations=(*logs_table(("who", "call", "decision", "reason")),),
+                options={"showHeader": False, "cellHeight": "sm", "footer": {"show": False}},
+                overrides=(
+                    {
+                        "matcher": {"id": "byName", "options": "ts"},
+                        "properties": [
+                            {"id": "unit", "value": "time: HH:mm:ss"},
+                            {"id": "custom.width", "value": 82},
+                        ],
+                    },
+                    _column_width("who", 92),
+                    _column_width("decision", 132),
+                    {
+                        "matcher": {"id": "byName", "options": "decision"},
+                        "properties": [
+                            {
+                                "id": "custom.cellOptions",
+                                "value": {"type": "color-background", "mode": "basic"},
+                            },
+                            {
+                                "id": "mappings",
+                                "value": [
+                                    {
+                                        "type": "value",
+                                        "options": {
+                                            "allow": {"color": "green", "index": 0},
+                                            "redact": {"color": "yellow", "index": 1},
+                                            "require_approval": {
+                                                "color": "orange",
+                                                "index": 2,
+                                                "text": "approval",
+                                            },
+                                            "block": {"color": "red", "index": 3},
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                ),
+            ),
+            Panel(
+                type="stat",
+                title="",  # the two boxes name themselves; no header row in a 2-unit panel
+                description="Calls blocked in the last 5 minutes, and operations waiting for a "
+                "human approval right now.",
+                queries=(
+                    prom(
+                        'round(sum(increase(acl_requests_total{decision="block"}'
+                        f"{five_min}))) or vector(0)"
+                    ),
+                    prom("max(acl_approvals_pending) or vector(0)"),
+                ),
+                width=24,
+                height=2,
+                decimals=0,
+                color_mode="thresholds",
+                options=_big_stat(value_size=40),
+                overrides=(
+                    _value_box("A", "Blocked (5 min)", (grey, red)),
+                    _value_box("B", "Approvals waiting", (grey, orange)),
+                ),
+            ),
+            Panel(
+                type="stat",
+                title="",
+                description="Last 5 minutes: decided calls, redacted calls, and the time the "
+                "gateway's checks took per call (95th percentile), split into rule checks "
+                "(deterministic controls, including sql_guard's query-plan lookup and egress's "
+                "DNS check) and AI checks (injection classifier and LLM judges, only on calls "
+                "where they ran). From each call's audit entry (latency_ms.controls).",
+                queries=(
+                    prom(f"round(sum(increase(acl_requests_total{five_min}))) or vector(0)"),
+                    prom(
+                        'round(sum(increase(acl_requests_total{decision="redact"}'
+                        f"{five_min}))) or vector(0)"
+                    ),
+                    loki(per_call_check_ms("rule", five_min), instant=True),
+                    loki(per_call_check_ms("ai", five_min), instant=True),
+                ),
+                width=24,
+                height=2,
+                decimals=0,
+                color_mode="thresholds",
+                no_value="-",
+                options=_big_stat(value_size=30, title_size=13) | {"colorMode": "value"},
+                overrides=(
+                    _value_box("A", "Requests", (Threshold(color="text"),)),
+                    _value_box("B", "Redacted", (Threshold(color="yellow"),)),
+                    _value_box(
+                        "C",
+                        "Rule checks p95 (live)",
+                        (Threshold(color="green"),),
+                        unit="ms",
+                        decimals=1,
+                    ),
+                    _value_box(
+                        "D",
+                        "AI checks p95 (live)",
+                        (Threshold(color="purple"),),
+                        unit="ms",
+                        decimals=1,
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+DASHBOARDS: Final = (posture, threats, session_trace, performance, recording)
 
 
 def render_all() -> dict[str, str]:

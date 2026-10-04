@@ -159,8 +159,11 @@ class GatewayContainer:
         identities = DemoIdentities.load(settings.identities_path) if settings.demo_tokens else None
         # Zero series for every bounded label set (dashboards' increase()), again on reload.
         humans = identities.subjects() if identities is not None else frozenset[str]()
-        initialize_metric_series(policy_store.current, humans)
-        policy_store.subscribe(lambda _old, current: initialize_metric_series(current, humans))
+        kind = settings.llm_upstream
+        initialize_metric_series(policy_store.current, humans, kind)
+        policy_store.subscribe(
+            lambda _old, current: initialize_metric_series(current, humans, kind)
+        )
         verifier = TokenVerifier(settings.jwt_key, clock=clock)
         state = StateStores.from_settings(settings, clock=clock)
         sessions = state.sessions

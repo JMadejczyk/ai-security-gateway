@@ -154,3 +154,12 @@ def test_a_probe_needs_no_token_and_a_wrong_reply_kind_is_an_error():
     assert compose.calls[0][1] == {}
     with pytest.raises(DemoError, match="expected a chat reply"):
         runner.chat(TOKEN, "hi")
+
+
+def test_the_revision_is_the_gateways_and_follows_the_file(policy: PolicyFile):
+    root = PolicyFile(ROOT_POLICY, Path("/nonexistent")).revision()
+    assert policy.revision() == root
+    assert len(root) == 12
+    with policy.edited(lambda text: set_max_cost(text, 100_000)):
+        assert policy.revision() != root
+    assert policy.revision() == root

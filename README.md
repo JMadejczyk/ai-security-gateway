@@ -118,7 +118,9 @@ and the audit entry. Agent actions run inside the `agent` container (`edge` only
 actions (tokens, approvals, the live policy edit) run on the host. Every scene asserts its own
 outcome, so the run exits 1 on any deviation. [`docs/demo.md`](docs/demo.md) has the talk
 track, timings, the reasons the injection page is served by a demo-only overlay, and what to
-do when the CPU model is slow. A recording is in `docs/demo.cast`.
+do when the CPU model is slow. A recording is in `docs/demo.cast`. The pitch video is staged beat by beat with
+`make record SCENE=1..6` (opencode on the left, Grafana on the right); [`docs/video.md`](docs/video.md)
+has the shot list, prompts, captions and the voiceover script.
 
 ## Test suite
 
@@ -254,6 +256,7 @@ only. Grafana is published on `http://127.0.0.1:3300` (`ACL_GRAFANA_HOST_PORT`);
 | Threats | security | Live block stream, highest-risk sessions (click through to the trace), top controls by block verdicts, signature hits, approvals, tainted sessions, killed agents, throttles |
 | Session trace | security | `$session_id`: every decision with its effective scope, risk and taint, plus risk over time; Recent sessions lists the ids |
 | Performance | judges, ops | Overhead p50/p95/p99 per channel, control latency p95, throughput, upstream and judge latency |
+| Recording | demo video | One full-width column for a ~760×1000 browser slot: session risk gauge, compromised yes/no, risk over time (policy-change markers), the last six decisions, blocked in 5 min, approvals waiting, requests and redactions, and the per-call p95 of rule checks and of AI checks (live) |
 
 The dashboards are generated from `grafana/build_dashboards.py` and committed (`make
 dashboards` after editing it; a test fails when the JSON is stale). `make smoke` sends demo
@@ -273,3 +276,12 @@ Screenshots after `make smoke` on a fresh stack (no Ollama model pulled):
 | ![Posture dashboard](docs/img/dashboards/posture.png) | ![Threats dashboard](docs/img/dashboards/threats.png) |
 | **Session trace** | **Performance** |
 | ![Session trace dashboard](docs/img/dashboards/session-trace.png) | ![Performance dashboard](docs/img/dashboards/performance.png) |
+
+The Recording dashboard is for the demo video (Grafana in 40 % of a 1920×1080 screen). Open it
+in kiosk mode, optionally focused on one session; empty `var-session_id` follows every session:
+
+```text
+http://127.0.0.1:3300/d/acl-recording/recording?orgId=1&kiosk&theme=dark&from=now-5m&to=now&refresh=5s&_dash.hideTimePicker&_dash.hideVariables&_dash.hideLinks&var-session_id=<session id>
+```
+
+<img src="docs/img/dashboards/recording.png" alt="Recording dashboard at 760×1000" width="380">

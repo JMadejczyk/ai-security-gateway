@@ -221,10 +221,10 @@ def test_main_exits_1_on_any_deviation_and_writes_the_report(
 
 
 def test_host_ports_fall_back_to_dotenv_then_default(monkeypatch):
-    assert run_demo._env_port({"ACL_GRAFANA_HOST_PORT": "4000"}, "ACL_GRAFANA_HOST_PORT", 3300) == (
+    assert run_demo.env_port({"ACL_GRAFANA_HOST_PORT": "4000"}, "ACL_GRAFANA_HOST_PORT", 3300) == (
         "4000"
     )
-    assert run_demo._env_port({}, "ACL_NO_SUCH_PORT", 1234) == "1234"
+    assert run_demo.env_port({}, "ACL_NO_SUCH_PORT", 1234) == "1234"
 
 
 class ChattyAgent(ScriptedAgent):

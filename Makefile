@@ -2,7 +2,7 @@
 REPORTS := reports
 
 .PHONY: help install models lint fmt test report test-docker test-all perf up down grafana smoke dashboards \
-	demo demo-up demo-off remote-up remote-off diagrams
+	demo demo-up demo-off remote-up remote-off opencode diagrams record
 
 help: ## List targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -98,6 +98,11 @@ demo: ## Run the 7-scene demo against the running stack (DEMO_ARGS="--pause" or 
 demo-off: ## Back to the default stack: gateway and mcp-fetch without the demo allowances, demo-web removed (REMOTE=1 keeps remote)
 	docker compose -f docker-compose.yml $(REMOTE_OVERLAY) up -d --wait --remove-orphans
 
+opencode: ## opencode (a real coding agent) through the gateway: AS=anna|bartek, ARGS='run "prompt"' for one turn
+	@test -n "$(AS)" || { echo "usage: make opencode AS=anna|bartek [ARGS='run \"...\"']"; exit 2; }
+	ACL_AGENT_HOST_PORT=$(AGENT_PORT) ACL_OPERATOR_HOST_PORT=$(OPERATOR_PORT) \
+		uv run python -m demo.opencode.launch --as $(AS) -- $(ARGS)
+
 REMOTE_COMPOSE := docker compose -f docker-compose.yml -f compose.remote.yml
 
 remote-up: ## Engineering: LLM calls go to OpenRouter (ZDR only) instead of Ollama; needs OPENROUTER_API_KEY in .env
@@ -106,3 +111,8 @@ remote-up: ## Engineering: LLM calls go to OpenRouter (ZDR only) instead of Olla
 
 remote-off: ## Back to the default stack: the local Ollama upstream
 	docker compose up -d --wait --remove-orphans
+
+record: ## Stage one beat of the pitch video (docs/video.md): make record SCENE=1..6 [RECORD_ARGS="--pace 3 --open"]
+	@test -n "$(SCENE)" || { echo "usage: make record SCENE=1..6"; exit 2; }
+	ACL_OPERATOR_HOST_PORT=$(OPERATOR_PORT) ACL_GRAFANA_HOST_PORT=$(GRAFANA_PORT) \
+		uv run python -m demo.record --scene $(SCENE) $(RECORD_ARGS)

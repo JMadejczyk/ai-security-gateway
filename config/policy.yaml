@@ -71,6 +71,18 @@ agents:
     allow: ["read:db:sales.*", "read:web:*", "write:fs:reports/*", "generate:model:*"]
     deny: ["egress:*"]
     approvers: [ops-team]
+  # A real coding agent (opencode, demo/opencode/) driving the gateway for the video: the same
+  # grants as databot but each model named, for the two people the demo films. Its own
+  # built-in tools (bash, files, webfetch) run on the developer's machine, outside the gateway;
+  # the launcher turns them off (docs/opencode.md).
+  opencode:
+    type: interactive
+    max_actions: [read, write, generate]
+    allow: ["read:db:sales.*", "read:web:*", "write:fs:reports/*", "generate:model:qwen3:8b",
+            "generate:model:deepseek-v4.1-flash"]
+    deny: ["egress:*"]
+    approvers: [ops-team]
+    principals: [anna@demo, bartek@demo]
   nightly_etl:
     type: autonomous                        # principal is svc:nightly_etl, U = this allow list
     max_actions: [read, write, generate]

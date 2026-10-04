@@ -34,20 +34,23 @@ the model window is classified in overlapping windows and scores as its best win
 
 **Tiers.** Text the agent authored and text it did not are decided differently:
 
-- *Untrusted text* (MCP results, and in a chat request the ``tool`` and ``assistant``
-  messages, which can carry tool results): score at or above ``threshold`` is detected by
-  the classifier alone. Score inside ``judge_band``: the best window of each such text goes
-  to the LLM judge, which answers whether it tries to instruct an AI agent; at most
-  `MAX_JUDGED` texts per call are judged. Below the band: clean.
-- *Judge-confirmed text* (`judge_confirmed`): the LLM request's ``user``, ``system`` and
-  ``developer`` messages (`authored_messages`), and the model's answer after it (content,
-  tool-call arguments, reasoning). Any score from the band up goes to the judge, because
-  the English-first classifier flags harmless text ("What is a primary key?" scored 1.0,
-  and Polish answers misfire). The judge confirms (block) or clears (allow); with no answer
+- *Untrusted text* (MCP results, and in a chat request the ``tool`` messages, which carry
+  tool results): score at or above ``threshold`` is detected by the classifier alone. Score
+  inside ``judge_band``: the best window of each such text goes to the LLM judge, which
+  answers whether it tries to instruct an AI agent; at most `MAX_JUDGED` texts per call are
+  judged. Below the band: clean.
+- *Judge-confirmed text* (`judge_confirmed`): the LLM request's ``user``, ``system``,
+  ``developer`` and ``assistant`` messages (`authored_messages`: client-authored, the
+  assistant turns being the model's earlier answers the client replays), and the model's
+  answer after it (content, tool-call arguments, reasoning). Any score from the band up
+  goes to the judge, because the English-first classifier flags harmless text ("What is a
+  primary key?" scored 1.0, a model paraphrasing a gateway refusal 0.9999, and Polish
+  answers misfire). The judge confirms (block) or clears (allow); with no answer
   within ``judge_confirm_timeout_s`` (timeout, error, garbled answer, no judge) the text
   is let through, the session tainted and the risk raised (``prompt_injection_unconfirmed``),
   so a real injection still costs the session its write and egress rights. A window built
-  from judge-confirmed and untrusted pieces is untrusted: the untrusted part decides.
+  from judge-confirmed and untrusted pieces is untrusted: the untrusted part decides (a
+  window of user and assistant text only is judge-confirmed).
 
 Judge verdicts are remembered by window text under a key of the judge configuration in
 effect (`judge_config_key`), so a policy reload that changes the judge model or this
@@ -106,10 +109,11 @@ JUDGE_BAND_OVERFLOW: Final = "judge_band_overflow"
 TOO_LARGE: Final = "content_too_large_to_classify"
 UNSCANNABLE: Final = "content_unscannable"
 UNCONFIRMED: Final = "prompt_injection_unconfirmed"
-# Message roles whose text the agent itself authored (its user's prompt, its own system or
-# developer instructions). Hits there are confirmed by the judge; everything else (tool and
-# assistant messages, which can carry tool results) is decided by the classifier alone.
-AUTHORED_ROLES: Final = frozenset({"user", "system", "developer"})
+# Message roles whose text the client authored: its user's prompt, its own system or developer
+# instructions, and the model's earlier answers it keeps as history (user decision
+# 2026-10-04). Hits there are confirmed by the judge; ``tool`` (and legacy ``function``)
+# messages carry tool results, the indirect path, and are decided by the classifier alone.
+AUTHORED_ROLES: Final = frozenset({"user", "system", "developer", "assistant"})
 CLASSIFIER_UNAVAILABLE: Final = "classifier_unavailable"
 
 WINDOW_CHARS: Final = 1000  # rolling window over the pieces joined in document order
@@ -279,9 +283,9 @@ def authored_messages(interaction: Interaction, stage: Stage) -> Callable[[TextS
 
 def judge_confirmed(interaction: Interaction, stage: Stage) -> Callable[[TextSegment], bool]:
     """Which segments the judge confirms instead of the classifier deciding alone: the agent's
-    own messages before the model (`authored_messages`) and, after it, everything the model
-    generated (the LLM answer: content, tool-call arguments, reasoning). Tool results and the
-    tool and assistant history stay with the classifier."""
+    own messages before the model (`authored_messages`, assistant history included) and, after
+    it, everything the model generated (the LLM answer: content, tool-call arguments,
+    reasoning). Tool results, as MCP results or ``tool`` messages, stay with the classifier."""
     if interaction.channel is Channel.LLM and stage is Stage.POST:
         return lambda _: True
     return authored_messages(interaction, stage)

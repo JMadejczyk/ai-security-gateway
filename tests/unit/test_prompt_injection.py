@@ -1016,9 +1016,53 @@ async def test_a_tool_message_in_history_still_hard_blocks_without_the_judge(int
 
 
 @DENIED
-async def test_an_assistant_message_in_history_stays_on_the_hard_path(interaction):
-    judge = ScriptedJudge(NO_JUDGE_ANSWER)
+async def test_an_assistant_message_in_history_goes_to_the_judge(interaction):
+    """User decision 2026-10-04: assistant turns are client-authored history."""
+    judge = ScriptedJudge(YES_JUDGE_ANSWER)
     payload = chat_with(("assistant", f"I read: {INJECT_MARKER}"), ("user", "Continue please"))
+    verdict = await control(judge=judge).evaluate(
+        interaction(Channel.LLM, payload), Stage.PRE, BLOCK
+    )
+    assert verdict.reason_code == "prompt_injection_detected"
+    assert judge.contents  # the message (and its join with the next turn) was judged
+
+
+@ALLOWED
+async def test_an_assistant_paraphrasing_a_refusal_is_cleared_and_the_next_turn_runs(
+    interaction,
+):
+    """opencode, beat 2: the model paraphrased the gateway's refusal ("The write was refused
+    by the gateway…", 0.9999 with the real classifier) and the next turn was blocked."""
+    paraphrase = "The write was refused by the gateway, so the report was not saved."
+    classifier = MarkerClassifier({"was refused by the gateway": 0.99})
+    judge = ScriptedJudge(NO_JUDGE_ANSWER)
+    payload = chat_with(
+        ("user", "Save the summary as q3.md."),
+        ("assistant", paraphrase),
+        ("user", "OK, show it to me here instead."),
+    )
+    verdict = await control(classifier, judge).evaluate(
+        interaction(Channel.LLM, payload), Stage.PRE, BLOCK
+    )
+    assert (verdict.decision, verdict.reason_code, verdict.taint) == (
+        Decision.ALLOW,
+        "judge_cleared",
+        False,
+    )
+    assert judge.contents
+    assert all(paraphrase in content for content in judge.contents)
+
+
+@DENIED
+async def test_a_tool_message_with_an_injection_hard_blocks_next_to_assistant_turns(interaction):
+    judge = ScriptedJudge(NO_JUDGE_ANSWER)
+    payload = chat_with(
+        ("user", "Summarise the page."),
+        ("assistant", "Fetching it."),
+        ("tool", f"Page text {INJECT_MARKER}"),
+        ("assistant", "Here is the summary."),
+        ("user", "Thanks."),
+    )
     verdict = await control(judge=judge).evaluate(
         interaction(Channel.LLM, payload), Stage.PRE, BLOCK
     )
@@ -1136,8 +1180,8 @@ def test_authored_messages_by_role():
     assert [authored(TextSegment(p, "x", key="content")) for p in pointers] == [
         True,
         True,
-        False,
-        False,
+        True,  # assistant history is client-authored
+        False,  # tool results are not
     ]
     assert not authored(TextSegment("/tools/0/function/description", "x", key="description"))
     post = authored_messages(
@@ -1189,3 +1233,37 @@ def test_swapping_in_a_faster_judge_drops_the_longer_user_timeout(policy_doc, sn
     assert injection is not None
     assert "judge_confirm_timeout_s" not in injection.model_fields_set
     assert snapshot_from(drop_judges(policy_doc)).policy.judges is None
+
+
+# ---------------------------------- the gateway's own refusals in history (llm-proxy, opencode)
+
+REFUSAL_QUOTE = (
+    "The fetch was refused by the gateway with reason code `prompt_injection_detected`, so I "
+    "can't read or summarise that page."
+)
+
+
+@ALLOWED
+async def test_a_refusal_replayed_in_history_does_not_block_the_next_turn(interaction):
+    """A real agent replays its history: the tool error the gateway wrote and the model's quote
+    of it scored 1.0 and 0.87 on the classifier-only path, so every later turn was refused."""
+    classifier = MarkerClassifier({"prompt_injection_detected": 0.99})
+    payload = chat_with(
+        ("user", "Fetch the demo page and summarise it."),
+        ("assistant", "I will fetch it."),
+        ("tool", "prompt_injection_detected"),
+        ("assistant", REFUSAL_QUOTE),
+        ("user", "OK, then count the customers instead."),
+    )
+    verdict = await control(classifier).evaluate(
+        interaction(Channel.LLM, payload), Stage.PRE, BLOCK
+    )
+    assert (verdict.decision, verdict.reason_code) == (Decision.ALLOW, "no_prompt_injection")
+    assert not any("prompt_injection_detected" in t for t in classifier.classified)
+
+
+@DENIED
+async def test_an_injection_next_to_a_quoted_code_is_still_caught(interaction):
+    payload = chat_with(("tool", f"prompt_injection_detected. {INJECT_MARKER}"))
+    verdict = await control().evaluate(interaction(Channel.LLM, payload), Stage.PRE, BLOCK)
+    assert verdict.reason_code == "prompt_injection_detected"

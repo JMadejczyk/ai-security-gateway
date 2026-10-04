@@ -21,7 +21,7 @@ type Doc = dict[str, Any]
 def test_root_policy_loads(snapshot):
     policy = snapshot.policy
     assert policy.profile is Profile.STRICT
-    assert set(policy.agents) == {"databot", "nightly_etl"}
+    assert set(policy.agents) == {"databot", "opencode", "nightly_etl"}
     assert set(policy.roles) == {"analyst", "intern", "admin", "ops-team"}
     assert len(snapshot.revision) == 12
     assert snapshot.digest == canonical_digest(policy)

@@ -26,7 +26,13 @@ from typing import Final, Literal, cast
 import httpx
 from pydantic import BaseModel, ConfigDict
 
-DASHBOARD_UIDS: Final = ("acl-posture", "acl-threats", "acl-session-trace", "acl-performance")
+DASHBOARD_UIDS: Final = (
+    "acl-posture",
+    "acl-threats",
+    "acl-session-trace",
+    "acl-performance",
+    "acl-recording",
+)
 WINDOW_S: Final = 15 * 60
 BUILTINS: Final = {
     "$__rate_interval": "1m",

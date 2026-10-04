@@ -10,9 +10,12 @@
   never equal an MCP arguments object).
   Missing or empty arguments are ``{}`` on both sides.
 
-Matching is by exact tool name: an agent that exposes an MCP tool to its model under another
-name does not get its flags matched. That is acceptable only because the judge is advisory:
-every MCP call is authorized on its own, whatever the LLM said (SPEC).
+Matching is by tool name, including the names MCP clients show a server's tools under to
+their model: ``<server>_<tool>`` (opencode) and ``mcp__<server>__<tool>`` (Claude Code), so a
+flag raised on ``sales_db_query`` holds ``query`` on ``sales_db``. Extra names can only add an
+approval obligation, never remove one. A client with another naming scheme does not get its
+flags matched; that is acceptable only because the judge is advisory: every MCP call is
+authorized on its own, whatever the LLM said (SPEC).
 """
 
 import hashlib
@@ -81,9 +84,17 @@ def flag_for(name: str, arguments: object) -> FlaggedToolCall:
     return FlaggedToolCall(tool=name, args_digest=arguments_digest(arguments))
 
 
-def mcp_flag_candidates(*payloads: object) -> set[FlaggedToolCall]:
-    """Flags an MCP ``tools/call`` would match: one per distinct ``{"name", "arguments"}``
-    payload given (the agent's own arguments and the adapter's canonical form)."""
+def exposed_names(tool: str, server: str | None) -> tuple[str, ...]:
+    """The names a model may know an MCP server's tool by (see the module docstring)."""
+    if not server:
+        return (tool,)
+    return (tool, f"{server}_{tool}", f"mcp__{server}__{tool}")
+
+
+def mcp_flag_candidates(*payloads: object, server: str | None = None) -> set[FlaggedToolCall]:
+    """Flags an MCP ``tools/call`` on ``server`` would match: per distinct ``{"name",
+    "arguments"}`` payload given (the agent's own arguments and the adapter's canonical
+    form), one per name the tool may have been exposed under."""
     candidates: set[FlaggedToolCall] = set()
     for payload in payloads:
         params = _mapping(payload)
@@ -91,7 +102,8 @@ def mcp_flag_candidates(*payloads: object) -> set[FlaggedToolCall]:
             continue
         name = params.get("name")
         if isinstance(name, str) and name:
-            candidates.add(flag_for(name, params.get("arguments")))
+            arguments = params.get("arguments")
+            candidates.update(flag_for(alias, arguments) for alias in exposed_names(name, server))
     return candidates
 
 

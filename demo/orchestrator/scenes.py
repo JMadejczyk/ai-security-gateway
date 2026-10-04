@@ -8,6 +8,7 @@ each starts a fresh gateway session with its own budget and no inherited taint.
 import subprocess
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import ClassVar, Final
 
@@ -97,9 +98,18 @@ def fetch(url: str, *, wait_throttle: bool = False) -> ToolCall:
     return ToolCall(server="web", tool="fetch", arguments={"url": url}, wait_throttle=wait_throttle)
 
 
+def _no_pause(_message: str) -> None:
+    """The demo runs straight through; `make record` paces and holds (demo/record.py)."""
+
+
 @dataclass
 class Demo:
-    """Everything a scene may use."""
+    """Everything a scene may use.
+
+    ``pace`` runs between the steps of a scripted scene (the recorder sleeps there, so a camera
+    can follow); ``hold`` stops at a point where a person acts on camera (the recorder waits for
+    Enter: approving, or typing the same prompt in opencode while the policy is raised). Both do
+    nothing in ``make demo``."""
 
     compose: Compose
     agent: AgentRunner
@@ -109,6 +119,8 @@ class Demo:
     policy: PolicyFile
     narrator: Narrator
     run_id: str
+    pace: Callable[[str], None] = _no_pause
+    hold: Callable[[str], None] = _no_pause
 
 
 @dataclass
@@ -244,9 +256,11 @@ class AutonomousApproval(Scene):
         rec.sessions["scene 3 nightly_etl"] = etl.session_id or ""
         reply, _ = self.tool(demo, etl, fetch(INJECTION_PAGE, wait_throttle=True))
         rec.expect(n, "page with hidden injection", reply.reason, "prompt_injection_detected")
+        demo.pace("the job goes on to write its report")
         write = report(f"demo-{demo.run_id}-nightly.md", "nightly totals", wait_throttle=True)
         held, _ = self.tool(demo, etl, write)
         rec.expect(n, "write after taint", held.reason, "approval_required")
+        demo.pace("an approver looks at the queue")
         if held.approval_id is None:
             msg = "the held write carried no approval_id"
             raise DemoError(msg)
@@ -263,16 +277,20 @@ class AutonomousApproval(Scene):
                 good=True,
             )
         rec.expect(n, "olga sees it pending", mine.state if mine else None, "pending")
+        demo.hold(f"Approve {held.approval_id} as olga@demo? [Enter]")
         n.act("olga (ops-team approver)", f"POST /admin/approvals/{held.approval_id}/approve")
         decided = demo.operator.approve(OLGA, held.approval_id)
         n.outcome(f"state={decided.state} decided_by={decided.decided_by}", good=True)
+        demo.pace("the job retries with the approval")
         done, _ = self.tool(demo, etl, write.retried_with(held.approval_id))
         rec.expect(n, "retry with the approval", done.reason, "ok")
+        demo.pace("a second use of the same approval")
         replay, _ = self.tool(demo, etl, write.retried_with(held.approval_id))
         rec.expect(n, "replaying the used approval", replay.reason, "approval_already_used")
         final = demo.operator.approval(OLGA, held.approval_id)
         n.detail(f"approval {final.id}: state={final.state} outcome={final.outcome}")
         rec.expect(n, "approval executed exactly once", final.state, "succeeded")
+        demo.pace("the job's next action while its risk is high")
         # risk 0.6 > 0.5: at most one action per 10 s for this agent; it waits, it does not die.
         more, _ = self.tool(demo, etl, query(COUNT_CUSTOMERS, wait_throttle=True))
         slowed = "throttled, then allowed" if more.ok and more.throttle_waits else more.reason
@@ -394,20 +412,28 @@ class LivePolicyChange(Scene):
         n = demo.narrator
         before = demo.operator.policy_revision()
         n.detail(f"active policy revision: {before}")
+        anna = self.session(demo, ANNA)
+        rec.sessions["scene 7 anna"] = anna.session_id or ""
+        reply, _ = self.tool(demo, anna, query(HEAVY_QUERY))
+        rec.expect(n, "heavy query before the edit", reply.reason, "sql_cost_exceeded")
+        demo.pace("a judge edits one line of the policy")
         path = demo.policy.path.relative_to(demo.compose.root)
-        n.act("judge", f"edit {path}: controls.sql_guard.max_cost -> {RAISED_MAX_COST:,}")
+        limit = max_cost(demo.policy.path.read_text())
+        n.act("judge", f"edit {path}")
+        n.detail(f"- controls.sql_guard.max_cost: {limit}")
+        n.detail(f"+ controls.sql_guard.max_cost: {RAISED_MAX_COST}")
         with demo.policy.edited(lambda text: set_max_cost(text, RAISED_MAX_COST)):
             after = demo.operator.wait_for_revision(lambda rev: rev != before)
             n.outcome(f"hot reload: revision {before} -> {after} (no restart)", good=True)
             for event in demo.audit.reloads(last=1):
                 n.detail(describe_reload(event) + "   (Grafana annotation source)")
-            anna = self.session(demo, ANNA)
-            rec.sessions["scene 7 anna"] = anna.session_id or ""
+            demo.pace("the same request again")
             reply, entry = self.tool(demo, anna, query(HEAVY_QUERY))
             rec.expect(n, "same heavy query", reply.reason, "ok")
             rec.expect(
                 n, "audit carries the new revision", entry.policy_revision if entry else None, after
             )
+            demo.hold("The policy is raised. Enter restores config/policy.yaml.")
         n.act("judge", f"restore {path}")
         restored = demo.operator.wait_for_revision(lambda rev: rev == before)
         n.outcome(f"revision back to {restored}", good=restored == before)

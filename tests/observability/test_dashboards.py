@@ -30,7 +30,11 @@ EXPECTED = {
     "acl-threats": "Threats",
     "acl-session-trace": "Session trace",
     "acl-performance": "Performance",
+    "acl-recording": "Recording",
 }
+DEFAULT_RANGE = {"acl-recording": "now-5m"}  # the others: now-15m
+VARIABLE_UIDS = {"${datasource}", "${loki}"}
+MIXED = {"type": "datasource", "uid": "-- Mixed --"}  # Grafana's built-in: per-target sources
 ALLOY_LABELS = {"job", "channel", "decision", "actor", "mode", "event"}
 FORBIDDEN_LABELS = {"session_id", "principal", "resource", "reason_code", "risk", "user_id"}
 PROVISIONED_UIDS = ("acl-prometheus", "acl-loki")
@@ -102,14 +106,14 @@ def test_committed_dashboards_equal_the_generator_output() -> None:
     assert committed == rendered, "run: uv run python -m grafana.build_dashboards"
 
 
-def test_the_four_spec_dashboards_exist_with_stable_uids() -> None:
+def test_the_spec_dashboards_and_the_recording_view_exist_with_stable_uids() -> None:
     assert {uid: d["title"] for uid, d in DASHBOARDS.items()} == EXPECTED
 
 
 @pytest.mark.parametrize("uid", sorted(EXPECTED))
 def test_dashboard_defaults_suit_a_short_demo(uid: str) -> None:
     dashboard = DASHBOARDS[uid]
-    assert dashboard["time"] == {"from": "now-15m", "to": "now"}
+    assert dashboard["time"] == {"from": DEFAULT_RANGE.get(uid, "now-15m"), "to": "now"}
     assert dashboard["refresh"] == "5s"
     assert dashboard["editable"] is False
     variables = {v["name"]: v for v in dashboard["templating"]["list"]}
@@ -137,9 +141,11 @@ def test_panels_have_unique_ids_targets_and_variable_data_sources(uid: str) -> N
     assert len({p["id"] for p in panels}) == len(panels)
     for panel in panels:
         assert panel["targets"], panel["title"]
-        assert panel["datasource"]["uid"] in {"${datasource}", "${loki}"}, panel["title"]
+        mixed = panel["datasource"] == MIXED
+        assert mixed or panel["datasource"]["uid"] in VARIABLE_UIDS, panel["title"]
         for target in panel["targets"]:
-            assert target["datasource"] == panel["datasource"], panel["title"]
+            assert target["datasource"]["uid"] in VARIABLE_UIDS, panel["title"]
+            assert mixed or target["datasource"] == panel["datasource"], panel["title"]
             assert target["expr"].strip(), panel["title"]
         grid = panel["gridPos"]
         assert grid["x"] + grid["w"] <= 24, panel["title"]
@@ -292,3 +298,66 @@ def test_loki_summaries_are_instant_queries_over_the_whole_range(uid: str, title
     ids = [t["id"] for t in panel["transformations"]]
     assert "reduce" not in ids  # no re-aggregation of the returned values over time
     assert ids[:2] == ["labelsToFields", "merge"]
+
+
+# ----------------------------------------------------------------------------- Recording
+
+# Measured at 760 px (single-column layout): ~36 px per grid unit, 18 px between panels, and
+# ~50 px of page margin plus the "Powered by Grafana" footer in kiosk mode.
+MOBILE_UNIT_PX, MOBILE_GAP_PX, MOBILE_CHROME_PX = 36, 18, 50
+
+
+def test_recording_fits_a_760_by_1000_slot() -> None:
+    """Below 769 px Grafana stacks panels one per row, so the recording view is built full
+    width and its stacked height must fit the 1000 px browser slot of the video."""
+    panels = DASHBOARDS["acl-recording"]["panels"]
+    assert all(p["gridPos"]["w"] == 24 and p["gridPos"]["x"] == 0 for p in panels)
+    height = sum(p["gridPos"]["h"] * MOBILE_UNIT_PX + MOBILE_GAP_PX for p in panels)
+    assert height + MOBILE_CHROME_PX <= 1000
+
+
+def test_recording_has_the_requested_panels_in_order() -> None:
+    panels = DASHBOARDS["acl-recording"]["panels"]
+    assert [(p["title"], p["type"]) for p in panels] == [
+        ("Session risk", "gauge"),
+        ("Session marked compromised", "stat"),
+        ("Risk over time", "timeseries"),  # carries the policy-change annotations
+        ("Last decisions", "table"),
+        ("", "stat"),  # Blocked (5 min) | Approvals waiting
+        ("", "stat"),  # Requests | Blocked | Redacted | p95 overhead
+    ]
+    gauge = panels[0]["fieldConfig"]["defaults"]
+    assert (gauge["min"], gauge["max"]) == (0, 1)
+    assert [t.get("value") for t in gauge["thresholds"]["steps"]] == [None, 0.5, 0.8]
+    (decisions,) = panels[3]["targets"]
+    assert decisions["maxLines"] == 6
+    boxes = [o["properties"][0]["value"] for o in panels[4]["fieldConfig"]["overrides"]]
+    assert boxes == ["Blocked (5 min)", "Approvals waiting"]
+
+
+def test_recording_is_kiosk_friendly() -> None:
+    dashboard = DASHBOARDS["acl-recording"]
+    assert dashboard["links"] == []
+    variables = {v["name"]: v for v in dashboard["templating"]["list"]}
+    assert variables["session_id"]["type"] == "textbox"
+    for panel in dashboard["panels"]:
+        legend = panel["options"].get("legend")
+        assert legend is None or legend["showLegend"] is False, panel["title"]
+
+
+def test_recording_reports_check_time_split_into_rule_and_ai_checks() -> None:
+    """One undifferentiated "overhead" number would mix the rule checks with the injection
+    classifier and LLM judges; the closing row shows the two per call, labelled."""
+    closing = DASHBOARDS["acl-recording"]["panels"][-1]
+    names = [o["properties"][0]["value"] for o in closing["fieldConfig"]["overrides"]]
+    assert names == ["Requests", "Redacted", "Rule checks p95 (live)", "AI checks p95 (live)"]
+    assert "overhead" not in json.dumps(closing["targets"])
+    rule, ai = (t["expr"] for t in closing["targets"][2:])
+    for expr, present, absent in (
+        (rule, ("sql_guard", "pii", "signatures"), ("prompt_injection", "intent_judge")),
+        (ai, ("prompt_injection", "intent_judge", "output_policy"), ("sql_guard", "pii")),
+    ):
+        assert expr.startswith("quantile_over_time(0.95, ")
+        assert all(f'latency_ms.controls.{c}"' in expr for c in present), expr
+        assert not any(f'latency_ms.controls.{c}"' in expr for c in absent), expr
+    assert '| ms != "0"' in ai  # only calls where an AI check ran

@@ -83,7 +83,7 @@ def test_who_may_decide(snapshot, operator, record, reason):
 
 def test_approvers_see_only_the_agents_that_name_their_role(snapshot):
     olga = OperatorAccess(claims("olga@demo", "ops-team"), snapshot)
-    assert olga.approvable_agents() == frozenset({"databot", "nightly_etl"})
+    assert olga.approvable_agents() == frozenset({"databot", "opencode", "nightly_etl"})
     bartek = OperatorAccess(claims("bartek@demo", "intern"), snapshot)
     assert not bartek.can_view(approval())
     with pytest.raises(OperatorRefusedError, match="operator_role_required"):

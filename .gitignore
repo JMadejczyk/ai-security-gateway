@@ -29,3 +29,6 @@ reports/
 
 # Injection classifier weights (python -m gateway.injection.fetch); pinned by gateway/injection/model_manifest.json
 models/cache/
+
+# opencode's isolated per-identity homes, npm cache and capture dumps (make opencode)
+demo/opencode/.home/

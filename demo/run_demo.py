@@ -40,7 +40,7 @@ EXIT_DEVIATED: Final = 1
 EXIT_NOT_READY: Final = 2
 
 
-def _env_port(env: Mapping[str, str], name: str, default: int) -> str:
+def env_port(env: Mapping[str, str], name: str, default: int) -> str:
     """A host port: the environment, else ``.env`` (compose reads it too), else the default."""
     if value := env.get(name):
         return value
@@ -65,9 +65,9 @@ def _parser(env: Mapping[str, str]) -> argparse.ArgumentParser:
     parser.add_argument("--pause", action="store_true", help="wait for Enter between scenes")
     parser.add_argument("--no-color", action="store_true", help="plain text transcript")
     parser.add_argument("--json", type=Path, default=None, help="write the results here")
-    port = _env_port(env, "ACL_OPERATOR_HOST_PORT", 9090)
+    port = env_port(env, "ACL_OPERATOR_HOST_PORT", 9090)
     parser.add_argument("--operator-url", default=f"http://127.0.0.1:{port}")
-    grafana = _env_port(env, "ACL_GRAFANA_HOST_PORT", 3300)
+    grafana = env_port(env, "ACL_GRAFANA_HOST_PORT", 3300)
     parser.add_argument("--grafana-url", default=f"http://127.0.0.1:{grafana}")
     return parser
 

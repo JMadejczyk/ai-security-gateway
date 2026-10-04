@@ -38,7 +38,7 @@ SPEC_METRICS: dict[str, tuple[str, frozenset[str]]] = {
     "acl_policy_reloads_total": ("acl_policy_reloads_total", frozenset({"result"})),
     "acl_policy_info": ("acl_policy_info", frozenset({"revision"})),
 }
-KNOWN_AGENTS = {"databot", "nightly_etl", "other"}
+KNOWN_AGENTS = {"databot", "opencode", "nightly_etl", "other"}
 UNPRICED_MODEL = "llama3.1:8b"  # granted by analyst/databot's generate:model:*, not in pricing
 
 

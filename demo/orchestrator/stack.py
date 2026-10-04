@@ -36,6 +36,7 @@ from demo.orchestrator.models import (
     ToolReply,
     parse_agent_reply,
 )
+from gateway.policy.loader import PolicyLoader
 from observability.smoke_traffic import MAX_COST
 
 REPO_ROOT: Final = Path(__file__).resolve().parents[2]
@@ -216,6 +217,10 @@ class Operator:
         response = self._admin(approver, "POST", f"/admin/approvals/{approval_id}/approve")
         return ApprovalInfo.model_validate_json(response.content)
 
+    def deny(self, approver: str, approval_id: str) -> ApprovalInfo:
+        response = self._admin(approver, "POST", f"/admin/approvals/{approval_id}/deny")
+        return ApprovalInfo.model_validate_json(response.content)
+
     def reload(self, admin: str) -> str:
         return str(self._admin(admin, "POST", "/admin/reload").json().get("result", "error"))
 
@@ -292,6 +297,16 @@ class AuditLog:
                 return found[-1] if found else None
             time.sleep(POLL_S)
 
+    def since(self, principal: str, ts: str) -> tuple[AuditEntry, ...]:
+        """Decisions made for ``principal`` at or after ``ts`` (ISO 8601, UTC), oldest first."""
+        entries: list[AuditEntry] = []
+        for line in self._grep(f'"principal":"{principal}"'):
+            with contextlib.suppress(ValidationError):
+                entry = AuditEntry.model_validate_json(line)
+                if entry.ts >= ts:
+                    entries.append(entry)
+        return tuple(sorted(entries, key=lambda e: e.ts))
+
     def reloads(self, last: int = 3) -> tuple[ReloadEvent, ...]:
         events: list[ReloadEvent] = []
         for line in self._grep('"event":"policy_reload"'):
@@ -353,6 +368,10 @@ class PolicyFile:
     def __init__(self, path: Path, backup: Path) -> None:
         self.path = path
         self.backup = backup
+
+    def revision(self) -> str:
+        """The revision the gateway reports once it has loaded this file (same loader)."""
+        return PolicyLoader().load(self.path).revision
 
     def recover(self) -> bool:
         """Restore a backup an interrupted run left behind; True if there was one."""

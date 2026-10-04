@@ -15,7 +15,11 @@ segment is language and present it the way a reader (or a model) reads it:
 - `neutral_markers`: the gateway's own redaction markers (``[REDACTED:PL_PESEL]``) as
   ``***``. The model reads the marker as an instruction-like token ("Customer
   [REDACTED:EMAIL_ADDRESS] has 3 orders." scored 0.97, with ``***`` 0.00; ``(redacted)``
-  and the bare label scored high too), and it is gateway output, not attacker text.
+  and the bare label scored high too), and it is gateway output, not attacker text. The
+  same goes for the gateway's own reason codes and control ids
+  (`gateway.injection.reason_codes`): a refused tool call's ``prompt_injection_detected``
+  (1.0) or the model quoting it (0.87, with ``***`` 0.06), re-sent as history, would
+  otherwise block every later turn. Only that fixed set of whole tokens is replaced.
 - `looks_like_prose`: at least `MIN_WORDS` words of two or more letters and `MIN_LETTERS`
   letters in them. A word is a whitespace-separated token made of letters (with inner
   hyphens or apostrophes), trailing punctuation allowed: numbers, ISO dates, UUIDs, emails,
@@ -29,6 +33,8 @@ from collections.abc import Iterator, Mapping
 from html.parser import HTMLParser
 from typing import Any, Final, NamedTuple, cast, override
 
+from gateway.injection.reason_codes import GATEWAY_REASON_CODES
+
 MIN_WORDS: Final = 3
 MIN_LETTERS: Final = 10
 REDACTED_PLACEHOLDER: Final = "***"  # measured: "(redacted)" and the label still score high
@@ -39,6 +45,11 @@ _LEADING_MARKS: Final = "\"'([{<\u00ab\u201e\u201c\u2018*_`"
 _TRAILING_MARKS: Final = "\"')]}>\u00bb\u201d\u2019.,;:!?*_`\u2026"
 _WORD: Final = re.compile(r"[^\W\d_]{2,}(?:[-'\u2019][^\W\d_]+)*")
 _MARKER: Final = re.compile(r"\[REDACTED:[A-Z0-9_+]{1,200}\]")
+_REASON_CODE: Final = re.compile(
+    r"(?<![A-Za-z0-9_])(?:"
+    + "|".join(re.escape(code) for code in sorted(GATEWAY_REASON_CODES, key=len, reverse=True))
+    + r")(?![A-Za-z0-9_])"
+)
 _HTML_HINT: Final = re.compile(r"<(?:!doctype\s|html[\s>]|body[\s>]|head[\s>])", re.IGNORECASE)
 _TAG: Final = re.compile(r"</?[a-zA-Z][a-zA-Z0-9-]*(?:\s[^<>]*)?/?>")
 _MIN_TAGS: Final = 3  # without a doctype/html/body/head tag, this many tags make it HTML
@@ -68,8 +79,11 @@ def looks_like_prose(text: str) -> bool:
 
 
 def neutral_markers(text: str) -> str:
-    """``text`` with every ``[REDACTED:LABEL]`` marker replaced by `REDACTED_PLACEHOLDER`."""
-    return _MARKER.sub(REDACTED_PLACEHOLDER, text) if "[REDACTED:" in text else text
+    """``text`` with every ``[REDACTED:LABEL]`` marker and every gateway reason code or control
+    id (whole tokens of `GATEWAY_REASON_CODES`) replaced by `REDACTED_PLACEHOLDER`."""
+    if "[REDACTED:" in text:
+        text = _MARKER.sub(REDACTED_PLACEHOLDER, text)
+    return _REASON_CODE.sub(REDACTED_PLACEHOLDER, text) if "_" in text else text
 
 
 def looks_like_html(text: str) -> bool:

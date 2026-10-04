@@ -25,5 +25,6 @@
 .md-typeset h1.sr-title { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); }
 .md-header__button.md-logo { background:#fff; border-radius:8px; padding:.25rem; margin:.3rem .4rem; }
 .md-typeset table:not([class]) td:first-child code { white-space: nowrap; }
-.video { position: relative; aspect-ratio: 16 / 9; border-radius: 14px; overflow: hidden; box-shadow: 0 18px 50px rgba(16,40,100,.18); }
+.video { position: relative; aspect-ratio: 16 / 9; border-radius: 14px;
+  width: min(78rem, calc(100vw - 3rem)); margin: 1.5rem 0 1.5rem 50%; transform: translateX(-50%); overflow: hidden; box-shadow: 0 18px 50px rgba(16,40,100,.18); }
 .video iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }

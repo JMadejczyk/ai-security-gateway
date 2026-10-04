@@ -46,6 +46,7 @@ from gateway_testkit import (
 )
 from injection_kit import MarkerClassifier
 from judge_kit import DEFAULT_ANSWERS
+from leak_kit import leaked
 from plugins.control_report import ControlClaim
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -306,13 +307,15 @@ def check(case: AttackCase, seen: Observed, *, decision: Decision | None = None)
         assert seen.upstream_called is expect["upstream_called"], f"{case.id}: upstream"
     if expect["taint"] is not None:
         assert seen.taint is expect["taint"], f"{case.id}: taint {seen.taint}"
+    # Searched where a payload can land (strings, whole integers), never in measurements: a
+    # short numeric value must not match a latency float by chance (`leak_kit`).
     for value in expect["absent"]:
-        assert value not in seen.agent_saw, f"{case.id}: leaked to the agent"
-        assert value not in seen.audit_raw, f"{case.id}: leaked to the audit log"
+        assert not leaked(value, seen.agent_saw), f"{case.id}: leaked to the agent"
+        assert not leaked(value, seen.audit_raw), f"{case.id}: leaked to the audit log"
     for value in expect["absent_upstream"]:
-        assert value not in seen.upstream_got, f"{case.id}: reached the upstream"
+        assert not leaked(value, seen.upstream_got), f"{case.id}: reached the upstream"
     for value in expect["present_upstream"]:
-        assert value in seen.upstream_got, f"{case.id}: {value!r} did not reach the upstream"
+        assert leaked(value, seen.upstream_got), f"{case.id}: {value!r} did not reach the upstream"
 
 
 # ---------------------------------------------------------------------------- stacks

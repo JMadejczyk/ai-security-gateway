@@ -16,6 +16,7 @@ import pytest
 import yaml
 from gateway_testkit import Harness, bearer, completion, running_gateway
 from judge_kit import set_judges
+from leak_kit import leaked
 from mcp_harness import MCPStack, connect_all, error_text
 from pin_kit import capture_pins, write_pins
 from upstreams import running_upstreams
@@ -149,8 +150,8 @@ async def test_goal_is_the_first_user_message_and_never_changes(stack: MCPStack,
     assert session is not None
     assert session.goal == GOAL
     # The goal is raw user text: it never reaches the audit log.
-    assert GOAL not in stack.gateway.audit.getvalue()
-    assert "export payments" not in stack.gateway.audit.getvalue()
+    assert not leaked(GOAL, stack.gateway.audit.getvalue())
+    assert not leaked("export payments", stack.gateway.audit.getvalue())
 
 
 @INTENT_HOLD
@@ -263,10 +264,12 @@ async def test_output_policy_redacts_out_of_scope_quotes(
     else:
         text = response.json()["choices"][0]["message"]["content"]
     assert text == expected
-    assert "4111" not in response.text
+    # The card number, searched where a payload could land (not in latency floats).
+    assert not leaked("4111-1111", response.text)
+    assert not leaked("4111", response.text)
     entry = stack.gateway.audit_entries()[-1]
     assert entry["decision"] == "redact"
-    assert "4111" not in stack.gateway.audit.getvalue()
+    assert not leaked("4111", stack.gateway.audit.getvalue())
 
 
 @OUTPUT_DENY
@@ -278,7 +281,7 @@ async def test_output_policy_block_mode_blocks(stack: MCPStack, llm: ScriptedLLM
     response = await ask(stack.gateway, db.token)
     assert response.status_code == 403
     assert response.json()["error"]["code"] == "out_of_scope_data"
-    assert "4111" not in response.text
+    assert not leaked("4111", response.text)
 
 
 async def test_judge_calls_are_not_audited_or_charged(stack: MCPStack, llm: ScriptedLLM):

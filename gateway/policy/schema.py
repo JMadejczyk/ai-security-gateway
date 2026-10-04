@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 
 from pydantic import (
     AfterValidator,
+    AliasChoices,
     Field,
     JsonValue,
     PositiveFloat,
@@ -403,6 +404,9 @@ class RemoteLlmUpstream(_LlmUpstreamBase):
     every request and wins over the agent's fields (e.g. OpenRouter's
     ``provider: {zdr: true, data_collection: deny}``). ``pricing`` replaces the top-level price
     of a logical id while this upstream is selected (remote calls have no GPU time).
+    ``judge_model`` is the logical id the LLM judges ask for while this upstream is selected
+    (``judges.model`` and per-control overrides name local models); it must be mapped, and
+    remote mode with a ``judges`` section refuses to start without it.
     """
 
     base_url: HttpsUrl
@@ -412,6 +416,7 @@ class RemoteLlmUpstream(_LlmUpstreamBase):
     pricing: FrozenDict[PricedModel, ModelPrice] = Field(
         default_factory=FrozenDict[str, ModelPrice]
     )
+    judge_model: PricedModel | None = None
 
     @model_validator(mode="after")
     def _coherent(self) -> Self:
@@ -424,6 +429,9 @@ class RemoteLlmUpstream(_LlmUpstreamBase):
             raise ValueError(msg)
         if unmapped := sorted(set(self.pricing) - set(self.model_map)):
             msg = f"pricing names models without a model_map entry: {unmapped}"
+            raise ValueError(msg)
+        if self.judge_model is not None and self.judge_model not in self.model_map:
+            msg = f"judge_model {self.judge_model!r} has no model_map entry"
             raise ValueError(msg)
         return self
 
@@ -483,11 +491,20 @@ class PromptInjectionConfig(ControlConfig):
     # Characters of not yet classified text one call may carry; more fails closed. The model
     # runs at roughly 5 KB/s on 4 CPU threads, so this also bounds the added latency.
     max_chars: Annotated[int, Field(gt=0, le=10_000_000)] = 50_000
-    # How long a classifier hit on the user's own prompt waits for the judge before the call
-    # is allowed and the session tainted (`prompt_injection_unconfirmed`). The judge's own
+    # How long a classifier hit the judge must confirm (the agent's own prompt before the
+    # model, the model's answer after it) waits for the judge before the text is let through
+    # and the session tainted (`prompt_injection_unconfirmed`). The judge's own
     # `judges.timeout_s` still applies, so the effective wait is the smaller of the two; set
-    # explicitly, it must not exceed `judges.timeout_s`.
-    user_judge_timeout_s: Annotated[float, Field(gt=0.0, le=300.0)] = 15.0
+    # explicitly, it must not exceed `judges.timeout_s`. `user_judge_timeout_s` is its
+    # earlier name, still accepted.
+    judge_confirm_timeout_s: Annotated[
+        float,
+        Field(
+            gt=0.0,
+            le=300.0,
+            validation_alias=AliasChoices("judge_confirm_timeout_s", "user_judge_timeout_s"),
+        ),
+    ] = 15.0
 
     @field_validator("judge_band")
     @classmethod
@@ -698,8 +715,8 @@ class Policy(FrozenModel):
         injection = controls.prompt_injection
         if injection is not None and "judge_band" in injection.model_fields_set:
             configured.append("prompt_injection.judge_band")
-        if injection is not None and "user_judge_timeout_s" in injection.model_fields_set:
-            configured.append("prompt_injection.user_judge_timeout_s")
+        if injection is not None and "judge_confirm_timeout_s" in injection.model_fields_set:
+            configured.append("prompt_injection.judge_confirm_timeout_s")
         poisoning = controls.tool_poisoning
         if poisoning is not None and "judge_band" in poisoning.model_fields_set:
             configured.append("tool_poisoning.judge_band")
@@ -709,16 +726,16 @@ class Policy(FrozenModel):
         return self
 
     @model_validator(mode="after")
-    def _user_judge_timeout_within_the_judge_timeout(self) -> Self:
+    def _judge_confirm_timeout_within_the_judge_timeout(self) -> Self:
         injection, judges = self.controls.prompt_injection, self.judges
         if (
             injection is not None
             and judges is not None
-            and "user_judge_timeout_s" in injection.model_fields_set
-            and injection.user_judge_timeout_s > judges.timeout_s
+            and "judge_confirm_timeout_s" in injection.model_fields_set
+            and injection.judge_confirm_timeout_s > judges.timeout_s
         ):
             msg = (
-                f"prompt_injection.user_judge_timeout_s ({injection.user_judge_timeout_s}) "
+                f"prompt_injection.judge_confirm_timeout_s ({injection.judge_confirm_timeout_s}) "
                 f"must not exceed judges.timeout_s ({judges.timeout_s})"
             )
             raise ValueError(msg)

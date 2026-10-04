@@ -54,7 +54,7 @@ from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from enum import StrEnum
-from typing import Any, Final, cast
+from typing import Any, Final, Protocol, cast, runtime_checkable
 
 from prometheus_client import Counter, Histogram
 from pydantic import BaseModel, ValidationError
@@ -257,6 +257,14 @@ def _json_text(answer: str) -> str:
     return text
 
 
+@runtime_checkable
+class JudgeModelSource(Protocol):
+    """An upstream that decides which model judges ask it for (the LLM proxy: a remote
+    upstream serves its own model ids, not the local ``judges.model``)."""
+
+    def judge_model(self, snapshot: PolicySnapshot, configured: str) -> str: ...
+
+
 _PINNED: ContextVar[PolicySnapshot | None] = ContextVar("acl_judge_snapshot", default=None)
 
 
@@ -340,8 +348,11 @@ class JudgeClient:
             if control_id in CONTROL_CATALOG
             else None
         )
+        model = override if isinstance(override, str) else settings.model
+        if isinstance(self._upstream, JudgeModelSource):
+            model = self._upstream.judge_model(snapshot, model)
         body: dict[str, Any] = {
-            "model": override if isinstance(override, str) else settings.model,
+            "model": model,
             "messages": judge_messages(
                 instructions=instructions,
                 content=content,

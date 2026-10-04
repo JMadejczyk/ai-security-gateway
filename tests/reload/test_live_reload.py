@@ -8,9 +8,9 @@ ALLOW = pytest.mark.control("authz", "allow")
 DENY = pytest.mark.control("authz", "deny")
 
 CHAT = "/v1/chat/completions"
-GRANT_LLAMA = (
-    '"generate:model:qwen3:8b"]',
-    '"generate:model:qwen3:8b", "generate:model:llama3:70b"]',
+GRANT_LLAMA = (  # the intern role's last grant
+    '"generate:model:deepseek-v4.1-flash"] }',
+    '"generate:model:deepseek-v4.1-flash", "generate:model:llama3:70b"] }',
 )
 
 

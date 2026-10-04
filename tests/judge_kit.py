@@ -81,7 +81,7 @@ def _injection(document: dict[str, Any]) -> dict[str, Any]:
 def set_judges(document: dict[str, Any], judges: Any) -> dict[str, Any]:
     """``document`` with its ``judges`` section replaced. A judge-bound setting the new
     section cannot carry is dropped with it, so the control falls back to its default:
-    ``prompt_injection.user_judge_timeout_s`` must not exceed ``judges.timeout_s`` (the root
+    ``prompt_injection.judge_confirm_timeout_s`` must not exceed ``judges.timeout_s`` (the root
     policy sets 35 s for a CPU judge; tests use judges of a few seconds)."""
     document["judges"] = judges
     try:
@@ -89,9 +89,10 @@ def set_judges(document: dict[str, Any], judges: Any) -> dict[str, Any]:
     except ValidationError:
         timeout_s = None  # an invalid section, under test: keep the rest of the document valid
     injection = _injection(document)
-    bound = injection.get("user_judge_timeout_s")
-    if bound is not None and (timeout_s is None or bound > timeout_s):
-        injection.pop("user_judge_timeout_s")
+    for key in ("judge_confirm_timeout_s", "user_judge_timeout_s"):  # name, earlier name
+        bound = injection.get(key)
+        if bound is not None and (timeout_s is None or bound > timeout_s):
+            injection.pop(key)
     return document
 
 
@@ -103,7 +104,7 @@ def drop_judges(document: dict[str, Any]) -> dict[str, Any]:
     controls: dict[str, Any] = document.get("controls") or {}
     for control in ("intent_judge", "output_policy"):
         controls.pop(control, None)
-    for key in ("judge_band", "user_judge_timeout_s"):
+    for key in ("judge_band", "judge_confirm_timeout_s", "user_judge_timeout_s"):
         _injection(document).pop(key, None)
     (controls.get("tool_poisoning") or {}).pop("judge_band", None)
     return document

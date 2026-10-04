@@ -23,6 +23,9 @@ class TokenUsage(FrozenModel):
     prompt_tokens: int = Field(default=0, ge=0)
     completion_tokens: int = Field(default=0, ge=0)
     total_tokens: int = Field(default=0, ge=0)
+    # What the upstream says the call cost, in USD (OpenRouter's ``usage.cost``), when it
+    # reported a finite, non-negative number. Settled instead of the price table, never above it.
+    cost_usd: float | None = Field(default=None, ge=0.0)
 
 
 class UpstreamResult(FrozenModel):

@@ -8,6 +8,7 @@ upstream is untouched when remote is not selected.
 """
 
 import json
+import logging
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
@@ -46,8 +47,15 @@ CHAT = "/v1/chat/completions"
 REMOTE = "https://openrouter.ai/api/v1"
 KEY_ENV = "OPENROUTER_API_KEY"
 KEY = "remote-test-key-" + "q8Zr2Lm5Tx9Wc4Vb7Nd1"  # fake, assembled
-PROVIDER = "qwen/qwen3-30b-a3b-instruct-2507"
-ZDR_TERMS = {"provider": {"zdr": True, "data_collection": "deny"}}
+LOGICAL = "deepseek-v4.1-flash"  # its own logical id: qwen3:8b stays local-only
+PROVIDER = "deepseek/deepseek-v4.1-flash"
+ZDR_TERMS = {
+    "provider": {
+        "zdr": True,
+        "data_collection": "deny",
+        "max_price": {"prompt": 0.3, "completion": 1.2},
+    }
+}
 PESEL = "44051401359"
 API_KEY = "sk-proj-" + "Ab3De5Fg7Hi9Jk1Lm3No5Pq7Rs9Tu1Vw3Xy5Za7Bc9De"  # fake, assembled
 ZDR_REFUSAL = "No endpoints found matching your data policy (Zero data retention). zdr-detail"
@@ -77,7 +85,8 @@ def answers(openrouter: respx.MockRouter) -> respx.Route:
 
 async def ask(gateway: Harness, sub: str = "anna@demo", **body: Any) -> httpx.Response:
     token = await gateway.token(sub)
-    return await gateway.agent.post(CHAT, json=chat(**body), headers=bearer(token))
+    request = chat(**{"model": LOGICAL, **body})
+    return await gateway.agent.post(CHAT, json=request, headers=bearer(token))
 
 
 def sent(route: respx.Route) -> dict[str, Any]:
@@ -92,9 +101,9 @@ async def test_the_model_is_mapped_out_and_back(remote, answers):
     response = await ask(remote)
     assert response.status_code == 200
     assert sent(answers)["model"] == PROVIDER
-    assert response.json()["model"] == "qwen3:8b"  # the agent only ever sees logical ids
+    assert response.json()["model"] == LOGICAL  # the agent only ever sees logical ids
     (entry,) = remote.audit_entries()
-    assert entry["resource"] == "model:qwen3:8b"
+    assert entry["resource"] == f"model:{LOGICAL}"
     assert {"control": "model_allowlist", "stage": "post", "decision": "allow"}.items() <= next(
         v for v in entry["verdicts"] if (v["control"], v["stage"]) == ("model_allowlist", "post")
     ).items()
@@ -103,15 +112,17 @@ async def test_the_model_is_mapped_out_and_back(remote, answers):
 @ALLOWLIST_DENY
 async def test_an_answer_from_an_unmapped_provider_model_is_a_mismatch(remote, openrouter):
     openrouter.post("/chat/completions").mock(
-        return_value=httpx.Response(200, json=completion(model="qwen/qwen3-30b-a3b-instruct"))
+        return_value=httpx.Response(200, json=completion(model="deepseek/deepseek-v4-flash"))
     )
     response = await ask(remote)
     assert (response.status_code, response.json()["error"]["code"]) == (403, "model_mismatch")
 
 
-async def test_an_unmapped_model_is_refused_before_egress(remote, answers):
-    response = await ask(remote, model="llama3:70b")  # anna may generate it; remote cannot
-    assert (response.status_code, response.json()["error"]["code"]) == (400, "model_not_mapped")
+async def test_a_local_model_is_refused_in_remote_mode_before_egress(remote, answers):
+    response = await ask(remote, model="qwen3:8b")  # anna may generate it; remote serves it not
+    error = response.json()["error"]
+    assert (response.status_code, error["code"]) == (400, "model_not_mapped")
+    assert error["message"] == f"qwen3:8b is local-only; the remote upstream serves: {LOGICAL}"
     assert not answers.called
     (entry,) = remote.audit_entries()
     assert (entry["reason_code"], entry["upstream"]) == ("model_not_mapped", "remote")
@@ -119,9 +130,23 @@ async def test_an_unmapped_model_is_refused_before_egress(remote, answers):
 
 async def test_models_lists_the_mapped_logical_ids_only(remote, openrouter):
     listing = openrouter.get("/models")
-    response = await remote.agent.get("/v1/models", headers=bearer(await remote.token("anna@demo")))
-    assert [m["id"] for m in response.json()["data"]] == ["qwen3:8b"]
+    for sub in ("anna@demo", "bartek@demo", "svc:nightly_etl"):  # each holds the grant
+        token = await remote.token(sub)
+        response = await remote.agent.get("/v1/models", headers=bearer(token))
+        assert [m["id"] for m in response.json()["data"]] == [LOGICAL], sub
+    olga = await remote.token("olga@demo")  # ops-team grants nothing
+    assert (await remote.agent.get("/v1/models", headers=bearer(olga))).json()["data"] == []
     assert not listing.called  # nothing to ask: the policy names the models
+
+
+async def test_a_remote_model_is_refused_in_local_mode(gateway, llm_upstream):
+    route = llm_upstream.post("/chat/completions")
+    token = await gateway.token("anna@demo")
+    response = await gateway.agent.post(CHAT, json=chat(LOGICAL), headers=bearer(token))
+    error = response.json()["error"]
+    assert (response.status_code, error["code"]) == (400, "model_not_mapped")
+    assert error["message"] == f"{LOGICAL} is served by the remote upstream only (make remote-up)"
+    assert not route.called
 
 
 # ------------------------------------------------------------ what leaves the machine
@@ -159,7 +184,7 @@ async def test_reasoning_effort_is_translated_for_this_upstream(
 
 async def test_only_the_gateway_key_reaches_the_remote_upstream(remote, answers):
     token = await remote.token("anna@demo")
-    await remote.agent.post(CHAT, json=chat(), headers=bearer(token))
+    await remote.agent.post(CHAT, json=chat(LOGICAL), headers=bearer(token))
     headers = answers.calls.last.request.headers
     assert headers["authorization"] == f"Bearer {KEY}"
     assert token not in str(headers)
@@ -246,7 +271,7 @@ async def test_judges_use_the_selected_upstream_with_mapping_terms_and_translati
         )
     assert verdict.ok is True
     body = sent(route)
-    assert body["model"] == PROVIDER
+    assert body["model"] == PROVIDER  # llm_remote.judge_model, not judges.model (qwen3:8b)
     assert body["reasoning"] == {"enabled": False}  # judges.reasoning_effort: "none"
     assert body["provider"] == ZDR_TERMS["provider"]
     assert body["response_format"] == {"type": "json_object"}
@@ -271,7 +296,7 @@ async def test_the_local_default_is_unchanged(gateway, llm_upstream):
     route = llm_upstream.post("/chat/completions").mock(
         return_value=httpx.Response(200, json=completion())
     )
-    response = await ask(gateway, reasoning_effort="none", seed=7)
+    response = await ask(gateway, model="qwen3:8b", reasoning_effort="none", seed=7)
     assert response.status_code == 200
     body = sent(route)
     assert (body["model"], body["reasoning_effort"], body["seed"]) == ("qwen3:8b", "none", 7)
@@ -305,6 +330,18 @@ def test_startup_refuses_remote_without_the_policy_section(tmp_path):
         GatewayContainer.from_settings(settings, env={KEY_ENV: KEY})
 
 
+def test_remote_judges_need_a_mapped_judge_model(tmp_path):
+    document = yaml.safe_load(ROOT_POLICY.read_text())
+    del document["upstreams"]["llm_remote"]["judge_model"]
+    path = tmp_path / "policy.yaml"
+    path.write_text(yaml.safe_dump(document))
+    settings = make_settings(path, llm_upstream="remote", pins_dir=tmp_path)
+    with pytest.raises(PolicyLoadError, match="judge_model"):
+        GatewayContainer.from_settings(settings, env={KEY_ENV: KEY})
+    # Locally the judges keep judges.model: the remote judge_model is not needed.
+    PolicyLoader(requirement=require_upstream(LlmUpstreamKind.LOCAL)).load(path)
+
+
 async def test_a_reload_cannot_drop_the_selected_remote_upstream(remote, answers):
     document = yaml.safe_load(remote.policy_path.read_text())
     del document["upstreams"]["llm_remote"]
@@ -329,7 +366,8 @@ def test_local_mode_does_not_require_the_remote_section(tmp_path):
     [
         ({"base_url": "http://openrouter.ai/api/v1"}, "https"),
         ({"extra_body": {"model": "openai/gpt-4o"}}, "gateway-owned"),
-        ({"model_map": {"qwen3:8b": PROVIDER, "other:1b": PROVIDER}}, "one logical id"),
+        ({"model_map": {LOGICAL: PROVIDER, "other:1b": PROVIDER}}, "one logical id"),
+        ({"judge_model": "qwen3:8b"}, "judge_model 'qwen3:8b' has no model_map entry"),
         ({"pricing": {"llama3:70b": {"prompt_per_1k": 0.1}}}, "without a model_map entry"),
         ({"model_map": {}}, "at least 1"),
     ],
@@ -345,7 +383,7 @@ def test_outgoing_request_for_the_remote_upstream(snapshot):
     remote = snapshot.policy.upstreams.llm_remote
     assert remote is not None
     body = outgoing_request(
-        {"model": "qwen3:8b", "messages": [], "stream": True, "stream_options": {}}, remote
+        {"model": LOGICAL, "messages": [], "stream": True, "stream_options": {}}, remote
     )
     assert body == {"model": PROVIDER, "messages": [], "stream": False, **ZDR_TERMS}
 
@@ -363,8 +401,8 @@ async def test_remote_calls_charge_remote_token_prices_and_no_gpu_time(snapshot)
         principal="anna@demo",
         agent="databot",
         channel=Channel.LLM,
-        model="qwen3:8b",
-        payload=chat(max_tokens=100),
+        model=LOGICAL,
+        payload=chat(LOGICAL, max_tokens=100),
         user_label="anna@demo",
         agent_label="databot",
     )
@@ -372,17 +410,77 @@ async def test_remote_calls_charge_remote_token_prices_and_no_gpu_time(snapshot)
     assert reservation.held.gpu_ms == 0
     assert reservation.gpu_allowance_s == snapshot.policy.limits.upstream_timeout_s  # deadline
     assert reservation.gpu_metered is False
-    usage = TokenUsage(model="qwen3:8b", prompt_tokens=1000, completion_tokens=1000)
+    usage = TokenUsage(model=LOGICAL, prompt_tokens=1000, completion_tokens=1000)
     await ledger.settle(reservation, UpstreamResult(body={}, elapsed_s=42.0, usage=usage))
     await ledger.drain()
     spent = await ledger.store.usages(reservation.scopes)
     by_kind = {
         scope.kind.value: used for scope, used in zip(reservation.scopes, spent, strict=True)
     }
-    # 1000 prompt * $0.0001/1k + 1000 completion * $0.0003/1k = $0.0004; no GPU seconds.
-    assert by_kind["per_user"].cost_nano_usd == 400_000
+    # 1000 prompt * $0.0003/1k + 1000 completion * $0.0012/1k = $0.0015 (the max_price
+    # ceiling, never less than an endpoint can charge); no GPU seconds.
+    assert by_kind["per_user"].cost_nano_usd == 1_500_000
     assert all(used.gpu_ms == 0 for used in spent)  # 42 s of wall time, none of it ours
     # per_session limits GPU seconds and tool calls only: a remote LLM call draws on neither,
     # so the session scope (gpu_seconds: 900) is not even touched.
     assert "per_session" not in by_kind
     assert all(Meter.GPU not in scope.limits.limited() for scope in reservation.scopes)
+
+
+# ------------------------------------------- settling on the cost OpenRouter reports
+
+# completion()'s usage: 12 prompt + 7 completion tokens. At the max_price ceiling
+# ($0.0003 / $0.0012 per 1k) that is 3,600 + 8,400 = 12,000 nano-USD: the most it may cost.
+CEILING_USD = 0.000012
+
+
+def cost_metric() -> float:
+    labels = {"user": "anna@demo", "agent": "databot", "model": LOGICAL}
+    return REGISTRY.get_sample_value("acl_cost_usd_total", labels) or 0.0
+
+
+def billed(openrouter: respx.MockRouter, cost: object) -> None:
+    """OpenRouter's answer with ``usage.cost`` set to ``cost`` (raw JSON text, so NaN works)."""
+    body = completion(model=PROVIDER)
+    body["usage"]["cost"] = "__COST__"
+    raw = json.dumps(body).replace(
+        '"__COST__"', cost if isinstance(cost, str) else json.dumps(cost)
+    )
+    openrouter.post("/chat/completions").mock(
+        return_value=httpx.Response(
+            200, content=raw.encode(), headers={"content-type": "application/json"}
+        )
+    )
+
+
+async def settled_cost(remote: Harness) -> float:
+    before = cost_metric()
+    response = await ask(remote)
+    assert response.status_code == 200
+    await remote.container.budgets.drain()
+    return round(cost_metric() - before, 12)
+
+
+async def test_a_reported_cost_is_what_gets_settled(remote, openrouter):
+    billed(openrouter, 0.000002)  # an endpoint well below the ceiling
+    assert await settled_cost(remote) == pytest.approx(0.000002, abs=1e-12)
+
+
+async def test_without_a_reported_cost_the_ceiling_is_settled(remote, openrouter):
+    openrouter.post("/chat/completions").mock(
+        return_value=httpx.Response(200, json=completion(model=PROVIDER))
+    )
+    assert await settled_cost(remote) == pytest.approx(CEILING_USD, abs=1e-12)
+
+
+async def test_a_reported_cost_above_the_ceiling_is_capped_and_logged(remote, openrouter, caplog):
+    billed(openrouter, 0.5)
+    with caplog.at_level(logging.WARNING, logger="gateway.budget.metering"):
+        assert await settled_cost(remote) == pytest.approx(CEILING_USD, abs=1e-12)
+    assert any("above_price_ceiling" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("cost", ["-0.001", "NaN", "Infinity", '"0.000002"', "true", "null"])
+async def test_a_malformed_reported_cost_settles_at_the_ceiling(remote, openrouter, cost):
+    billed(openrouter, cost)
+    assert await settled_cost(remote) == pytest.approx(CEILING_USD, abs=1e-12)

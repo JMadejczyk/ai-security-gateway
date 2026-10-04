@@ -16,23 +16,23 @@ upstreams:                 # internal networks, reachable only from the gateway
     api_key_env: OPENROUTER_API_KEY         # gateway environment only, from .env
     reasoning: openrouter                   # reasoning_effort -> reasoning {enabled|effort}
     model_map:
-      # qwen/qwen3-8b has no zero-data-retention endpoint on OpenRouter (2026-10-04: one
-      # provider, not ZDR), so ZDR routing could never serve it. The hybrid Qwen3 models with
-      # ZDR endpoints (qwen3-14b, -32b) keep thinking whatever `reasoning` says (measured: only
-      # a "/no_think" prompt suffix stops them), which the judges cannot afford. The 2507
-      # instruct model never thinks, has ZDR endpoints (DekaLLM, Nebius, SiliconFlow), JSON mode,
-      # and answered a one-sentence prompt in ~1.4 s.
-      "qwen3:8b": qwen/qwen3-30b-a3b-instruct-2507
+      # Its own logical id, never an alias of a local model: qwen3:8b stays local-only.
+      # DeepSeek V4.1 Flash: ~27 zero-data-retention endpoints on OpenRouter (2026-10-04),
+      # JSON mode, tools; `reasoning: {enabled: false}` gives 0 reasoning tokens (measured).
+      "deepseek-v4.1-flash": deepseek/deepseek-v4.1-flash
+    judge_model: "deepseek-v4.1-flash"      # judges' model while remote is selected
     extra_body:                             # merged into every request; the agent cannot override
       provider:
         zdr: true                           # zero-data-retention endpoints only, or an error
         data_collection: deny               # no provider that may train on or store prompts
+        # USD per million tokens: no endpoint dearer than the price budgets charge below, so a
+        # reservation is always an upper bound (ZDR endpoints span $0.02-3.12 out, 2026-10-04).
+        max_price: { prompt: 0.3, completion: 1.2 }
         # Fallbacks stay on: zdr filters every candidate, so a fallback is another ZDR endpoint.
     pricing:                                # replaces the top-level price while remote is selected
-      # OpenRouter, qwen/qwen3-30b-a3b-instruct-2507 ZDR endpoints 2026-10-04, USD per 1k tokens:
-      # the dearest of DekaLLM/SiliconFlow $0.09 and Nebius $0.10 in, $0.30 out per million.
-      # No GPU time is ours to charge.
-      "qwen3:8b": { prompt_per_1k: 0.0001, completion_per_1k: 0.0003, gpu_second: 0.0 }
+      # The provider.max_price ceiling above, per 1k tokens: what a call can cost at most.
+      # Typical ZDR endpoints are cheaper ($0.02-0.30 in, $0.18-1.20 out per million).
+      "deepseek-v4.1-flash": { prompt_per_1k: 0.0003, completion_per_1k: 0.0012, gpu_second: 0.0 }
   mcp:
     sales_db:
       url: http://mcp-postgres:8000/mcp
@@ -59,7 +59,8 @@ upstreams:                 # internal networks, reachable only from the gateway
 roles:
   analyst:  { allow: ["read:db:sales.*", "read:web:*", "write:fs:reports/*", "generate:model:*"] }
   intern:   { allow: ["read:db:sales.orders", "read:db:sales.customers", "read:web:*",
-                      "write:fs:reports/*", "generate:model:qwen3:8b"] }
+                      "write:fs:reports/*", "generate:model:qwen3:8b",
+                      "generate:model:deepseek-v4.1-flash"] }
   admin:    { allow: ["*:*"] }
   ops-team: { allow: [] }                   # approvers; grants nothing by itself
 
@@ -73,7 +74,8 @@ agents:
   nightly_etl:
     type: autonomous                        # principal is svc:nightly_etl, U = this allow list
     max_actions: [read, write, generate]
-    allow: ["read:db:sales.*", "read:web:*", "write:fs:reports/*", "generate:model:qwen3:8b"]
+    allow: ["read:db:sales.*", "read:web:*", "write:fs:reports/*", "generate:model:qwen3:8b",
+            "generate:model:deepseek-v4.1-flash"]
     approvers: [ops-team]                   # must be a role defined above
 
 risk:
@@ -117,11 +119,11 @@ controls:
   pii:              { mode: redact, threshold: 0.6,
                       entities: [PL_PESEL, PL_NIP, IBAN_CODE, EMAIL_ADDRESS, PHONE_NUMBER] }
   secrets:          { mode: block }
-  # user_judge_timeout_s: how long a flagged user/system prompt waits for the judge before it
-  # is allowed and the session tainted (must be <= judges.timeout_s). CPU judge ~25 s, so 35
-  # here; use ~5-10 on a GPU.
+  # judge_confirm_timeout_s: how long a classifier hit on the agent's own prompt, or on the
+  # model's answer, waits for the judge before it is let through and the session tainted
+  # (must be <= judges.timeout_s). CPU judge ~25 s, so 35 here; use ~5-10 on a GPU.
   prompt_injection: { mode: block, threshold: 0.85, judge_band: [0.5, 0.85], risk_delta: 0.6,
-                      user_judge_timeout_s: 35 }
+                      judge_confirm_timeout_s: 35 }
   sql_guard:        { mode: block, max_cost: 10000, force_limit: 500, timeout_ms: 3000 }
   egress:           { mode: block, allowed_ports: [80, 443] }   # http-adapter servers: public destinations only
   signatures:       { mode: block, feed: feeds/signatures.json, refresh_s: 30 }  # relative to this file, or an http(s) URL

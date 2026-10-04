@@ -11,6 +11,7 @@ import pytest
 from compose_support import REPO_ROOT, ComposeConfig, ComposeConfigError, find_docker
 
 REMOTE_OVERLAY = REPO_ROOT / "compose.remote.yml"
+DEMO_OVERLAY = REPO_ROOT / "demo" / "compose.demo.yml"
 KEY_ENV = "OPENROUTER_API_KEY"
 PLACEHOLDER = {KEY_ENV: "placeholder-openrouter-key"}
 
@@ -66,3 +67,17 @@ def test_no_network_changes_the_gateway_leaves_through_ops_the_agent_stays_on_ed
     assert gateway_out == {"ops"}  # its only route to the internet, in both stacks
     assert config.networks_of("agent") == {"edge"}
     assert config.networks["edge"].get("internal") is True
+
+
+def test_the_demo_and_remote_overlays_combine(docker: str) -> None:
+    """`make demo-up REMOTE=1`: both overlays' gateway settings survive the merge, and the key
+    still reaches the gateway alone (demo-web and mcp-fetch get none of it)."""
+    combined = ComposeConfig.render(
+        docker, overlays=(DEMO_OVERLAY, REMOTE_OVERLAY), extra_env=PLACEHOLDER
+    )
+    gateway = combined.environment_of("gateway")
+    assert gateway["ACL_LLM_UPSTREAM"] == "remote"
+    assert "ACL_EGRESS_DEMO_HOSTS" in gateway
+    assert "ACL_FETCH_DEMO_HOSTS" in combined.environment_of("mcp-fetch")
+    assert holders(combined, KEY_ENV) == {"gateway"}
+    assert combined.networks_of("agent") == {"edge"}

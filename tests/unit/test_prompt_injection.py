@@ -21,6 +21,7 @@ from gateway.controls.prompt_injection import (
     PromptInjectionControl,
     authored_messages,
     classified_texts,
+    judge_confirmed,
     rolling_windows,
     score_bucket,
 )
@@ -148,17 +149,6 @@ MODE_CASES = [
         Decision.ALLOW,
         True,
         "no_prompt_injection",
-    ),
-    (
-        "llm-post-injection",
-        Channel.LLM,
-        Stage.POST,
-        None,
-        answer(INJECT_MARKER),
-        BLOCK,
-        Decision.BLOCK,
-        True,
-        "prompt_injection_detected",
     ),
     (
         "mcp-pre-clean",
@@ -997,9 +987,9 @@ async def test_hits_on_authored_text_go_to_the_judge(
 
 
 @ALLOWED
-async def test_a_judge_slower_than_user_judge_timeout_allows_and_taints(interaction):
+async def test_a_judge_slower_than_the_confirm_timeout_allows_and_taints(interaction):
     judge = HangingJudge()
-    cfg = BLOCK.model_copy(update={"user_judge_timeout_s": 0.05})
+    cfg = BLOCK.model_copy(update={"judge_confirm_timeout_s": 0.05})
     started = time.perf_counter()
     verdict = await control(judge=judge).evaluate(
         interaction(Channel.LLM, chat_with(("user", INJECT_MARKER))), Stage.PRE, cfg
@@ -1066,15 +1056,75 @@ async def test_a_window_over_user_messages_only_goes_to_the_judge(interaction):
 
 
 @DENIED
-async def test_mcp_results_and_llm_answers_are_unchanged(interaction):
+async def test_mcp_results_stay_on_the_classifier_alone(interaction):
     judge = ScriptedJudge(NO_JUDGE_ANSWER)
     pi = control(judge=judge)
     mcp = await pi.evaluate(interaction(Channel.MCP, result=page(HIDDEN)), Stage.POST, BLOCK)
-    llm = await pi.evaluate(
-        interaction(Channel.LLM, result=answer(INJECT_MARKER)), Stage.POST, BLOCK
-    )
-    assert mcp.reason_code == llm.reason_code == "prompt_injection_detected"
+    assert mcp.reason_code == "prompt_injection_detected"
     assert judge.contents == []
+
+
+# ------------------------------- the model's own answer: judge confirms, taint on timeout
+
+POLISH_ANSWER = (
+    "Szanowny Panie, uprzejmie przypominamy o fakturze FV/2026/09/114 na kwotę 1 240,00 zł. "
+    f"Prosimy o płatność do piątku. {INJECT_MARKER}"
+)
+
+
+def answer_with_tool_call(arguments: str) -> dict[str, Any]:
+    call = {"id": "c1", "type": "function", "function": {"name": "query", "arguments": arguments}}
+    message = {"role": "assistant", "content": None, "tool_calls": [call]}
+    return {"model": "qwen3:8b", "choices": [{"message": message}]}
+
+
+ANSWER_CASES = [
+    pytest.param(ScriptedJudge(NO_JUDGE_ANSWER), answer(POLISH_ANSWER), Decision.ALLOW,
+                 "judge_cleared", 0.0, False, id="polish-answer-cleared", marks=ALLOWED),
+    pytest.param(ScriptedJudge(YES_JUDGE_ANSWER), answer(POLISH_ANSWER), Decision.BLOCK,
+                 "prompt_injection_detected", 0.6, False, id="answer-confirmed", marks=DENIED),
+    pytest.param(ScriptedJudge(None, JudgeResult.TIMEOUT), answer(POLISH_ANSWER), Decision.ALLOW,
+                 "prompt_injection_unconfirmed", 0.6, True, id="answer-judge-timeout",
+                 marks=ALLOWED),
+    pytest.param(None, answer(POLISH_ANSWER), Decision.ALLOW, "prompt_injection_unconfirmed", 0.6,
+                 True, id="answer-no-judge", marks=ALLOWED),
+    pytest.param(ScriptedJudge(YES_JUDGE_ANSWER),
+                 answer_with_tool_call(json.dumps({"sql": f"SELECT 1 -- {INJECT_MARKER}"})),
+                 Decision.BLOCK, "prompt_injection_detected", 0.6, False,
+                 id="tool-call-arguments-confirmed", marks=DENIED),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("judge", "result", "decision", "reason_code", "risk", "taint"), ANSWER_CASES
+)
+async def test_hits_on_the_models_answer_go_to_the_judge(
+    interaction, judge, result, decision, reason_code, risk, taint
+):
+    """User decision 2026-10-04: the English-first classifier misfires on Polish answers."""
+    verdict = await control(judge=judge).evaluate(
+        interaction(Channel.LLM, result=result), Stage.POST, BLOCK
+    )
+    assert (verdict.decision, verdict.reason_code, verdict.risk_delta, verdict.taint) == (
+        decision,
+        reason_code,
+        risk,
+        taint,
+    )
+    if judge is not None:
+        assert judge.contents  # asked (a tool call's name and arguments may be two windows)
+
+
+def test_everything_in_the_answer_is_judge_confirmed():
+    confirmed = judge_confirmed(
+        Interaction.model_construct(channel=Channel.LLM, result=answer("x")), Stage.POST
+    )
+    assert confirmed(TextSegment("/choices/0/message/content", "x", key="content"))
+    assert confirmed(TextSegment("/choices/0/message/reasoning", "x", key="reasoning"))
+    mcp = judge_confirmed(
+        Interaction.model_construct(channel=Channel.MCP, payload={}, result={}), Stage.POST
+    )
+    assert not mcp(TextSegment("/content/0/text", "x", key="text"))
 
 
 def test_authored_messages_by_role():
@@ -1096,13 +1146,29 @@ def test_authored_messages_by_role():
     assert not post(TextSegment("/messages/1/content", "x", key="content"))
 
 
-def test_user_judge_timeout_must_fit_the_judge_timeout(policy_doc, snapshot_from):
+def test_judge_confirm_timeout_must_fit_the_judge_timeout(policy_doc, snapshot_from):
     set_judges(policy_doc, {"model": "qwen3:8b", "timeout_s": 10})
-    policy_doc["controls"]["prompt_injection"]["user_judge_timeout_s"] = 15
-    with pytest.raises(PolicyLoadError, match="user_judge_timeout_s"):
+    injection = policy_doc["controls"]["prompt_injection"]
+    injection["judge_confirm_timeout_s"] = 15
+    with pytest.raises(PolicyLoadError, match="judge_confirm_timeout_s"):
         snapshot_from(policy_doc)
-    policy_doc["controls"]["prompt_injection"]["user_judge_timeout_s"] = 5
-    assert snapshot_from(policy_doc).policy.controls.prompt_injection.user_judge_timeout_s == 5
+    injection["judge_confirm_timeout_s"] = 5
+    loaded = snapshot_from(policy_doc).policy.controls.prompt_injection
+    assert loaded is not None
+    assert loaded.judge_confirm_timeout_s == 5
+
+
+def test_the_earlier_name_user_judge_timeout_s_is_still_accepted(policy_doc, snapshot_from):
+    set_judges(policy_doc, {"model": "qwen3:8b", "timeout_s": 10})
+    injection = policy_doc["controls"]["prompt_injection"]
+    injection.pop("judge_confirm_timeout_s", None)
+    injection["user_judge_timeout_s"] = 7
+    loaded = snapshot_from(policy_doc).policy.controls.prompt_injection
+    assert loaded is not None
+    assert loaded.judge_confirm_timeout_s == 7
+    injection["user_judge_timeout_s"] = 15  # the same rule under the old name
+    with pytest.raises(PolicyLoadError, match="judge_confirm_timeout_s"):
+        snapshot_from(policy_doc)
 
 
 def test_the_demo_policy_gives_the_cpu_judge_time_to_decide(snapshot):
@@ -1112,8 +1178,8 @@ def test_the_demo_policy_gives_the_cpu_judge_time_to_decide(snapshot):
     judges = snapshot.policy.judges
     assert injection is not None
     assert judges is not None
-    assert injection.user_judge_timeout_s == 35
-    assert injection.user_judge_timeout_s <= judges.timeout_s
+    assert injection.judge_confirm_timeout_s == 35
+    assert injection.judge_confirm_timeout_s <= judges.timeout_s
 
 
 def test_swapping_in_a_faster_judge_drops_the_longer_user_timeout(policy_doc, snapshot_from):
@@ -1121,5 +1187,5 @@ def test_swapping_in_a_faster_judge_drops_the_longer_user_timeout(policy_doc, sn
     snapshot = snapshot_from(set_judges(policy_doc, {"model": "qwen3:8b", "timeout_s": 5}))
     injection = snapshot.policy.controls.prompt_injection
     assert injection is not None
-    assert "user_judge_timeout_s" not in injection.model_fields_set
+    assert "judge_confirm_timeout_s" not in injection.model_fields_set
     assert snapshot_from(drop_judges(policy_doc)).policy.judges is None

@@ -12,7 +12,7 @@ from typing import Any
 
 import httpx
 import pytest
-from gateway_testkit import bearer, chat, echo_completion, running_gateway
+from gateway_testkit import bearer, chat, completion, echo_completion, running_gateway
 from injection_kit import INJECT_MARKER, MarkerClassifier
 from mcp_harness import MCPStack, connect, connect_all, error_text
 from pin_kit import capture_pins, write_pins
@@ -223,3 +223,63 @@ async def test_an_unconfirmed_prompt_holds_nightly_etl_writes_for_approval(stack
     held = await reports.call("write_report", name="nightly.md", content="nightly totals")
     assert error_text(held).startswith("approval_required")
     assert stack.log.of("write_report") == []
+
+
+async def unconfirmed_answer(stack: MCPStack, token: str) -> dict:
+    """An LLM call whose answer the classifier flags while the judge times out: the answer is
+    released, the session tainted."""
+
+    def flagged_answer(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, json=completion(f"Done. {INJECT_MARKER}"))
+
+    routes: dict[str, Any] = stack.transport._routes
+    routes["ollama"] = httpx.MockTransport(flagged_answer)
+    judges: Any = stack.gateway.container.judges
+    judges.answers["InjectionJudgement"] = JudgeUnavailableError(JudgeResult.TIMEOUT)
+    body = chat(messages=[{"role": "user", "content": "Summarise the quarter."}])
+    response = await stack.gateway.agent.post(
+        "/v1/chat/completions", json=body, headers=bearer(token)
+    )
+    assert response.status_code == 200, response.text  # released: unconfirmed, not detected
+    entry = stack.gateway.audit_entries()[-1]
+    unconfirmed = {
+        "control": "prompt_injection", "stage": "post", "decision": "allow", "enforced": True,
+        "reason_code": "prompt_injection_unconfirmed", "taint": True,
+    }  # fmt: skip
+    assert unconfirmed in entry["verdicts"]
+    return entry
+
+
+@PI_ALLOW
+@AUTHZ_DENY
+async def test_an_unconfirmed_answer_costs_databot_its_report_write(stack):
+    (reports,) = await connect_all(stack, ANNA, "reports")
+    await unconfirmed_answer(stack, reports.token or "")
+    after = await reports.call("write_report", name="q4.md", content="Q4 summary")
+    assert error_text(after) == "action_removed_by_session_risk"
+    assert stack.log.of("write_report") == []
+
+
+@PI_ALLOW
+@AUTHZ_HOLD
+async def test_an_unconfirmed_answer_holds_nightly_etl_writes_for_approval(stack):
+    (reports,) = await connect_all(stack, ETL, "reports")
+    await unconfirmed_answer(stack, reports.token or "")
+    held = await reports.call("write_report", name="nightly.md", content="nightly totals")
+    assert error_text(held).startswith("approval_required")
+
+
+@PI_DENY
+async def test_a_fetched_page_with_an_injection_still_blocks_without_the_judge(stack):
+    judges: Any = stack.gateway.container.judges
+    judges.answers["InjectionJudgement"] = {
+        "is_injection": False,
+        "confidence": 1.0,
+        "rationale": "x",
+    }
+    web = await connect(stack, ANNA, "web")
+    stack.log.fetch_page = HIDDEN_PAGE
+    fetched = await web.call("fetch", url="https://supplier.example/prices")
+    assert error_text(fetched) == "prompt_injection_detected"
+    assert [c for c in judges.calls if c.control_id == "prompt_injection"] == []

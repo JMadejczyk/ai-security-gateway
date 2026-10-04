@@ -34,19 +34,20 @@ the model window is classified in overlapping windows and scores as its best win
 
 **Tiers.** Text the agent authored and text it did not are decided differently:
 
-- *Untrusted text* (MCP results, LLM answers, and in a chat request the ``tool`` and
-  ``assistant`` messages, which can carry tool results): score at or above ``threshold`` is
-  detected by the classifier alone. Score inside ``judge_band``: the best window of each such
-  text goes to the LLM judge, which answers whether it tries to instruct an AI agent; at
-  most `MAX_JUDGED` texts per call are judged. Below the band: clean.
-- *Authored text* (the LLM request's ``user``, ``system`` and ``developer`` messages,
-  `authored_messages`): any score from the band up goes to the judge, because the
-  classifier flags harmless short questions ("What is a primary key?" scored 1.0). The
-  judge confirms (block) or clears (allow); with no answer within ``user_judge_timeout_s``
-  (timeout, error, garbled answer, no judge) the call is allowed, the session tainted and
-  the risk raised (``prompt_injection_unconfirmed``), so a real injection still loses the
-  session its write and egress rights. A window built from authored and untrusted pieces
-  is untrusted: the untrusted part decides.
+- *Untrusted text* (MCP results, and in a chat request the ``tool`` and ``assistant``
+  messages, which can carry tool results): score at or above ``threshold`` is detected by
+  the classifier alone. Score inside ``judge_band``: the best window of each such text goes
+  to the LLM judge, which answers whether it tries to instruct an AI agent; at most
+  `MAX_JUDGED` texts per call are judged. Below the band: clean.
+- *Judge-confirmed text* (`judge_confirmed`): the LLM request's ``user``, ``system`` and
+  ``developer`` messages (`authored_messages`), and the model's answer after it (content,
+  tool-call arguments, reasoning). Any score from the band up goes to the judge, because
+  the English-first classifier flags harmless text ("What is a primary key?" scored 1.0,
+  and Polish answers misfire). The judge confirms (block) or clears (allow); with no answer
+  within ``judge_confirm_timeout_s`` (timeout, error, garbled answer, no judge) the text
+  is let through, the session tainted and the risk raised (``prompt_injection_unconfirmed``),
+  so a real injection still costs the session its write and egress rights. A window built
+  from judge-confirmed and untrusted pieces is untrusted: the untrusted part decides.
 
 Judge verdicts are remembered by window text under a key of the judge configuration in
 effect (`judge_config_key`), so a policy reload that changes the judge model or this
@@ -56,7 +57,7 @@ control's settings asks the judge again.
 (never text) in ``reason`` and the configured ``risk_delta``; under ``log_only`` the same
 verdict is recorded with ``enforced=False``. The pipeline taints the session on any
 non-allow verdict of this control (``TAINTING_CONTROLS``), blocked or not, and on the
-``allow`` of an unconfirmed authored hit, which carries ``taint=True`` and the risk delta.
+``allow`` of an unconfirmed hit, which carries ``taint=True`` and the risk delta.
 
 **Failing closed** (``block``, no risk added, since nothing was detected): for untrusted
 text, the judge is unavailable or not configured (``judge_unavailable``), more uncertain
@@ -276,6 +277,16 @@ def authored_messages(interaction: Interaction, stage: Stage) -> Callable[[TextS
     return authored
 
 
+def judge_confirmed(interaction: Interaction, stage: Stage) -> Callable[[TextSegment], bool]:
+    """Which segments the judge confirms instead of the classifier deciding alone: the agent's
+    own messages before the model (`authored_messages`) and, after it, everything the model
+    generated (the LLM answer: content, tool-call arguments, reasoning). Tool results and the
+    tool and assistant history stay with the classifier."""
+    if interaction.channel is Channel.LLM and stage is Stage.POST:
+        return lambda _: True
+    return authored_messages(interaction, stage)
+
+
 class Outcome(StrEnum):
     PASSED = "passed"  # nothing found
     DETECTED = "detected"  # an injection: adds the control's risk
@@ -427,7 +438,7 @@ class PromptInjectionControl(Control):
                 UNSCANNABLE, "a segment could not be decoded for classification"
             )
         else:
-            texts = provenance_texts(segments, authored_messages(interaction, stage))
+            texts = provenance_texts(segments, judge_confirmed(interaction, stage))
             authored = frozenset(text for text, is_authored in texts.items() if is_authored)
             finding = await self.classify(list(texts), config, authored=authored)
         if not finding.clean:
@@ -473,7 +484,7 @@ class PromptInjectionControl(Control):
         if uncertain:
             findings.append(await self._judge_band(_windows(uncertain), uncertain[0][1], key))
         if flagged and not any(f.outcome is Outcome.DETECTED for f in findings):
-            timeout = config.user_judge_timeout_s
+            timeout = config.judge_confirm_timeout_s
             findings.append(
                 await self._judge_authored(_windows(flagged), flagged[0][1], key, timeout)
             )

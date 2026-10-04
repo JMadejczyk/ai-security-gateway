@@ -4,6 +4,7 @@
 #
 #   docker compose -f docker-compose.yml -f compose.remote.yml up -d --build --wait   (make remote-up)
 #   docker compose up -d --wait --remove-orphans                                       (make remote-off)
+#   with the demo overlay too:                                                         make demo-up REMOTE=1
 #
 # Prompts and judge content then leave this machine, after the pre controls (pii redaction,
 # secrets and prompt-injection blocks); grants, budgets and audit keep the logical model ids,
@@ -14,6 +15,8 @@
 #   - No network is opened: the gateway already reaches the internet through `ops`, the one
 #     non-internal network it is on. The agent stays on `edge` alone (tests/bypass/).
 #   - Ollama keeps running and serving nothing; `make remote-off` returns to the default.
+#   - Remote judge verdicts can differ between runs of the same content: different ZDR
+#     endpoints serve different runs, so they are less reproducible than the local judge's.
 
 services:
   gateway:

@@ -95,18 +95,16 @@ def test_unthrottled_gives_up_after_its_retries():
 class FakeGateway:
     """Answers MCP initialize / notifications / tools/call / DELETE and chat completions."""
 
-    def __init__(self) -> None:
+    def __init__(self, models: tuple[str, ...] = ("llama3:70b", "qwen3:8b")) -> None:
         self.calls: list[dict[str, object]] = []
+        self.models = models
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":  # what the selected upstream serves this token
+            data = [{"id": model, "object": "model"} for model in self.models]
+            return httpx.Response(200, json={"object": "list", "data": data})
         if request.url.path == "/v1/chat/completions":
-            body = json.loads(request.content)
-            self.calls.append(body)
-            if "AKIA" in body["messages"][0]["content"]:
-                error = {"error": {"code": "secret_detected", "message": "blocked"}}
-                return httpx.Response(403, json=error)
-            message = {"role": "assistant", "content": "CALLER PESEL [REDACTED:PL_PESEL]"}
-            return httpx.Response(200, json={"choices": [{"message": message}]})
+            return self._chat(json.loads(request.content))
         if request.method == "DELETE":
             return httpx.Response(204)
         body = json.loads(request.content)
@@ -124,6 +122,14 @@ class FakeGateway:
         return httpx.Response(
             200, json=_result(content=[{"type": "text", "text": "ok"}], isError=False)
         )
+
+    def _chat(self, body: dict[str, object]) -> httpx.Response:
+        self.calls.append(body)
+        if "AKIA" in body["messages"][0]["content"]:  # type: ignore[index]
+            error = {"error": {"code": "secret_detected", "message": "blocked"}}
+            return httpx.Response(403, json=error)
+        message = {"role": "assistant", "content": "CALLER PESEL [REDACTED:PL_PESEL]"}
+        return httpx.Response(200, json={"choices": [{"message": message}]})
 
 
 @pytest.fixture
@@ -154,6 +160,22 @@ def test_chat_disables_thinking_and_caps_tokens(gateway):
     assert (refused.status, refused.reason) == (403, "secret_detected")
     assert gateway.calls[0]["reasoning_effort"] == "none"
     assert gateway.calls[0]["max_tokens"] == 40
+    assert gateway.calls[0]["model"] == "qwen3:8b"  # preferred over the first listed
+
+
+@pytest.mark.parametrize(
+    ("served", "picked"),
+    [
+        (("deepseek-v4.1-flash",), "deepseek-v4.1-flash"),  # remote mode
+        (("qwen3:8b", "deepseek-v4.1-flash"), "qwen3:8b"),
+        (("mistral:7b",), "mistral:7b"),  # nothing preferred: the first one listed
+    ],
+)
+def test_chat_uses_a_model_the_selected_upstream_serves(served, picked):
+    gateway = FakeGateway(models=served)
+    with httpx.Client(base_url="http://gw", transport=httpx.MockTransport(gateway)) as client:
+        chat(client, "token", "hello")
+    assert gateway.calls[0]["model"] == picked
 
 
 def test_probe_reports_an_unresolvable_name():

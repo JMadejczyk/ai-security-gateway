@@ -90,16 +90,16 @@ def test_the_prose_filter_drops_no_corpus_injection():
 
 
 KNOWN_QUESTION_FALSE_POSITIVES = frozenset({"q-en-00", "q-en-01", "q-en-16", "q-pl-26", "q-pl-30"})
-# Samples that reach the gateway as the agent's own prompt (a user or system message), where
-# a classifier hit is confirmed by the judge; the others arrive as untrusted text.
-AUTHORED_KINDS = frozenset({"prompt", "question", "system"})
+# Samples whose classifier hits the judge confirms: the agent's own prompt (a user or system
+# message) and the model's answer; the others arrive as untrusted text (tool results).
+JUDGE_CONFIRMED_KINDS = frozenset({"prompt", "question", "system", "answer"})
 
 
 def effective_outcome(sample: Sample, score: float, *, judge: str) -> str:
     """What the gateway does with ``sample`` given its classifier ``score`` and a judge that
     answers correctly (``judge="oracle"``) or never in time (``judge="unavailable"``)."""
     low, _ = PromptInjectionConfig().judge_band
-    authored = sample.kind in AUTHORED_KINDS
+    authored = sample.kind in JUDGE_CONFIRMED_KINDS
     if score < low:
         decided = "allow"
     elif not authored and score >= THRESHOLD:
@@ -163,6 +163,15 @@ def test_corpus_precision_and_recall(classifier):
                 # What the gateway does, given the judge (authored kinds are judge-confirmed):
                 "effective_with_a_correct_judge": outcome_metrics(results, "oracle"),
                 "effective_with_no_judge_answer": outcome_metrics(results, "unavailable"),
+                "answers": {
+                    s.id: {
+                        "score": round(v, 4),
+                        "with_a_correct_judge": effective_outcome(s, v, judge="oracle"),
+                        "with_no_judge_answer": effective_outcome(s, v, judge="unavailable"),
+                    }
+                    for s, v in results
+                    if s.kind == "answer"
+                },
             },
             indent=2,
         )

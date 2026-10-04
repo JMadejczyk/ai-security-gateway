@@ -23,7 +23,9 @@
 import copy
 import json
 import logging
+import math
 import os
+import re
 import time
 from collections.abc import Callable, Iterator, Mapping
 from typing import Any, Final, cast
@@ -48,6 +50,7 @@ logger = logging.getLogger(__name__)
 
 SSE_CONTENT_CHARS: Final = 64  # content characters per re-emitted chunk
 _MESSAGE_CORE_FIELDS: Final = frozenset({"role", "content", "tool_calls"})
+_PRINTABLE_ID: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}")
 # OpenAI chat-completion request fields a remote upstream receives from the agent's payload.
 # Everything else is dropped: a router's own extensions (OpenRouter's `models` fallbacks,
 # `provider` routing, `plugins` such as web search, `transforms`, `route`) would let the agent
@@ -77,23 +80,46 @@ REMOTE_FORWARDED_FIELDS: Final = frozenset(
 
 
 class ModelNotMappedError(UpstreamError):
-    """The remote upstream has no provider model for this logical id: refused before egress."""
+    """The remote upstream has no provider model for this logical id: refused before egress.
+
+    The message names the models it does serve (operator configuration, no payload)."""
 
     status_code = 400
 
-    def __init__(self) -> None:
+    def __init__(self, upstream: RemoteLlmUpstream, requested: object) -> None:
         super().__init__("model_not_mapped")
-        self.message = "the model is not available on the selected upstream"
+        served = ", ".join(upstream.model_map)
+        model = (
+            requested if isinstance(requested, str) and _PRINTABLE_ID.fullmatch(requested) else None
+        )
+        subject = f"{model} is local-only" if model else "this model is not served remotely"
+        self.message = f"{subject}; the remote upstream serves: {served}"
+
+
+class RemoteOnlyModelError(UpstreamError):
+    """A remote logical id requested while the local upstream is selected: refused, since the
+    local upstream would only answer an unhelpful 404."""
+
+    status_code = 400
+
+    def __init__(self, model: str) -> None:
+        super().__init__("model_not_mapped")
+        self.message = f"{model} is served by the remote upstream only (make remote-up)"
 
 
 def selected_upstream(policy: Policy, kind: LlmUpstreamKind) -> AnyLlmUpstream:
-    """The declared upstream ``kind`` selects. Raises `ValueError` when it is not declared."""
+    """The declared upstream ``kind`` selects. Raises `ValueError` when it is not declared, or
+    when remote judges would have no model the remote upstream serves."""
     if kind is LlmUpstreamKind.LOCAL:
         return policy.upstreams.llm
-    if policy.upstreams.llm_remote is None:
+    remote = policy.upstreams.llm_remote
+    if remote is None:
         msg = "ACL_LLM_UPSTREAM=remote, but the policy declares no upstreams.llm_remote"
         raise ValueError(msg)
-    return policy.upstreams.llm_remote
+    if policy.judges is not None and remote.judge_model is None:
+        msg = "ACL_LLM_UPSTREAM=remote with judges needs upstreams.llm_remote.judge_model"
+        raise ValueError(msg)
+    return remote
 
 
 def require_upstream(kind: LlmUpstreamKind) -> Callable[[Policy], None]:
@@ -113,7 +139,7 @@ def outgoing_request(payload: Mapping[str, Any], upstream: AnyLlmUpstream) -> di
         logical = body.get("model")
         provider = upstream.provider_model(logical) if isinstance(logical, str) else None
         if provider is None:
-            raise ModelNotMappedError
+            raise ModelNotMappedError(upstream, logical)
         body["model"] = provider
         body.update(cast("dict[str, Any]", copy.deepcopy(dict(upstream.extra_body))))
     if upstream.reasoning == "openrouter" and "reasoning_effort" in body:
@@ -167,6 +193,15 @@ class Usage(_Lenient):
     prompt_tokens: int = Field(default=0, ge=0)
     completion_tokens: int = Field(default=0, ge=0)
     total_tokens: int = Field(default=0, ge=0)
+    cost: object = None  # OpenRouter: USD charged; anything but a finite number >= 0 is ignored
+
+
+def reported_cost_usd(value: object) -> float | None:
+    """``usage.cost`` if it is a finite, non-negative number; else None (settle at the ceiling)."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    cost = float(value)
+    return cost if math.isfinite(cost) and cost >= 0 else None
 
 
 class ChatCompletion(_Lenient):
@@ -217,6 +252,14 @@ class LLMProxy(Upstream):
     def host(self, snapshot: PolicySnapshot) -> str:
         return urlsplit(self.upstream(snapshot).base_url).hostname or ""
 
+    def judge_model(self, snapshot: PolicySnapshot, configured: str) -> str:
+        """The model a judge asks this upstream for: ``configured`` locally, the remote
+        upstream's ``judge_model`` when remote is selected (local ids are not served there)."""
+        upstream = self.upstream(snapshot)
+        if isinstance(upstream, RemoteLlmUpstream) and upstream.judge_model is not None:
+            return upstream.judge_model
+        return configured
+
     async def start(self) -> None:
         if self._client is None:
             # trust_env=False: no proxy or netrc settings from the environment.
@@ -234,6 +277,12 @@ class LLMProxy(Upstream):
             raise UpstreamError("upstream_invalid_request")
         upstream = self.upstream(snapshot)
         logical = cast("dict[str, Any]", payload).get("model")
+        remote = snapshot.policy.upstreams.llm_remote
+        remote_only = (
+            remote is not None and isinstance(logical, str) and logical in remote.model_map
+        )
+        if remote_only and not isinstance(upstream, RemoteLlmUpstream):
+            raise RemoteOnlyModelError(str(logical))
         body = outgoing_request(cast("dict[str, Any]", payload), upstream)
         started = time.perf_counter()
         sent = await self._send("POST", "/chat/completions", snapshot, body=body)
@@ -252,6 +301,7 @@ class LLMProxy(Upstream):
                 prompt_tokens=completion.usage.prompt_tokens,
                 completion_tokens=completion.usage.completion_tokens,
                 total_tokens=completion.usage.total_tokens,
+                cost_usd=reported_cost_usd(completion.usage.cost),
             )
             if completion.usage is not None
             else None
@@ -319,7 +369,9 @@ class LLMProxy(Upstream):
             logger.warning("upstream %s %s failed: %s", method, path, type(exc).__name__)
             raise UpstreamError("upstream_unreachable") from None
         try:
-            return json.loads(raw)
+            # NaN / Infinity are not JSON: read as null, so a stray one is ignored (a reported
+            # cost settles at the ceiling) instead of crashing the response sent to the agent.
+            return json.loads(raw, parse_constant=lambda _constant: None)
         except ValueError:
             raise UpstreamError("upstream_invalid_response") from None
 

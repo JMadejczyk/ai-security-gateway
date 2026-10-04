@@ -3,6 +3,7 @@
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -130,6 +131,8 @@ async def test_a_clean_prompt_reaches_the_model(gateway, llm_upstream):
 
 @DENY
 async def test_an_injected_model_answer_is_withheld_and_taints(gateway, llm_upstream):
+    """The model's own answer: the classifier's hit is confirmed by the judge, then withheld."""
+    gateway.container.judges.answers["InjectionJudgement"] = JUDGE_SAYS_INJECTION
     answer = completion(f"Sure. {INJECT_MARKER}")
     llm_upstream.post("/chat/completions").mock(return_value=httpx.Response(200, json=answer))
     response = await post(gateway, ask("Summarise the page I pasted earlier."))
@@ -143,6 +146,55 @@ async def test_an_injected_model_answer_is_withheld_and_taints(gateway, llm_upst
     session = await session_of(gateway, entry)
     assert session.taint  # blocked, and still tainted: the content reached the gateway
     assert session.risk >= 0.6
+
+
+POLISH_REMINDER = (
+    "Szanowny Panie, uprzejmie przypominamy o fakturze FV/2026/09/114. Prosimy o płatność "
+    "do piątku."
+)
+
+
+def answer_pi_verdict(entry: dict) -> dict:
+    [post] = [v for v in pi_verdicts(entry) if v["stage"] == "post"]
+    return post
+
+
+@ALLOW
+async def test_a_flagged_polish_answer_the_judge_clears_is_released(tmp_path, llm_upstream):
+    """User decision 2026-10-04: the classifier misfires on Polish answers (the PII demo
+    reply); the judge clears it and the answer reaches the agent, no taint."""
+    classifier = MarkerClassifier({"uprzejmie przypominamy": 0.99})
+    llm_upstream.post("/chat/completions").mock(
+        return_value=httpx.Response(200, json=completion(POLISH_REMINDER))
+    )
+    async with running_gateway(tmp_path, classifier=classifier) as harness:
+        judges: Any = harness.container.judges  # the testkit's FakeJudgeClient
+        judges.answers["InjectionJudgement"] = JUDGE_SAYS_CLEAN
+        response = await post(harness, ask("Napisz przypomnienie o fakturze."))
+        assert response.status_code == 200
+        assert POLISH_REMINDER in response.text
+        (entry,) = harness.audit_entries()
+        post_verdict = answer_pi_verdict(entry)
+        assert (post_verdict["decision"], post_verdict["reason_code"]) == ("allow", "judge_cleared")
+        assert not (await session_of(harness, entry)).taint
+
+
+@ALLOW
+async def test_a_judge_timeout_on_the_answer_releases_it_and_taints(gateway, llm_upstream):
+    gateway.container.judges.answers["InjectionJudgement"] = JudgeUnavailableError(
+        JudgeResult.TIMEOUT
+    )
+    answer = completion(f"Here you go. {INJECT_MARKER}")
+    llm_upstream.post("/chat/completions").mock(return_value=httpx.Response(200, json=answer))
+    response = await post(gateway, ask("Summarise the page."))
+    assert response.status_code == 200
+    (entry,) = gateway.audit_entries()
+    assert answer_pi_verdict(entry) == {
+        "control": "prompt_injection", "stage": "post", "decision": "allow", "enforced": True,
+        "reason_code": "prompt_injection_unconfirmed", "taint": True,
+    }  # fmt: skip
+    assert entry["taint"] is True
+    assert entry["risk"] >= 0.6
 
 
 @pytest.fixture

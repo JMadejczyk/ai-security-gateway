@@ -13,6 +13,10 @@ LLM calls (``generate``):
   hold: Ollama ignores ``n`` (one choice, always), so honouring it would hold n times what the
   demo upstream can spend, and every gateway path (post controls, SSE re-emission) is built
   around one answer per call.
+- When the upstream reports what a call cost (OpenRouter's ``usage.cost``), the settlement
+  charges that, capped at the price table's cost for the reported tokens: the reservation's
+  ceiling (``provider.max_price`` for the remote upstream). A missing or unusable figure
+  settles at the ceiling, so the budget never under-counts.
 - The prompt estimate is ``ceil(characters / 4)`` over the message text, tool-call arguments
   and tool definitions: the usual characters-per-token rule of thumb for English, a little
   generous for code and short for Polish. It only sizes the hold; the settlement charges
@@ -29,16 +33,20 @@ the attempt reached the server.
 """
 
 import json
+import logging
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from decimal import ROUND_CEILING, Decimal
 from typing import Any, Final, cast
 
-from gateway.budget.model import MS_PER_SECOND, BudgetedCall, Meter, Spend
+from gateway.budget.model import MS_PER_SECOND, NANO_USD_PER_USD, BudgetedCall, Meter, Spend
 from gateway.budget.pricing import CostModel
 from gateway.core.types import Channel
 from gateway.errors import InvalidRequestError
 from gateway.upstream import TokenUsage
+
+logger = logging.getLogger(__name__)
 
 CHARS_PER_TOKEN: Final = 4
 _COMPLETION_CAPS: Final = ("max_tokens", "max_completion_tokens")
@@ -110,10 +118,29 @@ def actual(  # noqa: PLR0913 -- what was held, what came back, and how long it t
         tokens, token_cost = held.tokens, held_token_cost
     else:
         tokens = charged_tokens(usage)
-        token_cost = costs.token_cost(
+        ceiling = costs.token_cost(
             call.model, prompt=usage.prompt_tokens, completion=usage.completion_tokens
         )
+        token_cost = settled_token_cost(usage, ceiling, call.model)
     return Spend.bounded(tokens=tokens, cost_nano_usd=token_cost + gpu_cost, gpu_ms=gpu_ms)
+
+
+def settled_token_cost(usage: TokenUsage, ceiling: int, model: str | None) -> int:
+    """The token cost to settle: the upstream's reported cost, never above ``ceiling``."""
+    if usage.cost_usd is None:
+        return ceiling
+    reported = int(
+        (Decimal(repr(usage.cost_usd)) * NANO_USD_PER_USD).to_integral_value(rounding=ROUND_CEILING)
+    )
+    if reported > ceiling:
+        logger.warning(
+            "reported_cost_above_price_ceiling model=%s reported_nano_usd=%d ceiling_nano_usd=%d",
+            model,
+            reported,
+            ceiling,
+        )
+        return ceiling
+    return reported
 
 
 def estimate_prompt_tokens(request: Mapping[str, Any]) -> int:

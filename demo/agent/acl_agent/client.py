@@ -158,17 +158,42 @@ class ChatOutcome:
     elapsed_s: float = 0.0
 
 
+# Picked in this order when the caller names no model: the local default, then the remote one.
+PREFERRED_MODELS: Final = ("qwen3:8b", "deepseek-v4.1-flash")
+
+
+def pick_model(client: httpx.Client, token: str) -> str | None:
+    """A model this token may generate with on the gateway's selected upstream.
+
+    ``/v1/models`` lists only what the session may ``generate`` on the upstream the gateway
+    runs with (local Ollama ids, or the remote upstream's logical ids), so the demo works in
+    both modes without knowing which one is on. None when nothing is listed (or the listing
+    failed): the chat call then names no model and the gateway refuses it with a reason code.
+    """
+    response = client.get("/v1/models", headers={"authorization": f"Bearer {token}"})
+    if response.status_code != HTTP_OK:
+        return None
+    entries = cast(list[object], as_object(response.json()).get("data") or [])
+    listed = [str(as_object(entry).get("id")) for entry in entries if as_object(entry).get("id")]
+    preferred = [model for model in PREFERRED_MODELS if model in listed]
+    return (preferred or listed or [None])[0]
+
+
 def chat(  # noqa: PLR0913 -- the OpenAI request knobs the demo sets, all keyword-only
     client: httpx.Client,
     token: str,
     text: str,
     *,
-    model: str = "qwen3:8b",
+    model: str | None = None,
     max_tokens: int = 80,
     reasoning_effort: str | None = "none",
 ) -> ChatOutcome:
     """One user turn on ``/v1/chat/completions``. ``reasoning_effort: none`` keeps qwen3 from
-    thinking for minutes on CPU; ``max_tokens`` bounds the answer (and the budget reserved)."""
+    thinking for minutes on CPU (and turns DeepSeek's thinking off on the remote upstream);
+    ``max_tokens`` bounds the answer (and the budget reserved). ``model`` None picks one the
+    selected upstream serves (`pick_model`)."""
+    if model is None:
+        model = pick_model(client, token) or ""
     body: JsonObject = {
         "model": model,
         "max_tokens": max_tokens,

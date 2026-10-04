@@ -126,8 +126,11 @@ async def test_models_outside_the_pricing_table_are_bucketed_as_other(
         tokens[model] = tokens.get(model, 0) + sample.value
     assert tokens.get("other", 0) >= 19  # the unpriced call's usage
     assert tokens.get("qwen3:8b", 0) >= 19
+    # Bounded: priced local models, the remote upstream's logical ids (other suites in this
+    # process run in remote mode), and `other`.
+    allowed = {"qwen3:8b", "deepseek-v4.1-flash", "other"}
     for name in ("acl_tokens_total", "acl_cost_usd_total"):
-        assert {s.labels["model"] for s in exposition[name]} <= {"qwen3:8b", "other"}, name
+        assert {s.labels["model"] for s in exposition[name]} <= allowed, name
 
 
 async def test_labels_stay_bounded(exposition: dict[str, list[Any]]) -> None:

@@ -82,9 +82,12 @@ diagrams: ## Render docs/architecture.md's diagrams to docs/img/architecture/ (S
 	done
 	@ls $(ARCH_IMG)
 
-DEMO_COMPOSE := docker compose -f docker-compose.yml -f demo/compose.demo.yml
+# REMOTE=1 adds compose.remote.yml (OpenRouter instead of Ollama) to demo-up / demo-off.
+REMOTE ?= 0
+REMOTE_OVERLAY := $(if $(filter 1,$(REMOTE)),-f compose.remote.yml,)
+DEMO_COMPOSE := docker compose -f docker-compose.yml -f demo/compose.demo.yml $(REMOTE_OVERLAY)
 
-demo-up: ## Start the stack with the demo overlay (demo-web serves the injection page); waits until healthy
+demo-up: ## Start the stack with the demo overlay (demo-web serves the injection page); REMOTE=1 adds the remote LLM overlay
 	$(DEMO_COMPOSE) up -d --build --wait
 	@$(MAKE) --no-print-directory grafana
 
@@ -92,8 +95,8 @@ demo: ## Run the 7-scene demo against the running stack (DEMO_ARGS="--pause" or 
 	ACL_OPERATOR_HOST_PORT=$(OPERATOR_PORT) ACL_GRAFANA_HOST_PORT=$(GRAFANA_PORT) \
 		uv run python -m demo.run_demo $(DEMO_ARGS)
 
-demo-off: ## Back to the default stack: gateway and mcp-fetch without the demo allowances, demo-web removed
-	docker compose up -d --wait --remove-orphans
+demo-off: ## Back to the default stack: gateway and mcp-fetch without the demo allowances, demo-web removed (REMOTE=1 keeps remote)
+	docker compose -f docker-compose.yml $(REMOTE_OVERLAY) up -d --wait --remove-orphans
 
 REMOTE_COMPOSE := docker compose -f docker-compose.yml -f compose.remote.yml
 

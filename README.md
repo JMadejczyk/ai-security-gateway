@@ -89,16 +89,26 @@ returns to the local default, which is what the product ships.
   cannot override; OpenRouter answers an error rather than route to an endpoint that retains
   data, and the gateway turns that into a generic 502 `upstream_error`. Router extensions in
   the agent's request (`models`, `provider`, `plugins`, ...) are dropped.
-- **Models.** Grants, pricing, `model_allowlist` and audit keep the logical id (`qwen3:8b`);
-  `model_map` names the provider model it is sent as, and an unmapped model is refused
-  (`model_not_mapped`). qwen3:8b maps to `qwen/qwen3-30b-a3b-instruct-2507`: OpenRouter has no
-  zero-data-retention endpoint for qwen3-8b, and the hybrid Qwen3 models that have one keep
-  thinking whatever `reasoning` says.
+- **Models.** The remote upstream serves its own logical ids: `deepseek-v4.1-flash`
+  (`deepseek/deepseek-v4.1-flash`, ~27 zero-data-retention endpoints). Grants, pricing,
+  `model_allowlist` and audit use that id; `model_map` names the provider model it is sent as.
+  `qwen3:8b` stays local-only: asking for it in remote mode (or for `deepseek-v4.1-flash` in
+  local mode) is a 400 `model_not_mapped` that names what is served. `/v1/models` lists what
+  the selected upstream serves, and the demo agent and smoke traffic pick their model from it,
+  so `make demo` runs in both modes. Judges ask for `upstreams.llm_remote.judge_model` while
+  remote is selected; remote mode with judges refuses to start without a mapped one. Remote
+  judge verdicts can differ between runs of the same content, because different ZDR endpoints
+  serve different runs, so they are less reproducible than the local judge's.
 - **Visibility.** `/healthz` reports `llm_upstream` and its host, every LLM audit entry carries
   `"upstream": "remote"`, `acl_llm_upstream_info{upstream}` is 1 for the active one, and the
   gateway logs a warning at startup.
 - **Budgets.** Remote calls are charged tokens at `llm_remote.pricing` and no GPU time; their
-  deadline stays `limits.upstream_timeout_s`.
+  deadline stays `limits.upstream_timeout_s`. `extra_body` also caps the endpoint price
+  (`provider.max_price`) and `pricing` reserves at that ceiling, so a hold is never too small;
+  the settlement charges the cost OpenRouter reports (`usage.cost`), never above the ceiling,
+  and the ceiling when no usable figure comes back.
+- **With the demo.** `make demo-up REMOTE=1` combines both overlays; `make remote-off` (or
+  `make demo-off`) returns to the default.
 
 ## Demo
 

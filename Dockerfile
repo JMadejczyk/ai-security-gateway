@@ -4,6 +4,8 @@
 # Both default to 127.0.0.1; docker-compose.yml binds the operator listener to the gateway's
 # static IP on the `ops` network only, so it is unreachable from `edge` and the upstream networks.
 # config/ (policy.yaml, feeds/) is bind-mounted read-only at runtime; secrets come from the environment.
+# ORT_DISABLE_TELEMETRY: ONNX Runtime otherwise uploads telemetry to Microsoft (1DS); the
+# gateway also forces it before importing onnxruntime (gateway/injection/__init__.py).
 # /app/models holds the injection classifier: the `models-init` service fetches it into a volume
 # the gateway mounts read-only, and the gateway verifies every file's SHA-256 before loading it.
 FROM ghcr.io/astral-sh/uv:0.12.22 AS uv
@@ -38,7 +40,10 @@ ENV PATH=/opt/venv/bin:$PATH \
     ACL_AGENT_PORT=8080 \
     ACL_OPERATOR_HOST=127.0.0.1 \
     ACL_OPERATOR_PORT=9090 \
-    ACL_MODELS_DIR=/app/models
+    ACL_MODELS_DIR=/app/models \
+    ORT_DISABLE_TELEMETRY=1 \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    HF_HUB_OFFLINE=1
 RUN groupadd --system --gid 10001 acl \
     && useradd --system --uid 10001 --gid acl --no-create-home --shell /usr/sbin/nologin acl
 COPY --from=trim /opt/venv /opt/venv

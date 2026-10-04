@@ -105,7 +105,9 @@ def _open_session(path: Path, threads: int) -> tuple[_Session, frozenset[str]]:
     """A CPU inference session over an ONNX file (never the ORT format), and its input names."""
     ort: Any = onnxruntime  # untyped module: one explicit boundary instead of Unknown types
     ort.set_default_logger_severity(3)  # errors only: ORT writes to stderr, not our logger
-    ort.disable_telemetry_events()  # nothing leaves the process; the image's FS is read-only
+    # Belt and braces: ORT_DISABLE_TELEMETRY, set by gateway.injection before ORT is imported,
+    # is what keeps the telemetry uploader from ever starting.
+    ort.disable_telemetry_events()
     options = ort.SessionOptions()
     options.intra_op_num_threads = threads
     options.inter_op_num_threads = 1
